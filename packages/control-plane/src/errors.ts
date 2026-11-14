@@ -32,7 +32,11 @@ export class WorkbenchError extends Error {
   }
 }
 
-/** 窄化辅助：不依赖 `instanceof` 的调用方（跨包/跨 realm）也要能判定。 */
+/**
+ * 窄化辅助：`instanceof` 判定，因此要求错误确实是本模块的 `WorkbenchError`。
+ * 跨包场景仍可用（`@pi-workbench/shared` 依赖本模块的同一份实现）；但**跨 realm**
+ * （vm context / worker 里加载的另一份模块实例）不成立，需依赖方按 `code` 字段自行判定。
+ */
 export function isWorkbenchError(e: unknown): e is WorkbenchError {
   return e instanceof WorkbenchError;
 }

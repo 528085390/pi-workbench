@@ -27,6 +27,8 @@ test("isWorkbenchError: 只认 WorkbenchError", () => {
   assert.equal(isWorkbenchError(null), false);
   assert.equal(isWorkbenchError(undefined), false);
   assert.equal(isWorkbenchError({ code: "E_NO_LEASE" }), false);
+  // 实现是 instanceof（不是 name 兜底）：长得像的普通对象不算
+  assert.equal(isWorkbenchError({ name: "WorkbenchError", code: "E_NO_LEASE" }), false);
 });
 
 test("isWorkbenchError: 可用于窄化后再读 code", () => {

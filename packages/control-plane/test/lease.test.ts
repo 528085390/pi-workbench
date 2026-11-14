@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type { DatabaseSync } from "node:sqlite";
 
+import { DEFAULT_LEASE_TTL_MS } from "../src/config.ts";
 import { migrate, openDb } from "../src/db.ts";
 import { isWorkbenchError } from "../src/errors.ts";
 import { LeaseManager } from "../src/lease.ts";
@@ -318,6 +319,91 @@ test("租约按 sessionKey 隔离：不同会话互不影响", () => {
     assert.equal(other.sessionKey, "claude:b");
     assert.equal(lm.current("claude:a")?.clientId, "client-a");
     assert.equal(lm.current("claude:b")?.clientId, "client-b");
+  } finally {
+    db.close();
+  }
+});
+
+/** 真默认 TTL 的 harness：不传 ttlMs，走 config.ts 的 DEFAULT_LEASE_TTL_MS。 */
+function freshDefault(): Harness {
+  const db = openDb(":memory:");
+  migrate(db);
+  const clock = makeClock();
+  const lm = new LeaseManager(db, { now: clock.now });
+  return { db, lm, clock };
+}
+
+test("默认 TTL：不传 ttlMs 时是 30 秒（钉住 binding ruling）", () => {
+  assert.equal(DEFAULT_LEASE_TTL_MS, 30_000);
+
+  const { db, lm, clock } = freshDefault();
+  try {
+    const lease = lm.acquire(KEY, "pi", "client-a");
+
+    assert.equal(lease.heartbeatAt, iso(clock.now()));
+    assert.equal(lease.expiresAt, iso(clock.now() + 30_000));
+  } finally {
+    db.close();
+  }
+});
+
+test("heartbeat: 不带 ttlMs 时按默认 TTL 续期（30 分钟租约被压回默认）", () => {
+  const HANDOFF_TTL = 30 * 60 * 1000;
+  const { db, lm, clock } = freshDefault();
+  try {
+    const acquired = lm.acquire(KEY, "human", "client-a", HANDOFF_TTL);
+    assert.equal(acquired.expiresAt, iso(START + HANDOFF_TTL));
+
+    clock.advance(1_000);
+    const beat = lm.heartbeat(KEY, "client-a");
+
+    assert.equal(beat.heartbeatAt, iso(START + 1_000));
+    assert.equal(beat.expiresAt, iso(START + 1_000 + 30_000));
+  } finally {
+    db.close();
+  }
+});
+
+test("heartbeat: 显式传 ttlMs 时保持该 TTL（30 分钟 handoff 租约不被压回默认）", () => {
+  const HANDOFF_TTL = 30 * 60 * 1000;
+  const { db, lm, clock } = freshDefault();
+  try {
+    lm.acquire(KEY, "human", "client-a", HANDOFF_TTL);
+    clock.advance(1_000);
+
+    const beat = lm.heartbeat(KEY, "client-a", HANDOFF_TTL);
+
+    assert.equal(beat.clientId, "client-a");
+    assert.equal(beat.driver, "human");
+    assert.equal(beat.expiresAt, iso(START + 1_000 + HANDOFF_TTL));
+    assert.equal(rawRow(db, KEY)?.expires_at, iso(START + 1_000 + HANDOFF_TTL));
+  } finally {
+    db.close();
+  }
+});
+
+test("heartbeat: 非法 ttlMs（0 / 负数）抛 E_BAD_REQUEST，且不改动租约", () => {
+  const { db, lm, clock } = freshDefault();
+  try {
+    const held = lm.acquire(KEY, "pi", "client-a");
+    clock.advance(1_000);
+
+    expectCode(() => lm.heartbeat(KEY, "client-a", 0), "E_BAD_REQUEST");
+    expectCode(() => lm.heartbeat(KEY, "client-a", -1), "E_BAD_REQUEST");
+
+    assert.equal(rawRow(db, KEY)?.expires_at, held.expiresAt);
+  } finally {
+    db.close();
+  }
+});
+
+test("构造器：非法 ttlMs（0 / 负数 / NaN）抛 E_BAD_REQUEST，不会写出出生即过期的租约", () => {
+  const db = openDb(":memory:");
+  migrate(db);
+  try {
+    expectCode(() => new LeaseManager(db, { ttlMs: 0 }), "E_BAD_REQUEST");
+    expectCode(() => new LeaseManager(db, { ttlMs: -1 }), "E_BAD_REQUEST");
+    expectCode(() => new LeaseManager(db, { ttlMs: Number.NaN }), "E_BAD_REQUEST");
   } finally {
     db.close();
   }

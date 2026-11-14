@@ -22,6 +22,7 @@ export type Config = {
 };
 
 export const DEFAULT_HOST = "127.0.0.1";
+/** 默认租约 TTL（毫秒）：唯一来源，`lease.ts` 直接 import 复用，勿另起同名常量。 */
 export const DEFAULT_LEASE_TTL_MS = 30_000;
 export const DEFAULT_PERMISSION_MODE: PermissionMode = "auto_allow";
 /** A00 实测的 Claude ACP adapter（见 docs/evidence/phase-0.5a-a00.md） */
