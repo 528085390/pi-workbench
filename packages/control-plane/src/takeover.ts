@@ -8,7 +8,8 @@
  * - R26 handoff 严格按序：cancel → (waitForTurn) → checkpoint → close → 租约转 human(30min) → 注册表 + 事件；
  * - R27 handback：resume（失败 → E_RESUME_REJECTED）→ 从 checkpoint 游标读 transcript 生成 deltaSummary
  *   → 注册表改回 pi/idle → 租约转回 pi；
- * - R28 dispatch 在引擎里（registry 保持纯存储，不依赖 adapter），幂等靠 events 表的 dispatch:<key> 事件；
+ * - R28 dispatch 在引擎里（registry 保持纯存储，不依赖 adapter），幂等靠 dispatches 表的原子占位
+ *   （round 1 起已从「events 表回溯」换成落库预留，本注释同步）；
  * - 本模块不 import server / fastify，也不 import 任何 HTTP 层。
  */
 import { createHash } from "node:crypto";
@@ -102,8 +103,13 @@ export type HandoffResult = {
 export type HandbackResult = { resumed: boolean; deltaSummary: string };
 
 /**
- * 接管原语集合。一个实例服务所有会话；状态全部走 registry / store / checkpoints / dispatches 表，
- * 引擎本身不持有跨调用的内存态（重启后 handback 仍能拿到 checkpoint 游标）。
+ * 接管原语集合。一个实例服务所有会话；业务状态（会话 / 游标 / 幂等预留）全部走
+ * registry / store / checkpoints / dispatches 表，引擎不缓存任何业务态 ——
+ * 重启后 handback 仍能从库里拿到 checkpoint 游标。
+ *
+ * 唯一的进程内字段是 `#eventSeq`：只用于给同一毫秒内的 state_update / error 事件生成不撞车的
+ * 幂等键（跨进程唯一性由 events.idempotency_key 的 UNIQUE 约束保证），不参与任何业务判定，
+ * 也不影响重启后的行为 —— round 2 选了「改这条注释」而不是「每次调用重置」。
  */
 export class TakeoverEngine {
   readonly #store: EventStore;
@@ -115,7 +121,11 @@ export class TakeoverEngine {
   readonly #handoffDir: string;
   readonly #now: () => number;
   readonly #readTranscript: TranscriptReader;
-  /** 事件幂等键的进程内序号，避免同一毫秒内多次操作撞键 */
+  /**
+   * 事件幂等键的进程内序号（round 2 的 Minor）：只做同毫秒去重，不重置。
+   * 重置会让同一毫秒内的两条同类事件拿到同一个幂等键，被 EventStore 合并成一条 —— 代价比
+   * 维护一个只增计数器大得多，所以选「把注释改成实话」。
+   */
   #eventSeq = 0;
 
   constructor(deps: TakeoverDeps) {
@@ -278,19 +288,21 @@ export class TakeoverEngine {
       throw new WorkbenchError("E_BAD_REQUEST", "dispatch 的 idempotencyKey 不能为空", { agent: input.agent });
     }
 
-    const cwd = input.cwd ?? process.cwd();
-    // C1：hash 口径固定为 {agent, task, cwd ?? null}
-    const hash = hashOf({ agent: input.agent, task, cwd: input.cwd ?? null });
+    // Minor（round 2）：cwd 只解析一次 —— hash / SessionRef / newSession 必须用同一个值。
+    // 之前 hash 取 input.cwd ?? null、会话行写 process.cwd()，于是「省略 cwd」与「显式传同一个
+    // cwd」会算出不同 hash，被误判成 E_IDEMPOTENCY_CONFLICT。
+    const resolvedCwd = input.cwd ?? process.cwd();
+    const hash = hashOf({ agent: input.agent, task, cwd: resolvedCwd });
 
     // C1 / C2：INSERT OR IGNORE 原子占位，同 key 并发只有一个赢家
-    const { record, created } = this.#dispatches.reserve(idempotencyKey, hash);
+    const { record, created } = this.#dispatches.reserve(idempotencyKey, hash, new Date(this.#now()));
     if (!created) {
       return await this.#resolveReserved(record, hash, idempotencyKey);
     }
 
     let sessionId: string;
     try {
-      const opened = await this.#adapter.newSession(cwd);
+      const opened = await this.#adapter.newSession(resolvedCwd);
       sessionId = opened.sessionId;
     } catch (err) {
       throw this.#dispatchFailed(idempotencyKey, "newSession", err);
@@ -301,32 +313,34 @@ export class TakeoverEngine {
       agent: "claude",
       nativeId: sessionId,
       acpSessionId: sessionId,
-      cwd,
-      transcriptPath: join(claudeProjectDir(cwd), sessionId + ".jsonl"),
+      cwd: resolvedCwd,
+      transcriptPath: join(claudeProjectDir(resolvedCwd), sessionId + ".jsonl"),
       status: "running",
       driver: "pi",
       capabilities: CLAUDE_CAPABILITIES,
       kind: "interactive",
     };
 
+    // Minor（round 2）：newSession 已经成功，之后任一步失败都必须先回收 adapter 侧会话，
+    // 再把幂等键标成 failed —— 否则会话泄漏在 adapter 里，且这个 key 永远停在 reserved。
     try {
       this.#registry.upsert(ref);
+      // 会话已落库：先把幂等记录标成 done，等待方（并发 / 重启）才能按 key 复用它
+      this.#dispatches.complete(idempotencyKey, ref.key, new Date(this.#now()));
+
+      this.#store.append({
+        sessionKey: ref.key,
+        type: "notice",
+        payload: { kind: "dispatch", idempotencyKey, hash, task, cwd: resolvedCwd },
+        source: "claude",
+        idempotencyKey: DISPATCH_KEY_PREFIX + idempotencyKey,
+      });
+      // M6：dispatch 让会话进入 running，除 notice 外再发一条 state_update，按状态分发的消费者才看得到
+      this.#appendState(ref, { state: "running", driver: "pi", kind: "dispatch", idempotencyKey }, "dispatch");
     } catch (err) {
-      throw this.#dispatchFailed(idempotencyKey, "registry.upsert", err);
+      await this.#discardSession(sessionId);
+      throw this.#dispatchFailed(idempotencyKey, "upsert/attach", err);
     }
-
-    // 会话已落库：先把幂等记录标成 done，等待方（并发 / 重启）才能按 key 复用它
-    this.#dispatches.complete(idempotencyKey, ref.key);
-
-    this.#store.append({
-      sessionKey: ref.key,
-      type: "notice",
-      payload: { kind: "dispatch", idempotencyKey, hash, task, cwd },
-      source: "claude",
-      idempotencyKey: DISPATCH_KEY_PREFIX + idempotencyKey,
-    });
-    // M6：dispatch 让会话进入 running，除 notice 外再发一条 state_update，按状态分发的消费者才看得到
-    this.#appendState(ref, { state: "running", driver: "pi", kind: "dispatch", idempotencyKey }, "dispatch");
 
     try {
       await this.#adapter.prompt(sessionId, task);
@@ -334,6 +348,18 @@ export class TakeoverEngine {
       // R28：投递失败不影响 dispatch 返回；回合结果通过事件流观察
     }
     return ref;
+  }
+
+  /**
+   * 尽力关闭 adapter 侧会话（round 2：newSession 成功但后续落库失败时的回收）。
+   * close 自己失败也不抛出 —— 原始失败原因更重要，回收只是止损。
+   */
+  async #discardSession(sessionId: string): Promise<void> {
+    try {
+      await this.#adapter.close(sessionId);
+    } catch {
+      // adapter 已断（shared 进程退出 / IPC 断开）时 close 也会失败，忽略即可
+    }
   }
 
   /** 等回合结束；adapter 未实现 waitForTurn 或超时都不阻断 handoff（quiesce 尽力而为） */
@@ -421,9 +447,11 @@ export class TakeoverEngine {
       return this.#refOf(record, idempotencyKey);
     }
 
-    // reserved：另一个调用方正在跑 newSession，轮询到它落定（C1：每 50ms，最多 5s）
-    const deadline = Date.now() + DISPATCH_POLL_TIMEOUT_MS;
-    while (Date.now() < deadline) {
+    // reserved：另一个调用方正在跑 newSession，轮询到它落定（C1）
+    // Minor（round 2）：不再用墙钟 Date.now 算截止时间 —— 改成「次数 × 间隔」封顶，
+    // 时间源就只剩 deps.now，注入固定时钟时这个循环也不会永远退不出去。
+    const maxPolls = Math.ceil(DISPATCH_POLL_TIMEOUT_MS / DISPATCH_POLL_INTERVAL_MS);
+    for (let poll = 0; poll < maxPolls; poll += 1) {
       await delay(DISPATCH_POLL_INTERVAL_MS);
       const current = this.#dispatches.get(idempotencyKey);
       if (current === null) {
@@ -469,7 +497,7 @@ export class TakeoverEngine {
   /** newSession / upsert 失败：先落 failed 记录再抛（C1），同键后续调用不会永远停在 reserved */
   #dispatchFailed(idempotencyKey: string, where: string, err: unknown): WorkbenchError {
     const message = err instanceof Error ? err.message : String(err);
-    this.#dispatches.fail(idempotencyKey, where + "：" + message);
+    this.#dispatches.fail(idempotencyKey, where + "：" + message, new Date(this.#now()));
     if (isWorkbenchError(err)) {
       return err;
     }

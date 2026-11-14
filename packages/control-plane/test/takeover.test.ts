@@ -181,19 +181,42 @@ function fresh(opts: FakeOpts = {}): Harness {
   };
 }
 
-/** 模拟进程重启：新引擎、同一 db 句柄与同一批 store，引擎内部没有任何内存态 */
-function restartEngine(h: Harness, reader?: TranscriptReader): TakeoverEngine {
-  return new TakeoverEngine({
-    store: h.store,
-    leases: h.leases,
-    registry: h.registry,
+type Restarted = {
+  store: EventStore;
+  leases: LeaseManager;
+  registry: SessionRegistry;
+  checkpoints: CheckpointStore;
+  dispatches: DispatchStore;
+  engine: TakeoverEngine;
+};
+
+/**
+ * 模拟**真进程重启**（round 2）：EventStore / LeaseManager / SessionRegistry / CheckpointStore /
+ * DispatchStore 全部重新构造，只共用同一个 DatabaseSync 句柄（同一个库），再按启动流程
+ * `registry.loadFromDb()` 从 sessions 表把会话水合回内存。
+ * 这里刻意**不复用** h.registry / h.leases：真重启后它们的进程内存并不存在，
+ * 复用会掩盖「内存空 → E_SESSION_NOT_FOUND」这条真实失败路径。
+ */
+function restart(h: Harness, reader?: TranscriptReader): Restarted {
+  const store = new EventStore(h.db);
+  const leases = new LeaseManager(h.db, { now: h.clock.now });
+  const registry = new SessionRegistry(h.db);
+  const checkpoints = new CheckpointStore(h.db);
+  const dispatches = new DispatchStore(h.db);
+  // 真重启的启动步骤（R34）：内存为空 → 从 sessions 表回灌
+  registry.loadFromDb();
+  const engine = new TakeoverEngine({
+    store,
+    leases,
+    registry,
     adapter: h.fake.adapter,
-    checkpoints: h.checkpoints,
-    dispatches: h.dispatches,
+    checkpoints,
+    dispatches,
     handoffDir: h.handoffDir,
     now: h.clock.now,
     readTranscript: reader ?? emptyReader,
   });
+  return { store, leases, registry, checkpoints, dispatches, engine };
 }
 
 function countRows(db: DatabaseSync, table: "checkpoints" | "dispatches"): number {
@@ -717,15 +740,25 @@ test("dispatch: 并发两次同 key → 同一 key，newSession 只 1 次，disp
   }
 });
 
-test("dispatch: 重启后（新引擎、同一 db）同 key 同 task 复用库里的会话，newSession 仍为 1（C2）", async () => {
+test("dispatch: 真重启（全新 store/registry/leases + loadFromDb）同 key 同 payload → 同一会话，newSession 仍为 1（C2 / round 2）", async () => {
   const h = fresh();
   try {
     const input = { agent: "claude" as const, task: "重启后幂等", cwd: CWD, idempotencyKey: "idem-restart" };
     const first = await h.engine.dispatch(input);
-    const second = await restartEngine(h).dispatch(input);
+
+    // 真重启：内存全空，只有 sessions 表 + loadFromDb 能把会话带回来
+    const after = restart(h);
+    assert.notEqual(
+      after.registry.get(first.key),
+      null,
+      "loadFromDb 必须把会话水合回内存，否则幂等命中会报 E_SESSION_NOT_FOUND",
+    );
+
+    const second = await after.engine.dispatch(input);
 
     assert.deepEqual(second, first, "重启后必须返回同一个 SessionRef");
     assert.equal(h.fake.count("newSession"), 1, "库里已 done 的幂等键不得再起会话");
+    assert.equal(h.fake.count("prompt"), 1, "重启后的幂等命中不得重复投递任务");
     assert.equal(countRows(h.db, "dispatches"), 1);
   } finally {
     h.close();
@@ -776,7 +809,7 @@ test("checkpoint: 落库（checkpoints 表 1 行，latest 与返回值一致）�
   }
 });
 
-test("handback: 新引擎（同 db、无进程内存）仍用库里 checkpoint 的游标读增量（C3）", async () => {
+test("handback: 真重启（全新 store/registry/leases + loadFromDb）仍用库里 checkpoint 的游标读增量，不报 E_SESSION_NOT_FOUND（C3 / round 2）", async () => {
   let humanPhase = false;
   const reader: TranscriptReader = (_path, cursor) => {
     if ((cursor ?? "0") === "0") {
@@ -800,12 +833,20 @@ test("handback: 新引擎（同 db、无进程内存）仍用库里 checkpoint �
     assert.equal(countRows(h.db, "checkpoints"), 1, "handoff 的 checkpoint 必须落库");
 
     humanPhase = true;
-    // 新引擎 = 重启后的进程：内存里没有 checkpoint，只能靠库
-    const result = await restartEngine(h, reader).handback(KEY, "handoff-pi-1");
+    // 真重启：内存里没有会话、没有 checkpoint、没有租约对象，只能靠库 + loadFromDb
+    const after = restart(h, reader);
+    assert.notEqual(
+      after.registry.get(KEY),
+      null,
+      "loadFromDb 必须先水合会话，否则 handback 会在 #requireSession 报 E_SESSION_NOT_FOUND",
+    );
 
-    assert.equal(result.resumed, true);
+    const result = await after.engine.handback(KEY, "handoff-pi-1");
+
+    assert.equal(result.resumed, true, "重启后 handback 必须成功");
     assert.equal(result.deltaSummary, "user: 我把 auth 改成抛错了", "必须从库里 checkpoint 的游标起读");
-    assert.equal(h.registry.get(KEY)?.driver, "pi");
+    assert.equal(after.registry.get(KEY)?.driver, "pi");
+    assert.equal(after.leases.current(KEY)?.clientId, "handback-handoff-pi-1", "租约转回 pi 并落库");
   } finally {
     h.close();
   }
@@ -888,6 +929,54 @@ test("dispatch: 会话进入 running 时除 notice 还写一条 state_update（M
     assert.equal(stateUpdates.length, 1, "按状态分发的消费者需要 state_update");
     const payload = stateUpdates[0]?.payload as Record<string, unknown> | undefined;
     assert.equal(payload?.["state"], "running");
+  } finally {
+    h.close();
+  }
+});
+
+// ---------- 评审修复 round 2：真重启覆盖 / upsert 失败回收 / cwd 口径 ----------
+
+test("dispatch: registry.upsert 失败 → 回收 adapter 会话（close 1 次）+ dispatches 落 failed（round 2）", async () => {
+  const h = fresh();
+  try {
+    // 模拟「会话落库失败」（sessions 表不可写），此时 newSession 已经成功
+    h.registry.upsert = (_ref: SessionRef): void => {
+      throw new Error("写入 sessions 表失败");
+    };
+
+    const input = { agent: "claude" as const, task: "落库必然失败", cwd: CWD, idempotencyKey: "idem-upsert-fail" };
+    await expectRejectCode(() => h.engine.dispatch(input), "E_ADAPTER_DOWN");
+
+    assert.deepEqual(h.fake.argsOf("close"), [["sess-new"]], "必须回收刚起的那一个 adapter 会话");
+    assert.equal(h.fake.count("close"), 1, "回收只做一次");
+
+    const record = h.dispatches.get("idem-upsert-fail");
+    assert.equal(record?.status, "failed", "幂等键不能永远停在 reserved");
+    assert.ok((record?.error ?? "").includes("写入 sessions 表失败"), "失败原因要落库：" + String(record?.error));
+
+    await expectRejectCode(() => h.engine.dispatch(input), "E_ADAPTER_DOWN");
+    assert.equal(h.fake.count("newSession"), 1, "failed 记录不能让重试又起一个会话");
+  } finally {
+    h.close();
+  }
+});
+
+test("dispatch: 省略 cwd 与显式传同一个 cwd 等价（同 hash，不报 E_IDEMPOTENCY_CONFLICT）（round 2）", async () => {
+  const h = fresh();
+  try {
+    const here = process.cwd();
+    const first = await h.engine.dispatch({ agent: "claude", task: "cwd 口径", idempotencyKey: "idem-cwd" });
+    const second = await h.engine.dispatch({
+      agent: "claude",
+      task: "cwd 口径",
+      cwd: here,
+      idempotencyKey: "idem-cwd",
+    });
+
+    assert.equal(first.cwd, here, "省略 cwd 时解析成 process.cwd()");
+    assert.deepEqual(second, first, "显式传同一个 cwd 必须命中同一会话");
+    assert.equal(h.fake.count("newSession"), 1);
+    assert.deepEqual(h.fake.argsOf("newSession"), [[here]]);
   } finally {
     h.close();
   }
