@@ -17,6 +17,7 @@
   },
   "dependencies": {
     "@pi-workbench/shared": "workspace:*",
+    "execa": "^10.2.1",
     "yaml": "^2.9.1"
   }
 }
