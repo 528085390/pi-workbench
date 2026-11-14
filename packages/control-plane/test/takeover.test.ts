@@ -961,6 +961,41 @@ test("dispatch: registry.upsert 失败 → 回收 adapter 会话（close 1 次�
   }
 });
 
+test("dispatch: complete 抛错 → 回收 adapter 会话 + 会话行回 idle + dispatches 落 failed（round 3 / N1）", async () => {
+  const h = fresh();
+  try {
+    // 让「标 done」这一步抛错：此时 registry.upsert 已经成功，会话行与内存都已经落库
+    h.dispatches.complete = (): void => {
+      throw new Error("写 dispatches 表失败");
+    };
+
+    const input = {
+      agent: "claude" as const,
+      task: "落库成功、标记失败",
+      cwd: CWD,
+      idempotencyKey: "idem-complete-fail",
+    };
+    await expectRejectCode(() => h.engine.dispatch(input), "E_ADAPTER_DOWN");
+
+    assert.deepEqual(h.fake.argsOf("close"), [["sess-new"]], "必须回收刚起的那一个 adapter 会话");
+    assert.equal(h.fake.count("close"), 1, "回收只做一次");
+
+    // 会话不能停在 running 指向一个已经关闭的 adapter 会话（僵尸行）
+    assert.equal(h.registry.get("claude:sess-new")?.status, "idle", "内存态必须回 idle");
+    const row = h.db.prepare("SELECT status FROM sessions WHERE key = ?").get("claude:sess-new") as
+      | { status?: string }
+      | undefined;
+    assert.equal(row?.status, "idle", "sessions 表也必须回 idle");
+
+    const record = h.dispatches.get("idem-complete-fail");
+    assert.equal(record?.status, "failed", "幂等键不能停在 reserved");
+    assert.equal(record?.sessionKey, null, "fail 会把 session_key 置空");
+    assert.ok((record?.error ?? "").includes("写 dispatches 表失败"), "失败原因要落库：" + String(record?.error));
+  } finally {
+    h.close();
+  }
+});
+
 test("dispatch: 省略 cwd 与显式传同一个 cwd 等价（同 hash，不报 E_IDEMPOTENCY_CONFLICT）（round 2）", async () => {
   const h = fresh();
   try {

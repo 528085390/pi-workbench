@@ -108,8 +108,15 @@ export type HandbackResult = { resumed: boolean; deltaSummary: string };
  * 重启后 handback 仍能从库里拿到 checkpoint 游标。
  *
  * 唯一的进程内字段是 `#eventSeq`：只用于给同一毫秒内的 state_update / error 事件生成不撞车的
- * 幂等键（跨进程唯一性由 events.idempotency_key 的 UNIQUE 约束保证），不参与任何业务判定，
- * 也不影响重启后的行为 —— round 2 选了「改这条注释」而不是「每次调用重置」。
+ * 幂等键，不参与任何业务判定，也不影响重启后的行为 —— round 2 选了「改这条注释」而不是
+ * 「每次调用重置」。
+ *
+ * 幂等键的真实边界（round 3 更正）：`events.idempotency_key` 的 UNIQUE 约束只在**同一个库内**
+ * 去重，**不构成跨进程唯一性** —— 键里没有进程启动标识。所以「重启到同一毫秒 + 同一会话 + 同一
+ * action」仍可能撞键：INSERT OR IGNORE 会把第二条**静默合并**进第一条，调用方拿回旧事件，消费者
+ * 看不到这次 state_update（丢一条事件的已知代价；窗口极窄，但要承认它存在）。
+ * round 2 / round 3 都选「把注释改成实话」而不是「换键格式」：加进程 nonce 会改掉历史键的形状，
+ * 让已落库事件的幂等重放与按 key 排查的口径一起漂移，代价大于这条窄窗口。
  */
 export class TakeoverEngine {
   readonly #store: EventStore;
@@ -125,6 +132,8 @@ export class TakeoverEngine {
    * 事件幂等键的进程内序号（round 2 的 Minor）：只做同毫秒去重，不重置。
    * 重置会让同一毫秒内的两条同类事件拿到同一个幂等键，被 EventStore 合并成一条 —— 代价比
    * 维护一个只增计数器大得多，所以选「把注释改成实话」。
+   * 注意作用域：它只在**本进程内**防止撞车，跨进程（重启）没有等价物，UNIQUE 约束也不保证
+   * 跨进程唯一（真实行为与代价见类注释）。
    */
   #eventSeq = 0;
 
@@ -272,6 +281,14 @@ export class TakeoverEngine {
    * 起一个新会话（R28 / C1 / C2）。幂等与并发都由 dispatches 表的原子占位保证：
    * reserve 的赢家负责 newSession → complete，输家按记录的 hash / 状态复用、等待或报错。
    * prompt 只负责投递，不等回合结束，投递失败也不影响本次返回。
+   *
+   * 迁移口径（round 3 / N3）：payload hash 含 cwd；`cwd` 省略时取 daemon 的
+   * `process.cwd()`，因此换个目录重启 daemon，同一个逻辑 dispatch 会算出另一个 hash。
+   * - 调用方 **SHOULD** 显式传 `cwd`：否则幂等会随 daemon 启动目录漂移（同 key 同任务被判成
+   *   `E_IDEMPOTENCY_CONFLICT`）。
+   * - pre-release 期间按旧口径（`cwd: null` 进 hash）建的行，升级后同 key 同任务必然冲突；
+   *   这些行**不做迁移**——本仓库 pre-1.0，历史幂等记录没有需要保留的业务数据，直接换一个
+   *   新的 idempotencyKey 重新 dispatch 即可。
    */
   async dispatch(input: DispatchInput): Promise<SessionRef> {
     if (input.agent !== "claude") {
@@ -339,6 +356,15 @@ export class TakeoverEngine {
       this.#appendState(ref, { state: "running", driver: "pi", kind: "dispatch", idempotencyKey }, "dispatch");
     } catch (err) {
       await this.#discardSession(sessionId);
+      // Minor（round 3 / N1）：adapter 会话已经关掉，会话行不能继续停在 running 指向它 ——
+      // dispatches.fail 只把 session_key 置空，不碰 sessions 表，于是留下僵尸行。
+      // 尽力而为：upsert 本身就是失败点时内存里没有这行（updateStatus 对未知 key 返回 null），
+      // 回收抛错也不覆盖原始失败原因，因为 dispatches.fail 必须照常落库。
+      try {
+        this.#registry.updateStatus(ref.key, "idle");
+      } catch {
+        // 状态回收失败不影响止损：幂等记录仍会被标成 failed
+      }
       throw this.#dispatchFailed(idempotencyKey, "upsert/attach", err);
     }
 
