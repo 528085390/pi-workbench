@@ -1,0 +1,20 @@
+{
+  "at": "2026-11-14T18:49:39.426Z",
+  "holder": "t10-g3-82421d61",
+  "intruder": "t10-intruder-82421d61",
+  "response": {
+    "status": 409,
+    "json": {
+      "error": {
+        "code": "E_LEASE_CONFLICT",
+        "message": "租约被其他客户端持有：claude:422c46b8-948a-4f87-8574-07e507561ada",
+        "details": {
+          "sessionKey": "claude:422c46b8-948a-4f87-8574-07e507561ada",
+          "clientId": "t10-intruder-82421d61",
+          "heldBy": "t10-g3-82421d61",
+          "expiresAt": "2026-11-14T19:19:35.086Z"
+        }
+      }
+    }
+  }
+}

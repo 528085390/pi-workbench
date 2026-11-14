@@ -1,0 +1,32 @@
+{
+  "at": "2026-11-14T18:50:18.620Z",
+  "nonce": "37f65616",
+  "firstConnect": {
+    "after": 0,
+    "received": 45,
+    "firstSeq": 1,
+    "lastSeq": 1019,
+    "monotonic": true,
+    "distinctSeq": true
+  },
+  "reconnectAtLastSeq": {
+    "after": 1019,
+    "received": 0,
+    "replayedWithSeqAtOrBelowLast": 0,
+    "seqs": []
+  },
+  "reconnectBack3": {
+    "after": 1016,
+    "received": 2,
+    "seqs": [
+      1018,
+      1019
+    ]
+  },
+  "typeHistogram": {
+    "notice": 5,
+    "state_update": 34,
+    "thought": 4,
+    "token": 2
+  }
+}

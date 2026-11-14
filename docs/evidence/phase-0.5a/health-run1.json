@@ -1,0 +1,11 @@
+{
+  "at": "2026-11-14T18:47:15.830Z",
+  "nonce": "c392a9ee",
+  "health": {
+    "ok": true,
+    "name": "pi-workbenchd",
+    "version": "0.0.1",
+    "pid": 29060,
+    "uptimeMs": 199
+  }
+}

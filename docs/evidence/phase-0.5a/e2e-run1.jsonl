@@ -1,0 +1,13 @@
+{"ts":"2026-11-14T18:47:16.036Z","step":"start","ok":true,"detail":"{\"baseUrl\":\"http://127.0.0.1:7331\",\"clientId\":\"e2e-f476fc43\",\"nonce\":\"f476fc43\",\"logPath\":\"E:\\\\pi-workbench\\\\tmp\\\\e2e-2026-11-14T18-47-16-034Z.jsonl\"}"}
+{"ts":"2026-11-14T18:47:16.066Z","step":"health","ok":true,"detail":"{\"ok\":true,\"name\":\"pi-workbenchd\",\"version\":\"0.0.1\",\"pid\":29060,\"uptimeMs\":439}"}
+{"ts":"2026-11-14T18:47:18.082Z","step":"dispatch","ok":true,"detail":"{\"key\":\"claude:3569f43e-173d-44ef-ab7d-12a8e249613b\",\"status\":\"running\",\"nativeId\":\"3569f43e-173d-44ef-ab7d-12a8e249613b\"}"}
+{"ts":"2026-11-14T18:47:18.088Z","step":"lease","ok":true,"detail":"{\"clientId\":\"e2e-f476fc43\",\"expiresAt\":\"2026-11-14T19:17:18.084Z\"}"}
+{"ts":"2026-11-14T18:47:18.609Z","step":"see-ready","ok":true,"detail":"{\"waitedMs\":521,\"status\":\"running\",\"messages\":1,\"preview\":[\"E2E 基线任务（nonce f476fc43）：请用一句话答复 E2E_READY_f476fc43\"]}"}
+{"ts":"2026-11-14T18:47:19.576Z","step":"inject","ok":true,"detail":"{\"messageId\":\"c8975950-e870-4206-9b4d-2f9e311c7d48\",\"effective\":\"next_turn\"}"}
+{"ts":"2026-11-14T18:47:20.085Z","step":"see-inject","ok":true,"detail":"{\"waitedMs\":509,\"messages\":3}"}
+{"ts":"2026-11-14T18:47:20.108Z","step":"interrupt","ok":true,"detail":"{\"stopReason\":\"cancelled\"}"}
+{"ts":"2026-11-14T18:47:20.116Z","step":"checkpoint","ok":true,"detail":"{\"sessionKey\":\"claude:3569f43e-173d-44ef-ab7d-12a8e249613b\",\"summary\":\"E2E f476fc43：已跑通 dispatch / see / inject / interrupt\",\"touchedFiles\":[],\"nextStep\":\"人工接管确认一轮，再 handback 回 Pi\",\"transcriptCursor\":\"191320\",\"createdAt\":\"2026-11-14T18:47:20.111Z\",\"path\":\"E:\\\\pi-workbench\\\\tmp\\\\t10-home\\\\handoffs\\\\claude-3569f43e-173d-44ef-ab7d-12a8e249613b-2026-11-14T18-47-20.111Z.md\"}"}
+{"ts":"2026-11-14T18:47:20.140Z","step":"handoff","ok":true,"detail":"{\"mode\":\"resume-tui\",\"command\":\"claude --resume 3569f43e-173d-44ef-ab7d-12a8e249613b\"}"}
+{"ts":"2026-11-14T18:47:20.143Z","step":"lease-handback","ok":true,"detail":"{\"clientId\":\"handoff-e2e-f476fc43\"}"}
+{"ts":"2026-11-14T18:47:21.000Z","step":"handback","ok":true,"detail":"{\"resumed\":true,\"deltaSummary\":\"\"}"}
+{"ts":"2026-11-14T18:47:21.001Z","step":"summary","ok":true,"detail":"{\"result\":\"PASS\",\"sessionKey\":\"claude:3569f43e-173d-44ef-ab7d-12a8e249613b\",\"nonce\":\"f476fc43\",\"logPath\":\"E:\\\\pi-workbench\\\\tmp\\\\e2e-2026-11-14T18-47-16-034Z.jsonl\",\"error\":null}"}

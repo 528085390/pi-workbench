@@ -1,0 +1,125 @@
+{
+  "at": "2026-11-14T18:50:44.329Z",
+  "killedPid": 60100,
+  "restartedPid": 47444,
+  "sessionsListed": [
+    "claude:888279e4-3340-4035-8ea8-e1b285d1b1c6",
+    "claude:96b22896-d67b-4f90-be9e-976f78b0e327",
+    "claude:422c46b8-948a-4f87-8574-07e507561ada",
+    "claude:9325ca39-cd0e-4594-9e94-55eeaadefbe5",
+    "claude:19983001-3253-4a22-9bbb-350819eee2c8",
+    "claude:3569f43e-173d-44ef-ab7d-12a8e249613b"
+  ],
+  "crashSessionListed": true,
+  "checkpoint": {
+    "sessionKey": "claude:888279e4-3340-4035-8ea8-e1b285d1b1c6",
+    "path": "E:\\pi-workbench\\tmp\\t10-home\\handoffs\\claude-888279e4-3340-4035-8ea8-e1b285d1b1c6-2026-11-14T18-50-23.727Z.md",
+    "summary": "T10_CRASH 37f65616 崩溃前检查点：长计数任务进行中",
+    "touchedFiles": [],
+    "nextStep": "重启后确认会话/检查点/幂等键恢复",
+    "transcriptCursor": "107600",
+    "createdAt": "2026-11-14T18:50:23.727Z"
+  },
+  "sessionDetail": {
+    "session": {
+      "key": "claude:888279e4-3340-4035-8ea8-e1b285d1b1c6",
+      "agent": "claude",
+      "nativeId": "888279e4-3340-4035-8ea8-e1b285d1b1c6",
+      "cwd": "E:\\pi-workbench\\spike\\a00-workspace",
+      "status": "idle",
+      "driver": "pi",
+      "capabilities": {
+        "stream": true,
+        "inject": true,
+        "interrupt": true,
+        "attach": false,
+        "resume": true,
+        "transcript": true,
+        "permissions": true,
+        "background": false
+      },
+      "kind": "interactive",
+      "acpSessionId": "888279e4-3340-4035-8ea8-e1b285d1b1c6",
+      "transcriptPath": "C:\\Users\\huang\\.claude\\projects\\E--pi-workbench-spike-a00-workspace\\888279e4-3340-4035-8ea8-e1b285d1b1c6.jsonl"
+    },
+    "lease": {
+      "sessionKey": "claude:888279e4-3340-4035-8ea8-e1b285d1b1c6",
+      "driver": "pi",
+      "clientId": "t10-crash-37f65616",
+      "expiresAt": "2026-11-14T19:20:20.523Z",
+      "heartbeatAt": "2026-11-14T18:50:20.523Z"
+    }
+  },
+  "idempotentRedispatch": {
+    "idempotencyKey": "t10-crash:37f65616",
+    "returnedKey": "claude:888279e4-3340-4035-8ea8-e1b285d1b1c6",
+    "sameKey": true,
+    "response": {
+      "key": "claude:888279e4-3340-4035-8ea8-e1b285d1b1c6",
+      "agent": "claude",
+      "nativeId": "888279e4-3340-4035-8ea8-e1b285d1b1c6",
+      "cwd": "E:\\pi-workbench\\spike\\a00-workspace",
+      "status": "idle",
+      "driver": "pi",
+      "capabilities": {
+        "stream": true,
+        "inject": true,
+        "interrupt": true,
+        "attach": false,
+        "resume": true,
+        "transcript": true,
+        "permissions": true,
+        "background": false
+      },
+      "kind": "interactive",
+      "acpSessionId": "888279e4-3340-4035-8ea8-e1b285d1b1c6",
+      "transcriptPath": "C:\\Users\\huang\\.claude\\projects\\E--pi-workbench-spike-a00-workspace\\888279e4-3340-4035-8ea8-e1b285d1b1c6.jsonl"
+    }
+  },
+  "countsBefore": {
+    "sessions": 6,
+    "events": 51,
+    "leases": 5,
+    "checkpoints": 5,
+    "dispatches": 6
+  },
+  "countsAfter": {
+    "sessions": 6,
+    "events": 53,
+    "leases": 5,
+    "checkpoints": 5,
+    "dispatches": 6,
+    "leases_rows": [
+      {
+        "session_key": "claude:3569f43e-173d-44ef-ab7d-12a8e249613b",
+        "driver": "pi",
+        "client_id": "handoff-e2e-f476fc43",
+        "expires_at": "2026-11-14T18:47:50.995Z"
+      },
+      {
+        "session_key": "claude:19983001-3253-4a22-9bbb-350819eee2c8",
+        "driver": "pi",
+        "client_id": "handoff-e2e-69d6fc6c",
+        "expires_at": "2026-11-14T18:47:56.970Z"
+      },
+      {
+        "session_key": "claude:422c46b8-948a-4f87-8574-07e507561ada",
+        "driver": "pi",
+        "client_id": "t10-g3-82421d61",
+        "expires_at": "2026-11-14T19:19:35.086Z"
+      },
+      {
+        "session_key": "claude:96b22896-d67b-4f90-be9e-976f78b0e327",
+        "driver": "pi",
+        "client_id": "t10-g4-37f65616",
+        "expires_at": "2026-11-14T19:19:57.976Z"
+      },
+      {
+        "session_key": "claude:888279e4-3340-4035-8ea8-e1b285d1b1c6",
+        "driver": "pi",
+        "client_id": "t10-crash-37f65616",
+        "expires_at": "2026-11-14T19:20:20.523Z"
+      }
+    ]
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "at": "2026-11-14T18:51:03.902Z",
+  "nonce": "e3fbdcbb",
+  "sessionKey": "claude:2937f287-81d2-4ac2-a08c-7c9b6c59570b",
+  "nativeId": "2937f287-81d2-4ac2-a08c-7c9b6c59570b",
+  "handoffCommand": [
+    "claude",
+    "--resume",
+    "2937f287-81d2-4ac2-a08c-7c9b6c59570b"
+  ],
+  "nativeResume": {
+    "cmd": "claude -p --resume 2937f287-81d2-4ac2-a08c-7c9b6c59570b \"...\"",
+    "exit": 0,
+    "stdout": "T10_NATIVE_e3fbdcbb",
+    "stderr": "",
+    "sawNativeToken": true
+  },
+  "note": "claude -p --resume 非交互接管证据，仅支撑 Gate #6；原生 TUI 交互接管由控制者补做。"
+}

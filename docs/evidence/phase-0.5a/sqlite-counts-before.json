@@ -1,0 +1,13 @@
+{
+  "at": "2026-11-14T18:50:23.740Z",
+  "nonce": "37f65616",
+  "counts": {
+    "sessions": 6,
+    "events": 51,
+    "leases": 5,
+    "checkpoints": 5,
+    "dispatches": 6
+  },
+  "crashSessionKey": "claude:888279e4-3340-4035-8ea8-e1b285d1b1c6",
+  "idempotencyKey": "t10-crash:37f65616"
+}

@@ -1,0 +1,23 @@
+[
+  {
+    "key": "claude:3569f43e-173d-44ef-ab7d-12a8e249613b",
+    "agent": "claude",
+    "nativeId": "3569f43e-173d-44ef-ab7d-12a8e249613b",
+    "acpSessionId": "3569f43e-173d-44ef-ab7d-12a8e249613b",
+    "cwd": "E:\\pi-workbench\\spike\\a00-workspace",
+    "transcriptPath": "C:\\Users\\huang\\.claude\\projects\\E--pi-workbench-spike-a00-workspace\\3569f43e-173d-44ef-ab7d-12a8e249613b.jsonl",
+    "status": "idle",
+    "driver": "pi",
+    "capabilities": {
+      "stream": true,
+      "inject": true,
+      "interrupt": true,
+      "attach": false,
+      "resume": true,
+      "transcript": true,
+      "permissions": true,
+      "background": false
+    },
+    "kind": "interactive"
+  }
+]

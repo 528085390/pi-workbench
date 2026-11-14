@@ -1,0 +1,56 @@
+{
+  "at": "2026-11-14T18:49:39.423Z",
+  "nonce": "82421d61",
+  "sessionKey": "claude:422c46b8-948a-4f87-8574-07e507561ada",
+  "clientId": "t10-g3-82421d61",
+  "dispatch": {
+    "key": "claude:422c46b8-948a-4f87-8574-07e507561ada",
+    "agent": "claude",
+    "nativeId": "422c46b8-948a-4f87-8574-07e507561ada",
+    "acpSessionId": "422c46b8-948a-4f87-8574-07e507561ada",
+    "cwd": "E:\\pi-workbench\\spike\\a00-workspace",
+    "transcriptPath": "C:\\Users\\huang\\.claude\\projects\\E--pi-workbench-spike-a00-workspace\\422c46b8-948a-4f87-8574-07e507561ada.jsonl",
+    "status": "running",
+    "driver": "pi",
+    "capabilities": {
+      "stream": true,
+      "inject": true,
+      "interrupt": true,
+      "attach": false,
+      "resume": true,
+      "transcript": true,
+      "permissions": true,
+      "background": false
+    },
+    "kind": "interactive"
+  },
+  "lease": {
+    "sessionKey": "claude:422c46b8-948a-4f87-8574-07e507561ada",
+    "driver": "pi",
+    "clientId": "t10-g3-82421d61",
+    "expiresAt": "2026-11-14T19:19:35.086Z",
+    "heartbeatAt": "2026-11-14T18:49:35.086Z"
+  },
+  "inject": {
+    "status": 200,
+    "response": {
+      "messageId": "43c3f43c-d112-42d0-a007-25219d2f9ce1",
+      "effective": "now"
+    },
+    "text": "请只回答这一行，不要加任何别的内容：T10_INJ_82421d61"
+  },
+  "assistantEcho": {
+    "id": "4d521871-2973-41e0-aeaa-4ab0212a6d83:0",
+    "role": "assistant",
+    "kind": "text",
+    "text": "T10_INJ_82421d61",
+    "ts": "2026-11-14T18:49:39.020Z"
+  },
+  "assistantReadyEcho": {
+    "id": "f2ef0bf3-8a2d-42a8-830b-5747f68b0999:0",
+    "role": "assistant",
+    "kind": "text",
+    "text": "T10_READY_82421d61",
+    "ts": "2026-11-14T18:49:36.590Z"
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "run1": {
+    "nonce": "f476fc43",
+    "sessionKey": "claude:3569f43e-173d-44ef-ab7d-12a8e249613b",
+    "result": "PASS",
+    "jsonl": "E:\\pi-workbench\\tmp\\e2e-2026-11-14T18-47-16-034Z.jsonl"
+  },
+  "run2": {
+    "nonce": "69d6fc6c",
+    "sessionKey": "claude:19983001-3253-4a22-9bbb-350819eee2c8",
+    "result": "PASS",
+    "jsonl": "E:\\pi-workbench\\tmp\\e2e-2026-11-14T18-47-21-306Z.jsonl"
+  },
+  "daemonPid": 29060,
+  "env": {
+    "node": "v24.16.0",
+    "pnpm": "12.3.4",
+    "claude": "2.1.325",
+    "commit": "bbfd200cfa0ae0803635db52cdc51fb58a9cf83e",
+    "acpAdapter": "0.107.0",
+    "acpSdk": "2.6.0",
+    "fastify": "5.12.8",
+    "ws": "11.3.7"
+  }
+}
