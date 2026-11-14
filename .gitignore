@@ -1,6 +1,6 @@
 node_modules/
 dist/
-spike/acp-probe/evidence/
+spike/acp-probe/evidence/*
 !spike/acp-probe/evidence/a00*.jsonl
 tmp/
 *.log
