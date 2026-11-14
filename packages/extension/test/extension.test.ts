@@ -1,0 +1,271 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+
+import {
+  createWorkbenchClient,
+  registerWorkbenchTools,
+  WORKBENCH_TOOL_NAMES,
+  WorkbenchHttpError,
+  type PiToolApi,
+  type PiToolDefinition,
+} from "../src/index.ts";
+
+/** 记录一次被拦下的请求（断言用） */
+type Call = {
+  url: string;
+  method: string;
+  headers: Record<string, string>;
+  body: unknown;
+};
+
+type Reply = { status?: number; body: unknown };
+
+/**
+ * 假 fetch：记录每次调用，按 handler 返回固定响应。
+ * 单测要求离线，因此绝不碰真实网络。
+ */
+function recorder(handler?: (call: Call) => Reply): { calls: Call[]; fetchImpl: typeof fetch } {
+  const calls: Call[] = [];
+  const fetchImpl: typeof fetch = async (input, init) => {
+    const url =
+      typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    const headerRecord: Record<string, string> = {};
+    new Headers(init?.headers ?? {}).forEach((value, key) => {
+      headerRecord[key.toLowerCase()] = value;
+    });
+    const rawBody = typeof init?.body === "string" ? init.body : undefined;
+    const call: Call = {
+      url,
+      method: init?.method ?? "GET",
+      headers: headerRecord,
+      body: rawBody === undefined ? undefined : (JSON.parse(rawBody) as unknown),
+    };
+    calls.push(call);
+
+    const reply: Reply = handler === undefined ? { body: {} } : handler(call);
+    return new Response(JSON.stringify(reply.body), {
+      status: reply.status ?? 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  return { calls, fetchImpl };
+}
+
+function fieldOf(source: unknown, key: string): unknown {
+  return typeof source === "object" && source !== null ? (source as Record<string, unknown>)[key] : undefined;
+}
+
+test("clientId 缺省是 pi:<pid>，可覆盖", () => {
+  const { fetchImpl } = recorder();
+  assert.equal(createWorkbenchClient({ fetch: fetchImpl }).clientId, "pi:" + process.pid);
+  assert.equal(createWorkbenchClient({ fetch: fetchImpl, clientId: "pi:42" }).clientId, "pi:42");
+});
+
+test("URL 拼接与鉴权头：baseUrl 末尾斜杠不产生双斜杠，token 走 Bearer", async () => {
+  const { calls, fetchImpl } = recorder(() => ({ body: { ok: true } }));
+  const client = createWorkbenchClient({ baseUrl: "http://127.0.0.1:7331/", authToken: "secret", fetch: fetchImpl });
+
+  await client.health();
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]?.url, "http://127.0.0.1:7331/health");
+  assert.equal(calls[0]?.method, "GET");
+  assert.equal(calls[0]?.headers["authorization"], "Bearer secret");
+});
+
+test("没有 token 时不发 authorization 头", async () => {
+  const { calls, fetchImpl } = recorder(() => ({ body: [] }));
+  const client = createWorkbenchClient({ baseUrl: "http://127.0.0.1:7331", fetch: fetchImpl });
+
+  await client.agents();
+
+  assert.equal(calls[0]?.headers["authorization"], undefined);
+});
+
+test("sessions 过滤器拼进查询串；agents 打到 /api/cp/agents", async () => {
+  const { calls, fetchImpl } = recorder(() => ({ body: [] }));
+  const client = createWorkbenchClient({ baseUrl: "http://127.0.0.1:7331", fetch: fetchImpl });
+
+  await client.agents();
+  await client.sessions();
+  await client.sessions({ agent: "claude", status: "idle" });
+
+  assert.equal(calls[0]?.url, "http://127.0.0.1:7331/api/cp/agents");
+  assert.equal(calls[1]?.url, "http://127.0.0.1:7331/api/cp/sessions");
+  assert.equal(calls[2]?.url, "http://127.0.0.1:7331/api/cp/sessions?agent=claude&status=idle");
+});
+
+test("每个方法打到正确的 path + method", async () => {
+  const { calls, fetchImpl } = recorder((call) => ({ body: { ok: true, path: call.url } }));
+  const client = createWorkbenchClient({ baseUrl: "http://h:1", clientId: "pi:7", fetch: fetchImpl });
+
+  await client.dispatch({ task: "干活", cwd: "/tmp/w", idempotencyKey: "k1" });
+  await client.see("claude:abc", "12", 5);
+  await client.inject("claude:abc", "你好");
+  await client.interrupt("claude:abc");
+  await client.checkpoint("claude:abc", { summary: "做了一半", touchedFiles: ["a.ts"], nextStep: "继续" });
+  await client.handoff("claude:abc", "human", { summary: "交给人类" });
+  await client.handback("claude:abc");
+  await client.health();
+
+  const seen = calls.map((call) => call.method + " " + call.url.replace("http://h:1", ""));
+  assert.deepEqual(seen, [
+    "POST /api/cp/dispatch",
+    "GET /api/cp/sessions/claude%3Aabc/transcript?after=12&limit=5",
+    "POST /api/cp/sessions/claude%3Aabc/inject",
+    "POST /api/cp/sessions/claude%3Aabc/interrupt",
+    "POST /api/cp/sessions/claude%3Aabc/checkpoint",
+    "POST /api/cp/sessions/claude%3Aabc/handoff",
+    "POST /api/cp/sessions/claude%3Aabc/handback",
+    "GET /health",
+  ]);
+});
+
+test("写操作 body 带上 clientId 与各自的字段", async () => {
+  const { calls, fetchImpl } = recorder(() => ({ body: {} }));
+  const client = createWorkbenchClient({ baseUrl: "http://h:1", clientId: "pi:7", fetch: fetchImpl });
+
+  await client.dispatch({ task: "干活", cwd: "/tmp/w", idempotencyKey: "k1" });
+  await client.inject("claude:abc", "你好");
+  await client.checkpoint("claude:abc", { summary: "s" });
+  await client.handoff("claude:abc", "human");
+
+  assert.deepEqual(calls[0]?.body, { agent: "claude", task: "干活", idempotencyKey: "k1", cwd: "/tmp/w" });
+  assert.deepEqual(calls[1]?.body, { text: "你好", clientId: "pi:7" });
+  assert.deepEqual(calls[2]?.body, { clientId: "pi:7", summary: "s", touchedFiles: [], nextStep: "" });
+  assert.deepEqual(calls[3]?.body, { to: "human", clientId: "pi:7" });
+});
+
+test("404 抛 WorkbenchHttpError，字段 status/code/message 齐全", async () => {
+  const { fetchImpl } = recorder(() => ({
+    status: 404,
+    body: { error: { code: "E_SESSION_NOT_FOUND", message: "会话不存在：claude:x" } },
+  }));
+  const client = createWorkbenchClient({ baseUrl: "http://h:1", fetch: fetchImpl });
+
+  await assert.rejects(client.see("claude:x"), (error: unknown) => {
+    assert.ok(error instanceof WorkbenchHttpError, "必须是 WorkbenchHttpError");
+    assert.equal(error.status, 404);
+    assert.equal(error.code, "E_SESSION_NOT_FOUND");
+    assert.equal(error.message, "会话不存在：claude:x");
+    return true;
+  });
+});
+
+test("409 租约冲突同样透出 code/message", async () => {
+  const { fetchImpl } = recorder(() => ({
+    status: 409,
+    body: { error: { code: "E_NO_LEASE", message: "无有效租约：claude:x" } },
+  }));
+  const client = createWorkbenchClient({ baseUrl: "http://h:1", fetch: fetchImpl });
+
+  await assert.rejects(client.inject("claude:x", "hi"), (error: unknown) => {
+    assert.ok(error instanceof WorkbenchHttpError);
+    assert.equal(error.status, 409);
+    assert.equal(error.code, "E_NO_LEASE");
+    assert.equal(error.message, "无有效租约：claude:x");
+    return true;
+  });
+});
+
+test("错误体不是标准结构时回落 E_HTTP_<status>", async () => {
+  const { fetchImpl } = recorder(() => ({ status: 500, body: { oops: true } }));
+  const client = createWorkbenchClient({ baseUrl: "http://h:1", fetch: fetchImpl });
+
+  await assert.rejects(client.health(), (error: unknown) => {
+    assert.ok(error instanceof WorkbenchHttpError);
+    assert.equal(error.status, 500);
+    assert.equal(error.code, "E_HTTP_500");
+    return true;
+  });
+});
+
+function fakeApi(): { api: PiToolApi; tools: Array<{ name: string; def: PiToolDefinition }> } {
+  const tools: Array<{ name: string; def: PiToolDefinition }> = [];
+  return {
+    api: { registerTool: (name, def) => void tools.push({ name, def }) },
+    tools,
+  };
+}
+
+test("registerWorkbenchTools 只注册 7 个 cp_* 工具，各带 description/inputSchema/handler", () => {
+  const { api, tools } = fakeApi();
+  const { fetchImpl } = recorder();
+  registerWorkbenchTools(api, { baseUrl: "http://h:1", fetch: fetchImpl });
+
+  assert.equal(tools.length, 7);
+  assert.deepEqual(
+    tools.map((tool) => tool.name),
+    [...WORKBENCH_TOOL_NAMES],
+  );
+  for (const tool of tools) {
+    assert.ok(tool.name.startsWith("cp_"), tool.name + " 必须以 cp_ 开头");
+    assert.equal(typeof tool.def.description, "string");
+    assert.ok(tool.def.description.length > 0, tool.name + " 需要描述");
+    assert.equal(typeof tool.def.inputSchema, "object");
+    assert.equal(typeof tool.def.handler, "function");
+  }
+});
+
+test("cp_dispatch / cp_inject handler 委托给 client，返回人读摘要", async () => {
+  const { api, tools } = fakeApi();
+  const { calls, fetchImpl } = recorder((call) => {
+    if (call.url.endsWith("/api/cp/dispatch")) {
+      return { body: { key: "claude:abc", status: "running", cwd: "/w", driver: "pi" } };
+    }
+    return { body: { messageId: "m-1", effective: "next_turn" } };
+  });
+  registerWorkbenchTools(api, { baseUrl: "http://h:1", clientId: "pi:7", fetch: fetchImpl });
+
+  const dispatch = tools.find((tool) => tool.name === "cp_dispatch");
+  const inject = tools.find((tool) => tool.name === "cp_inject");
+  assert.ok(dispatch !== undefined && inject !== undefined);
+
+  const dispatched = await dispatch.def.handler({ task: "跑测试", cwd: "/w" });
+  assert.equal(dispatched, "dispatched claude:abc (running) cwd=/w");
+
+  const injected = await inject.def.handler({ key: "claude:abc", text: "回答 E2E" });
+  assert.equal(injected, "injected claude:abc (effective=next_turn, messageId=m-1)");
+
+  assert.equal(fieldOf(calls[1]?.body, "clientId"), "pi:7");
+});
+
+test("handler 把 HTTP 错误转成 E_XXX: message 文本，不抛错", async () => {
+  const { api, tools } = fakeApi();
+  const { fetchImpl } = recorder(() => ({
+    status: 409,
+    body: { error: { code: "E_NO_LEASE", message: "无有效租约：claude:x" } },
+  }));
+  registerWorkbenchTools(api, { baseUrl: "http://h:1", fetch: fetchImpl });
+
+  const interrupt = tools.find((tool) => tool.name === "cp_interrupt");
+  assert.ok(interrupt !== undefined);
+  assert.equal(await interrupt.def.handler({ key: "claude:x" }), "E_NO_LEASE: 无有效租约：claude:x");
+});
+
+test("handler 缺必填参数时返回 E_BAD_REQUEST 文本，且不发请求", async () => {
+  const { api, tools } = fakeApi();
+  const { calls, fetchImpl } = recorder();
+  registerWorkbenchTools(api, { baseUrl: "http://h:1", fetch: fetchImpl });
+
+  const inject = tools.find((tool) => tool.name === "cp_inject");
+  assert.ok(inject !== undefined);
+
+  assert.equal(await inject.def.handler({ key: "claude:x" }), "E_BAD_REQUEST: 缺少必填参数 text");
+  assert.equal(calls.length, 0, "参数不合法时不应发请求");
+});
+
+test("registerWorkbenchTools 接受已建好的 client（复用，不重建）", async () => {
+  const { api, tools } = fakeApi();
+  const { calls, fetchImpl } = recorder(() => ({ body: [] }));
+  const client = createWorkbenchClient({ baseUrl: "http://h:1", authToken: "t", fetch: fetchImpl });
+
+  const returned = registerWorkbenchTools(api, client);
+  assert.equal(returned, client);
+
+  const sessions = tools.find((tool) => tool.name === "cp_sessions");
+  assert.ok(sessions !== undefined);
+  assert.equal(await sessions.def.handler({}), "no sessions");
+  assert.equal(calls[0]?.url, "http://h:1/api/cp/sessions");
+  assert.equal(calls[0]?.headers["authorization"], "Bearer t");
+});
