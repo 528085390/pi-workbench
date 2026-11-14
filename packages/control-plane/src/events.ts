@@ -4,14 +4,15 @@
  */
 import type { DatabaseSync, StatementSync } from "node:sqlite";
 
-import type { SessionEvent, SessionEventType } from "@pi-workbench/shared";
+import type { AgentName, SessionEvent, SessionEventType } from "@pi-workbench/shared";
 
 /** 待写入的新事件（seq / ts 由 store 分配）。 */
 export type NewEvent = {
   sessionKey: string;
   type: SessionEventType;
   payload: unknown;
-  source: "acp" | "transcript" | "system";
+  /** 事件来源 agent 名，口径同 shared 的 `AgentName`（如 "claude" / "pi" / "codex" / "dsh"）。 */
+  source: AgentName;
   idempotencyKey: string;
 };
 

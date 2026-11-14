@@ -23,7 +23,7 @@ function makeEvent(overrides: Partial<NewEvent> = {}): NewEvent {
     sessionKey: "claude:sess-1",
     type: "notice",
     payload: { text: "hello" },
-    source: "acp",
+    source: "claude",
     idempotencyKey: "claude:sess-1:k1",
     ...overrides,
   };
@@ -39,7 +39,7 @@ test("append: seq 从 1 开始递增，返回完整 SessionEvent", () => {
     assert.equal(second.seq, 2);
     assert.equal(first.sessionKey, "claude:sess-1");
     assert.equal(first.type, "notice");
-    assert.equal(first.source, "acp");
+    assert.equal(first.source, "claude");
     assert.equal(first.idempotencyKey, "k1");
     assert.deepEqual(first.payload, { text: "hello" });
     assert.equal(typeof first.ts, "string");
@@ -209,6 +209,24 @@ test("subscribe: 监听器抛错不影响 append 落库", () => {
     off();
     assert.equal(event.seq, 1);
     assert.equal(eventCount(db), 1);
+  } finally {
+    db.close();
+  }
+});
+
+test("append: 任意 AgentName 可作为 source 透传（claude / pi / 自定义名）", () => {
+  const { db, store } = freshStore();
+  try {
+    const claude = store.append(makeEvent({ idempotencyKey: "src-claude", source: "claude" }));
+    const pi = store.append(makeEvent({ idempotencyKey: "src-pi", source: "pi" }));
+    const custom = store.append(makeEvent({ idempotencyKey: "src-custom", source: "my-agent" }));
+
+    assert.equal(claude.source, "claude");
+    assert.equal(pi.source, "pi");
+    assert.equal(custom.source, "my-agent", "AgentName 含 (string & {})，自定义 agent 名应原样往返");
+
+    const rows = db.prepare("SELECT source FROM events ORDER BY seq ASC").all() as { source: string }[];
+    assert.deepEqual(rows.map((r) => r.source), ["claude", "pi", "my-agent"]);
   } finally {
     db.close();
   }
