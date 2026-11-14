@@ -74,6 +74,11 @@ export type ServerDeps = {
   checkpoints: CheckpointStore;
   readTranscript?: ServerTranscriptReader;
   pipeline?: PipelineLike;
+  /**
+   * 内部错误（500）的落点。Fastify 以 logger:false 建实例，`app.log.error` 是 no-op，
+   * 所以必须显式注入；默认写 stderr，测试可传入收集器断言。
+   */
+  logError?: (error: unknown) => void;
 };
 
 /** startServer 返回的可关闭句柄（index.ts 的 SIGINT/SIGTERM 用） */
@@ -153,6 +158,7 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
   const startedAt = Date.now();
 
   const app = Fastify({ logger: false });
+  const logError = deps.logError ?? ((error: unknown): void => { console.error("[pi-workbenchd] 未处理异常", error); });
   await app.register(fastifyWebsocket);
 
   const health = async (): Promise<HealthBody> => ({
@@ -179,7 +185,7 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
       return;
     }
     // 未知异常：对外固定文案，真实错误只进日志（评审 Minor 2：不回传内部 message）
-    app.log.error({ err: error }, "未处理异常，按 500 " + INTERNAL_ERROR_CODE + " 返回");
+    logError(error);
     void reply.status(500).send(errorBody(INTERNAL_ERROR_CODE, INTERNAL_ERROR_MESSAGE));
   });
 

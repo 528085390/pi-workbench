@@ -3,7 +3,7 @@
  * 口径：task-8-brief 的 R31–R47；spec §6（API 契约）/ §7（事件模型）。
  * HTTP 走 app.inject；WS 走真 listen（127.0.0.1:0）+ Node 内置 WebSocket 客户端。
  */
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { connect } from "node:net";
@@ -124,6 +124,8 @@ type BundleOptions = {
   readTranscript?: ServerTranscriptReader;
   /** 需要观察 WS 回放窗口时可换成 EventStore 子类（正常用例不传） */
   storeFactory?: (db: DatabaseSync) => EventStore;
+  /** 500 路径的内部错误收集器（Fastify logger:false 时 app.log.error 是 no-op） */
+  logError?: (error: unknown) => void;
 };
 
 function makeBundle(opts: BundleOptions = {}): Bundle {
@@ -159,6 +161,7 @@ function makeBundle(opts: BundleOptions = {}): Bundle {
     adapter: fake.adapter,
     checkpoints,
     readTranscript: opts.readTranscript,
+    logError: opts.logError,
   };
 
   return {
@@ -802,9 +805,13 @@ test("E_ADAPTER_DOWN：dispatch 建会话失败 → 503", async () => {
 });
 
 test("未知异常 → 500 E_INTERNAL（R35 兜底码）", async () => {
+  const logged: unknown[] = [];
   const h = await makeHarness({
     readTranscript: () => {
       throw new Error("boom");
+    },
+    logError: (error) => {
+      logged.push(error);
     },
   });
   try {
@@ -815,6 +822,9 @@ test("未知异常 → 500 E_INTERNAL（R35 兜底码）", async () => {
     // 内部 message 不外泄（评审 Minor 2）：对外固定文案，真实原因只进日志
     assert.equal(body.error.message, "internal error");
     assert.ok(!res.body.includes("boom"), "不得把内部 error.message 回给客户端：" + res.body);
+    // 评审 N1：logger:false 让 app.log.error 变 no-op，真实原因必须仍能落到注入的 logError
+    assert.equal(logged.length, 1, "内部异常必须交给 logError 一次");
+    assert.match(String((logged[0] as Error).message), /boom/);
   } finally {
     await h.close();
   }
@@ -979,6 +989,19 @@ type UpgradeResult = { status: number; body: string; socket: Socket | null; head
  * 用裸 net socket 手写请求行，是因为被拒绝的升级（401）之后服务端会直接 RST，
  * http 客户端会把已到的响应丢掉；这里只认自己收到的字节。
  */
+/**
+ * 101 的 socket 交给调用方持有；这里再登记一份，测试结束时统一销毁，
+ * 免得断言失败时裸 socket 把事件循环吊住（评审 N2：失败用例曾拖到 30s）。
+ */
+const PROBE_SOCKETS = new Set<Socket>();
+
+after(() => {
+  for (const socket of PROBE_SOCKETS) {
+    socket.destroy();
+  }
+  PROBE_SOCKETS.clear();
+});
+
 function probeUpgrade(target: string, headers: Record<string, string>, timeoutMs = 4000): Promise<UpgradeResult> {
   const url = new URL(target);
   const port = Number(url.port);
@@ -997,6 +1020,10 @@ function probeUpgrade(target: string, headers: Record<string, string>, timeoutMs
 
   return new Promise<UpgradeResult>((resolve, reject) => {
     const socket = connect({ host: url.hostname, port });
+    PROBE_SOCKETS.add(socket);
+    socket.on("close", () => {
+      PROBE_SOCKETS.delete(socket);
+    });
     let buffer = Buffer.alloc(0);
     let settled = false;
 
