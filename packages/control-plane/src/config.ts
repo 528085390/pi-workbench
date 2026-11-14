@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
 import { DEFAULT_PORT } from "@pi-workbench/shared";
@@ -25,8 +26,56 @@ export const DEFAULT_HOST = "127.0.0.1";
 /** 默认租约 TTL（毫秒）：唯一来源，`lease.ts` 直接 import 复用，勿另起同名常量。 */
 export const DEFAULT_LEASE_TTL_MS = 30_000;
 export const DEFAULT_PERMISSION_MODE: PermissionMode = "auto_allow";
-/** A00 实测的 Claude ACP adapter（见 docs/evidence/phase-0.5a-a00.md） */
-export const DEFAULT_ADAPTER_CMD: string[] = ["npx", "-y", "@agentclientprotocol/claude-agent-acp"];
+/**
+ * Claude ACP adapter 的回落启动命令：本地装不到 `@agentclientprotocol/claude-agent-acp` 时才用。
+ * A00 实测入口见 docs/evidence/phase-0.5a-a00.md；优先走 `resolveDefaultAdapterCmd` 的本地入口。
+ */
+export const FALLBACK_ADAPTER_CMD: string[] = ["npx", "-y", "@agentclientprotocol/claude-agent-acp"];
+/** 包路径解析器（默认 createRequire；测试注入以覆盖两条分支） */
+export type ModuleResolver = (specifier: string) => string;
+
+const requireFromHere = createRequire(import.meta.url);
+
+/**
+ * 惰性解析默认 adapter 命令（R14）：
+ * - 能解析到 `@agentclientprotocol/claude-agent-acp` 包 → `[node, <包入口>]`（省掉 npx 冷启动）；
+ * - 解析不到（未安装 / 解析器抛错）→ 回落 `["npx","-y","@agentclientprotocol/claude-agent-acp"]`。
+ * 入口取 package.json 的 `bin`（对象取第一个值）或 `main`，拼成包内绝对路径。
+ */
+export function resolveDefaultAdapterCmd(resolveModule: ModuleResolver = requireFromHere.resolve): string[] {
+  try {
+    const pkgPath = resolveModule(ADAPTER_PKG_SPECIFIER);
+    const entry = readPackageEntry(JSON.parse(readFileSync(pkgPath, "utf8")) as unknown);
+    if (entry !== undefined) {
+      return [process.execPath, join(dirname(pkgPath), entry)];
+    }
+  } catch {
+    // 未安装 / package.json 不可读：走 npx 回落
+  }
+  return [...FALLBACK_ADAPTER_CMD];
+}
+
+const ADAPTER_PKG_SPECIFIER = "@agentclientprotocol/claude-agent-acp/package.json";
+
+/** 从 package.json 里挑一个可执行的入口：bin（对象取第一个值 / 字符串直接用）优先，其次 main */
+function readPackageEntry(pkg: unknown): string | undefined {
+  if (typeof pkg !== "object" || pkg === null) {
+    return undefined;
+  }
+  const record = pkg as { bin?: unknown; main?: unknown };
+  const bin = record.bin;
+  if (typeof bin === "string" && bin.length > 0) {
+    return bin;
+  }
+  if (typeof bin === "object" && bin !== null) {
+    for (const value of Object.values(bin as Record<string, unknown>)) {
+      if (typeof value === "string" && value.length > 0) {
+        return value;
+      }
+    }
+  }
+  return typeof record.main === "string" && record.main.length > 0 ? record.main : undefined;
+}
 export const CONFIG_FILE_NAME = "config.yaml";
 export const DEFAULT_HOME_DIRNAME = ".pi-workbench";
 
@@ -151,7 +200,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     authToken: fileToken ?? null,
     leaseTtlMs: assertLeaseTtl(fileTtl ?? DEFAULT_LEASE_TTL_MS, configPath),
     claude: {
-      adapterCmd: fileAdapter ?? [...DEFAULT_ADAPTER_CMD],
+      adapterCmd: fileAdapter ?? resolveDefaultAdapterCmd(),
       permissionMode: fileMode ?? DEFAULT_PERMISSION_MODE,
     },
   };

@@ -16,6 +16,8 @@
     "test": "node --test --experimental-strip-types \"test/*.test.ts\""
   },
   "dependencies": {
+    "@agentclientprotocol/claude-agent-acp": "0.107.0",
+    "@agentclientprotocol/sdk": "2.6.0",
     "@pi-workbench/shared": "workspace:*",
     "execa": "^10.2.1",
     "yaml": "^2.9.1"
