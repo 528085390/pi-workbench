@@ -1,5 +1,6 @@
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
+import type { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 
 import { ClaudeAdapter } from "./adapters/claude.ts";
@@ -12,7 +13,7 @@ import { isWorkbenchError } from "./errors.ts";
 import { EventStore } from "./events.ts";
 import { LeaseManager } from "./lease.ts";
 import { InstanceLockError, acquireInstanceLock, ensureDirs, resolvePaths } from "./paths.ts";
-import type { InstanceLock } from "./paths.ts";
+import type { InstanceLock, WorkbenchPaths } from "./paths.ts";
 import { EventPipeline } from "./pipeline.ts";
 import { SessionRegistry } from "./registry.ts";
 import { startServer } from "./server.ts";
@@ -48,16 +49,14 @@ export async function main(): Promise<void> {
     throw err;
   }
 
-  const db = openDb(paths.db);
-  migrate(db);
-
-  const store = new EventStore(db);
-  const leases = new LeaseManager(db, { ttlMs: config.leaseTtlMs });
-  const registry = new SessionRegistry(db);
-  // R34：冷启动恢复 —— 否则重启后 /sessions 与 dispatch 幂等复用都看不到历史会话
-  const restored = registry.loadFromDb();
-  const checkpoints = new CheckpointStore(db);
-  const dispatches = new DispatchStore(db);
+  // 评审 Minor 5：开库 / 迁移 / 装配 store 都在抢到实例锁之后，失败时必须释放锁，
+  // 否则下次启动只能靠 stale lock 自愈（R39 要求「启动失败也要释放锁」）。
+  const boot = bootStores(config, paths, lock);
+  if (boot === null) {
+    process.exitCode = 1;
+    return;
+  }
+  const { db, store, leases, registry, restored, checkpoints, dispatches } = boot;
 
   let adapter: ClaudeAdapter;
   try {
@@ -127,6 +126,51 @@ export async function main(): Promise<void> {
   });
 }
 
+/** 抢到实例锁之后装配出来的运行期对象（R39） */
+type Boot = {
+  db: DatabaseSync;
+  store: EventStore;
+  leases: LeaseManager;
+  registry: SessionRegistry;
+  /** R34：loadFromDb 恢复出来的会话条数 */
+  restored: number;
+  checkpoints: CheckpointStore;
+  dispatches: DispatchStore;
+};
+
+/**
+ * 开库 → 迁移 → 装配 store（R39）。
+ * 失败时（库损坏 SQLITE_NOTADB / 迁移报错 / store 构造抛错）关闭半开的库、释放实例锁、打印人话并返回 null，
+ * 由 main 设置 exitCode —— 评审 Minor 5。
+ */
+function bootStores(config: Config, paths: WorkbenchPaths, lock: InstanceLock): Boot | null {
+  let db: DatabaseSync | null = null;
+  try {
+    db = openDb(paths.db);
+    migrate(db);
+    const store = new EventStore(db);
+    const leases = new LeaseManager(db, { ttlMs: config.leaseTtlMs });
+    const registry = new SessionRegistry(db);
+    // R34：冷启动恢复 —— 否则重启后 /sessions 与 dispatch 幂等复用都看不到历史会话
+    const restored = registry.loadFromDb();
+    const checkpoints = new CheckpointStore(db);
+    const dispatches = new DispatchStore(db);
+    return { db, store, leases, registry, restored, checkpoints, dispatches };
+  } catch (err) {
+    if (db !== null) {
+      try {
+        db.close();
+      } catch {
+        // 半开的库关不掉也不该盖住原始失败原因
+      }
+    }
+    lock.release();
+    const reason = err instanceof Error ? err.message : String(err);
+    console.error("[pi-workbenchd] E_DB_INIT：打开数据库 / 迁移失败（" + reason + "），已释放实例锁");
+    return null;
+  }
+}
+
 /** 启动失败给一句人话：鉴权拒绝（R32）直接报错误码，端口占用保留 T1 的口径 */
 function reportStartupFailure(err: unknown, config: Config): void {
   if (isWorkbenchError(err)) {
@@ -171,5 +215,11 @@ function isEntrypoint(): boolean {
 }
 
 if (isEntrypoint()) {
-  void main();
+  // 评审 Minor 6：main 内未捕获异常（config.yaml 解析失败 / 迁移失败等）走 unhandled rejection
+  // 只会打原始栈；这里统一收口成人话 + 非零 exitCode。
+  main().catch((err: unknown) => {
+    const reason = err instanceof Error ? err.stack ?? err.message : String(err);
+    console.error("[pi-workbenchd] 启动失败：" + reason);
+    process.exitCode = 1;
+  });
 }

@@ -121,6 +121,11 @@ export const STATUS_BY_CODE: Readonly<Record<WorkbenchErrorCode, number>> = {
 
 /** 兜底错误码（spec §6 之外，仅「未知异常 → 500」使用） */
 export const INTERNAL_ERROR_CODE = "E_INTERNAL";
+/**
+ * 500 的对外固定文案（评审 Minor 2）：真实 message 可能带 SQL 片段 / 绝对路径 / 内部标识，
+ * 只写进日志，绝不回传给客户端。
+ */
+export const INTERNAL_ERROR_MESSAGE = "internal error";
 
 const ROUTE_LIST = "GET /sessions";
 const ROUTE_TRANSCRIPT = "GET /sessions/:key/transcript";
@@ -167,17 +172,28 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
       void reply.status(status).send(errorBody(error.code, error.message, error.details));
       return;
     }
-    // Fastify 自己的客户端错误（JSON 解析失败、body 过大等）按 400 E_BAD_REQUEST 回
+    // Fastify 自己的客户端错误（JSON 解析失败 / body 过大 413 / 不支持媒体类型 415 等）：
+    // 保留原 4xx 状态码，只把 code 归一到 E_BAD_REQUEST（评审 Minor 1：别把 413/415 一律压成 400）
     if (typeof error.statusCode === "number" && error.statusCode >= 400 && error.statusCode < 500) {
-      void reply.status(400).send(errorBody("E_BAD_REQUEST", error.message, { statusCode: error.statusCode }));
+      void reply.status(error.statusCode).send(errorBody("E_BAD_REQUEST", error.message));
       return;
     }
-    void reply.status(500).send(errorBody(INTERNAL_ERROR_CODE, error.message));
+    // 未知异常：对外固定文案，真实错误只进日志（评审 Minor 2：不回传内部 message）
+    app.log.error({ err: error }, "未处理异常，按 500 " + INTERNAL_ERROR_CODE + " 返回");
+    void reply.status(500).send(errorBody(INTERNAL_ERROR_CODE, INTERNAL_ERROR_MESSAGE));
   });
 
   app.setNotFoundHandler((request, reply) => {
     // R31：路由不存在仍是 404，但 body 统一成 {error:{code,message}}，code 用 E_BAD_REQUEST
     const path = pathOf(request.url);
+    // R32 + 评审 Minor 3：未匹配的 /api/cp/* 仍在受保护命名空间里，未认证必须先 401，
+    // 否则未认证调用方靠 404/401 的差异就能枚举路由是否存在。非 /api 路径保持 404。
+    if (isApiPath(path) && !isAuthorized(config, request.headers.authorization)) {
+      void reply
+        .status(401)
+        .send(errorBody("E_UNAUTHORIZED", "缺少或错误的 Authorization: Bearer <token>", { header: "authorization" }));
+      return;
+    }
     void reply.status(404).send(errorBody("E_BAD_REQUEST", "未知路由：" + request.method + " " + path, { path }));
   });
 
@@ -469,6 +485,11 @@ function pathOf(url: string): string {
   return mark === -1 ? url : url.slice(0, mark);
 }
 
+/** 是否落在 /api/cp 受保护命名空间内（含裸前缀本身） */
+function isApiPath(path: string): boolean {
+  return path === API_PREFIX || path.startsWith(API_PREFIX + "/");
+}
+
 function requireSession(registry: SessionRegistry, key: string): SessionRef {
   const session = registry.get(key);
   if (session === null) {
@@ -499,12 +520,16 @@ function bodyOf(body: unknown, route: string): JsonRecord {
   return body as JsonRecord;
 }
 
+/**
+ * 必填字符串：trim 只用于「是否为空」判定，值原样返回（评审 Minor 4）。
+ * inject.text / checkpoint.summary 的首尾空白有语义（代码块、patch、尾随换行），裁掉会破坏内容。
+ */
 function requireString(source: JsonRecord, field: string, route: string): string {
   const value = source[field];
   if (typeof value !== "string" || value.trim().length === 0) {
     throw new WorkbenchError("E_BAD_REQUEST", route + " 缺少必填字段 " + field, { route, field });
   }
-  return value.trim();
+  return value;
 }
 
 function optionalString(source: JsonRecord, field: string, route: string): string | undefined {

@@ -6,11 +6,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
+import { connect } from "node:net";
+import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 
-import type { SessionCaps, SessionRef } from "@pi-workbench/shared";
+import type { SessionCaps, SessionEvent, SessionRef } from "@pi-workbench/shared";
 import type { FastifyInstance } from "fastify";
 
 import type { AgentAdapter } from "../src/adapters/types.ts";
@@ -21,6 +23,7 @@ import { migrate, openDb } from "../src/db.ts";
 import { DispatchStore } from "../src/dispatch-store.ts";
 import { isWorkbenchError } from "../src/errors.ts";
 import { EventStore } from "../src/events.ts";
+import type { NewEvent } from "../src/events.ts";
 import { LeaseManager } from "../src/lease.ts";
 import { SessionRegistry } from "../src/registry.ts";
 import { STATUS_BY_CODE, createServer, startServer } from "../src/server.ts";
@@ -119,6 +122,8 @@ type BundleOptions = {
   config?: Partial<Config>;
   fakeOptions?: FakeOptions;
   readTranscript?: ServerTranscriptReader;
+  /** 需要观察 WS 回放窗口时可换成 EventStore 子类（正常用例不传） */
+  storeFactory?: (db: DatabaseSync) => EventStore;
 };
 
 function makeBundle(opts: BundleOptions = {}): Bundle {
@@ -126,7 +131,7 @@ function makeBundle(opts: BundleOptions = {}): Bundle {
   const db = openDb(":memory:");
   migrate(db);
 
-  const store = new EventStore(db);
+  const store = opts.storeFactory === undefined ? new EventStore(db) : opts.storeFactory(db);
   const leases = new LeaseManager(db);
   const registry = new SessionRegistry(db);
   const checkpoints = new CheckpointStore(db);
@@ -256,6 +261,22 @@ test("GET /agents 复用能力矩阵常量（R37）", async () => {
     assert.equal(first.version, "unknown");
     assert.equal(typeof first.available, "boolean");
     assert.deepEqual(first.caps, CLAUDE_CAPABILITIES);
+  } finally {
+    await h.close();
+  }
+});
+
+test("GET /agents：adapter 命令解析不到 → available:false（R37）", async () => {
+  const h = await makeHarness({
+    config: { claude: { adapterCmd: ["C:/nonexistent/pi-workbench-nope.exe"], permissionMode: "auto_allow" } },
+  });
+  try {
+    const res = await h.app.inject({ method: "GET", url: API + "/agents" });
+    assert.equal(res.statusCode, 200);
+    const body = res.json<{ agent: string; available: boolean; caps: SessionCaps }[]>();
+    assert.equal(body[0]?.agent, "claude");
+    assert.equal(body[0]?.available, false, "绝对路径不存在时必须报 available:false");
+    assert.deepEqual(body[0]?.caps, CLAUDE_CAPABILITIES);
   } finally {
     await h.close();
   }
@@ -405,6 +426,35 @@ test("POST inject：无租约 → 409 E_NO_LEASE；有租约 → {messageId, eff
     });
     assert.equal(noClient.statusCode, 400);
     assert.equal(noClient.json<ErrorEnvelope>().error.code, "E_BAD_REQUEST");
+  } finally {
+    await h.close();
+  }
+});
+
+test("POST inject：text 只做非空校验，原样投递（首尾空白不裁）", async () => {
+  const h = await makeHarness();
+  try {
+    await acquire(h.app, "pi:1");
+    const text = "  \n const a = 1;\n  ";
+    const res = await h.app.inject({
+      method: "POST",
+      url: SESSIONS + "/inject",
+      payload: { text, clientId: "pi:1" },
+    });
+    assert.equal(res.statusCode, 200, res.body);
+    assert.ok(
+      h.calls.includes("prompt:sess-1:" + text),
+      "adapter.prompt 应收到未裁剪的原文，实际调用：" + JSON.stringify(h.calls),
+    );
+
+    // 只有空白仍然算缺失（trim 只用于空判定）
+    const blank = await h.app.inject({
+      method: "POST",
+      url: SESSIONS + "/inject",
+      payload: { text: "   ", clientId: "pi:1" },
+    });
+    assert.equal(blank.statusCode, 400);
+    assert.equal(blank.json<ErrorEnvelope>().error.code, "E_BAD_REQUEST");
   } finally {
     await h.close();
   }
@@ -622,6 +672,30 @@ test("非 loopback + token：/api/cp/* 需 Bearer，/health 免鉴权", async ()
   }
 });
 
+test("未认证不得用 404/401 差异探路由：/api/cp/* 未知路径先 401，非 /api 未知路径仍 404（R32）", async () => {
+  const h = await makeHarness({ config: { host: "0.0.0.0", authToken: "tok-123" } });
+  try {
+    const anon = await h.app.inject({ method: "GET", url: API + "/nope" });
+    assert.equal(anon.statusCode, 401, "未认证访问未知 /api/cp 路径应 401，不能泄漏路由是否存在");
+    assert.equal(anon.json<ErrorEnvelope>().error.code, "E_UNAUTHORIZED");
+
+    const authed = await h.app.inject({
+      method: "GET",
+      url: API + "/nope",
+      headers: { authorization: "Bearer tok-123" },
+    });
+    assert.equal(authed.statusCode, 404);
+    assert.equal(authed.json<ErrorEnvelope>().error.code, "E_BAD_REQUEST");
+
+    // 非 /api 路径不在受保护命名空间内：未认证也应保持 404
+    const outside = await h.app.inject({ method: "GET", url: "/nope" });
+    assert.equal(outside.statusCode, 404);
+    assert.equal(outside.json<ErrorEnvelope>().error.code, "E_BAD_REQUEST");
+  } finally {
+    await h.close();
+  }
+});
+
 test("非 loopback 且无 token：拒绝构造，不静默裸奔（R32）", async () => {
   const bundle = makeBundle({ config: { host: "0.0.0.0", authToken: null } });
   try {
@@ -662,8 +736,13 @@ test("错误码 → 状态码映射覆盖 R35 全表", () => {
 test("错误体形状与状态码（E_BAD_REQUEST / E_NO_LEASE / E_IDEMPOTENCY_CONFLICT / E_RESUME_REJECTED）", async () => {
   const h = await makeHarness({ fakeOptions: { resumeError: new Error("resume denied") } });
   try {
-    // E_BAD_REQUEST：请求体不是 JSON 对象
-    const notObject = await h.app.inject({ method: "POST", url: SESSIONS + "/inject", payload: "x" });
+    // E_BAD_REQUEST：请求体是合法 JSON 但不是对象（字符串）
+    const notObject = await h.app.inject({
+      method: "POST",
+      url: SESSIONS + "/inject",
+      headers: { "content-type": "application/json" },
+      payload: JSON.stringify("x"),
+    });
     assert.equal(notObject.statusCode, 400);
     assert.equal(notObject.json<ErrorEnvelope>().error.code, "E_BAD_REQUEST");
 
@@ -733,7 +812,36 @@ test("未知异常 → 500 E_INTERNAL（R35 兜底码）", async () => {
     assert.equal(res.statusCode, 500);
     const body = res.json<ErrorEnvelope>();
     assert.equal(body.error.code, "E_INTERNAL");
-    assert.match(body.error.message, /boom/);
+    // 内部 message 不外泄（评审 Minor 2）：对外固定文案，真实原因只进日志
+    assert.equal(body.error.message, "internal error");
+    assert.ok(!res.body.includes("boom"), "不得把内部 error.message 回给客户端：" + res.body);
+  } finally {
+    await h.close();
+  }
+});
+
+test("Fastify 自身的 4xx（413 / 415）保留原状态码，code 仍是 E_BAD_REQUEST", async () => {
+  const h = await makeHarness();
+  try {
+    // 413：body 超过默认 1MiB bodyLimit
+    const tooLarge = await h.app.inject({
+      method: "POST",
+      url: SESSIONS + "/inject",
+      headers: { "content-type": "application/json" },
+      payload: JSON.stringify({ text: "x".repeat(1_200_000), clientId: "pi:1" }),
+    });
+    assert.equal(tooLarge.statusCode, 413, "payload 过大应保留 413，不能被压成 400：" + tooLarge.body);
+    assert.equal(tooLarge.json<ErrorEnvelope>().error.code, "E_BAD_REQUEST");
+
+    // 415：不支持的 Content-Type
+    const badType = await h.app.inject({
+      method: "POST",
+      url: SESSIONS + "/inject",
+      headers: { "content-type": "application/x-pi-unknown" },
+      payload: "text",
+    });
+    assert.equal(badType.statusCode, 415, "不支持的媒体类型应保留 415：" + badType.body);
+    assert.equal(badType.json<ErrorEnvelope>().error.code, "E_BAD_REQUEST");
   } finally {
     await h.close();
   }
@@ -862,6 +970,194 @@ function wsUrl(harness: Harness, after?: number): string {
   return base + API + "/ws" + (after === undefined ? "" : "?after=" + String(after));
 }
 
+/** 手工升级请求的结果：101 时给 socket，其它状态给 status + body */
+type UpgradeResult = { status: number; body: string; socket: Socket | null; head: Buffer };
+
+/**
+ * 手工发起 WS 升级（I1）：undici 的 WebSocket 客户端无法设置 header，
+ * 「鉴权钩子是否覆盖升级请求」只能自己发 HTTP 请求。
+ * 用裸 net socket 手写请求行，是因为被拒绝的升级（401）之后服务端会直接 RST，
+ * http 客户端会把已到的响应丢掉；这里只认自己收到的字节。
+ */
+function probeUpgrade(target: string, headers: Record<string, string>, timeoutMs = 4000): Promise<UpgradeResult> {
+  const url = new URL(target);
+  const port = Number(url.port);
+  const requestText =
+    [
+      "GET " + url.pathname + url.search + " HTTP/1.1",
+      "Host: " + url.hostname + ":" + String(port),
+      "Upgrade: websocket",
+      "Connection: Upgrade",
+      "Sec-WebSocket-Version: 13",
+      "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+      ...Object.entries(headers).map(([key, value]) => key + ": " + value),
+      "",
+      "",
+    ].join("\r\n");
+
+  return new Promise<UpgradeResult>((resolve, reject) => {
+    const socket = connect({ host: url.hostname, port });
+    let buffer = Buffer.alloc(0);
+    let settled = false;
+
+    const settle = (result: UpgradeResult): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+
+    const timer = setTimeout(() => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      socket.destroy();
+      reject(new Error("WS 升级请求超时：" + target));
+    }, timeoutMs);
+
+    const parseHead = (): { status: number; headText: string; rest: Buffer } | null => {
+      const mark = buffer.indexOf("\r\n\r\n");
+      if (mark === -1) {
+        return null;
+      }
+      const headText = buffer.subarray(0, mark).toString("utf8");
+      const match = /^HTTP\/1\.1 (\d{3})/.exec(headText);
+      return { status: match === null ? 0 : Number(match[1]), headText, rest: buffer.subarray(mark + 4) };
+    };
+
+    /** 能把结果定下来就返回 true（非 101 需要 body 收齐） */
+    const settleOnceAvailable = (force: boolean): boolean => {
+      const parsed = parseHead();
+      if (parsed === null) {
+        return false;
+      }
+      if (parsed.status === 101) {
+        settle({ status: 101, body: "", socket, head: parsed.rest });
+        return true;
+      }
+      const lengthMatch = /content-length:\s*(\d+)/i.exec(parsed.headText);
+      const length = lengthMatch === null ? -1 : Number(lengthMatch[1]);
+      if (!force && length >= 0 && parsed.rest.length < length) {
+        return false;
+      }
+      const body = (length >= 0 ? parsed.rest.subarray(0, length) : parsed.rest).toString("utf8");
+      settle({ status: parsed.status, body, socket: null, head: Buffer.alloc(0) });
+      socket.destroy();
+      return true;
+    };
+
+    socket.on("connect", () => {
+      socket.write(requestText);
+    });
+    socket.on("data", (chunk: Buffer) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      settleOnceAvailable(false);
+    });
+    socket.on("end", () => {
+      settleOnceAvailable(true);
+    });
+    socket.on("error", (err: Error) => {
+      // 401 之后服务端 RST：已收到的字节足够断言状态码与 body
+      if (settleOnceAvailable(true)) {
+        return;
+      }
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
+}
+
+/** 解析一帧；数据不够返回 null。服务端帧不掩码，客户端掩码时按 RFC 跳过 4 字节掩码键。 */
+function parseTextFrame(buffer: Buffer): { text: string; size: number } | null {
+  if (buffer.length < 2) {
+    return null;
+  }
+  const first = buffer[0] ?? 0;
+  const second = buffer[1] ?? 0;
+  const opcode = first & 0x0f;
+  let length = second & 0x7f;
+  let offset = 2;
+  if (length === 126) {
+    if (buffer.length < 4) {
+      return null;
+    }
+    length = buffer.readUInt16BE(2);
+    offset = 4;
+  } else if (length === 127) {
+    if (buffer.length < 10) {
+      return null;
+    }
+    length = Number(buffer.readBigUInt64BE(2));
+    offset = 10;
+  }
+  if ((second & 0x80) !== 0) {
+    offset += 4;
+  }
+  if (buffer.length < offset + length) {
+    return null;
+  }
+  const payload = buffer.subarray(offset, offset + length).toString("utf8");
+  return { text: opcode === 0x1 ? payload : "", size: offset + length };
+}
+
+/** 从裸 socket 上读一帧文本（101 之后断言「确实收到事件」用） */
+function readTextFrame(socket: Socket, head: Buffer, timeoutMs = 4000): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    let buffer = head;
+    const cleanup = (): void => {
+      clearTimeout(timer);
+      socket.off("data", onData);
+      socket.off("error", onError);
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("等待 WS 帧超时"));
+    }, timeoutMs);
+    const onError = (err: Error): void => {
+      cleanup();
+      reject(err);
+    };
+    const onData = (chunk: Buffer): void => {
+      buffer = Buffer.concat([buffer, chunk]);
+      const frame = parseTextFrame(buffer);
+      if (frame === null) {
+        return;
+      }
+      cleanup();
+      assert.ok(frame.text.length > 0, "收到的应是文本帧");
+      resolve(frame.text);
+    };
+    socket.on("data", onData);
+    socket.on("error", onError);
+    onData(Buffer.alloc(0));
+  });
+}
+
+/**
+ * I2 的确定性场景：让「回放瞬间刚 append 的事件」既进订阅缓冲、又出现在 listAll 的结果里。
+ * 只有 server.ts 里 `event.seq <= lastSeq` 的去重守卫能挡住重复下发 —— 守卫一删，对应测试必红。
+ */
+class RaceReplayStore extends EventStore {
+  /** 下一次 listAll 之前要插入的事件（模拟「回放窗口内到达的实时事件」） */
+  pending: NewEvent | null = null;
+
+  override listAll(afterSeq = 0, limit?: number): SessionEvent[] {
+    const pending = this.pending;
+    this.pending = null;
+    if (pending !== null) {
+      this.append(pending);
+    }
+    return super.listAll(afterSeq, limit);
+  }
+}
+
 test("WS：连接后 append 的事件以 {seq,sessionKey,type,payload,source,ts} 下发（R33）", async () => {
   const h = await makeHarness({ listen: true, seed: null });
   const received: string[] = [];
@@ -922,12 +1218,95 @@ test("WS：?after=<seq> 先回放存量再收新事件，且不重复下发", as
       source: "claude",
       idempotencyKey: "ws-live",
     });
-    const messages = await waitFor(received, 2);
-    const live = JSON.parse(messages[1] ?? "{}") as { seq: number; type: string };
-    assert.equal(live.type, "token");
-    assert.ok(live.seq > newer.seq);
+    await waitFor(received, 2);
+    // I2：静置 120ms 再看总数 —— 去重守卫一旦失效，缓冲里被回放过的存量会被补发一次，这里就会多出第 3 条
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    const expected = 2; // newer 的存量回放 + 一条 live
+    assert.equal(received.length, expected, "回放 + live 应恰好 " + String(expected) + " 条：" + JSON.stringify(received));
+    const seqs = received.map((raw) => (JSON.parse(raw) as { seq: number }).seq);
+    for (let i = 1; i < seqs.length; i += 1) {
+      assert.ok((seqs[i] ?? 0) > (seqs[i - 1] ?? 0), "seq 必须严格递增：" + JSON.stringify(seqs));
+    }
+    assert.equal(new Set(seqs).size, seqs.length, "seq 不得重复：" + JSON.stringify(seqs));
+    assert.deepEqual(seqs, [newer.seq, newer.seq + 1]);
   } finally {
     socket?.close();
+    await h.close();
+  }
+});
+
+test("WS：回放窗口内到达的实时事件不会重复下发（去重靠 seq 单调，I2）", async () => {
+  const h = await makeHarness({ listen: true, seed: null, storeFactory: (db) => new RaceReplayStore(db) });
+  const received: string[] = [];
+  let socket: MinimalSocket | null = null;
+  try {
+    h.store.append({
+      sessionKey: SESSION_KEY,
+      type: "notice",
+      payload: { n: 1 },
+      source: "claude",
+      idempotencyKey: "ws-race-1",
+    });
+    // 连接时服务端先订阅再回放：这条事件既进缓冲，也会出现在回放结果里
+    const store = h.store as RaceReplayStore;
+    store.pending = {
+      sessionKey: SESSION_KEY,
+      type: "token",
+      payload: { n: 2 },
+      source: "claude",
+      idempotencyKey: "ws-race-2",
+    };
+
+    socket = await openWs(wsUrl(h), received);
+    await waitFor(received, 2);
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    assert.equal(received.length, 2, "同一条事件只能下发一次：" + JSON.stringify(received));
+    const seqs = received.map((raw) => (JSON.parse(raw) as { seq: number }).seq);
+    assert.equal(seqs.length, new Set(seqs).size, "seq 不得重复：" + JSON.stringify(seqs));
+    assert.ok((seqs[1] ?? 0) > (seqs[0] ?? 0), "seq 必须严格递增：" + JSON.stringify(seqs));
+  } finally {
+    socket?.close();
+    await h.close();
+  }
+});
+
+// ---------------------------------------------------------------- WS 鉴权（R32 / I1）
+
+test("WS 鉴权只认 Authorization header：无 header → 401、?token= → 401、Bearer → 101 且收到事件（I1）", async () => {
+  const h = await makeHarness({ listen: true, seed: null, config: { authToken: "t" } });
+  let socket: Socket | null = null;
+  try {
+    // (a) 无 Authorization：升级必须被拒绝（服务端回 401，不会完成 101 握手）
+    const noHeader = await probeUpgrade(wsUrl(h), {});
+    assert.equal(noHeader.status, 401, "无 Authorization 必须 401 拒绝升级");
+    assert.equal(noHeader.socket, null, "被拒绝的升级不应拿到已升级的 socket");
+    assert.equal((JSON.parse(noHeader.body) as ErrorEnvelope).error.code, "E_UNAUTHORIZED");
+
+    // (a2) query-string 形式：header-only 规则，?token= 同样 401（浏览器无法给 WS 设 header 的 v1 限制）
+    const queryToken = await probeUpgrade(wsUrl(h) + "?token=t", {});
+    assert.equal(queryToken.status, 401, "?token= 不受支持：WS 鉴权只认 header");
+    assert.equal((JSON.parse(queryToken.body) as ErrorEnvelope).error.code, "E_UNAUTHORIZED");
+
+    // (b) 带正确 Bearer：握手成功，并能收到一条 append 的事件
+    const upgraded = await probeUpgrade(wsUrl(h), { authorization: "Bearer t" });
+    assert.equal(upgraded.status, 101, "带正确 Bearer 应 101");
+    const raw = upgraded.socket;
+    assert.ok(raw !== null, "101 必须给出已升级的 socket");
+    socket = raw;
+
+    const appended = h.store.append({
+      sessionKey: SESSION_KEY,
+      type: "token",
+      payload: { text: "hello" },
+      source: "claude",
+      idempotencyKey: "ws-auth-1",
+    });
+    const wire = JSON.parse(await readTextFrame(raw, upgraded.head)) as Record<string, unknown>;
+    assert.equal(wire["seq"], appended.seq);
+    assert.equal(wire["sessionKey"], SESSION_KEY);
+    assert.equal(wire["type"], "token");
+  } finally {
+    socket?.destroy();
     await h.close();
   }
 });
