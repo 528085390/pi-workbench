@@ -207,7 +207,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 
   const envHost = env.PI_WORKBENCH_HOST?.trim();
   const envPortRaw = env.PI_WORKBENCH_PORT?.trim();
-  const envToken = env.PI_WORKBENCH_AUTH_TOKEN?.trim();
+  // 兼容两个名字：daemon 侧历史上用 PI_WORKBENCH_AUTH_TOKEN，客户端/CLI/e2e 用 PI_WORKBENCH_TOKEN。
+  // 只认前者时，用后者启动的 daemon 会「静默无鉴权」——所以两个都认，AUTH_TOKEN 优先。
+  const envToken = (env.PI_WORKBENCH_AUTH_TOKEN ?? env.PI_WORKBENCH_TOKEN)?.trim();
 
   const cfg: Config = {
     ...persisted,

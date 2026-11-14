@@ -5,14 +5,14 @@ import type { AgentName, Checkpoint, SessionCaps, SessionRef } from "@pi-workben
  *
  * 分层（裁定 R42）：
  * - `createWorkbenchClient` 只做 HTTP：返回解析后的 JSON，非 2xx 抛 `WorkbenchHttpError`；
- * - `registerWorkbenchTools` 属于工具层：注册 7 个 `WORKBENCH_TOOL_NAMES`，把 JSON 响应压成
+ * - `registerWorkbenchTools` 属于工具层：注册 8 个 `WORKBENCH_TOOL_NAMES`，把 JSON 响应压成
  *   一句人读文本，把错误压成 `E_XXX: message`（LLM 看得到错误码，不需要解析 JSON）。
  *
  * 不 import Pi SDK：`PiToolApi` 是最小结构化契约（`registerTool(name, def)`），
  * 宿主传什么实现都行（Pi runtime / 测试里的假 api）。
  */
 
-/** A09 注册给 Pi LLM 的工具名（7 个，顺序即注册顺序）。 */
+/** A09 注册给 Pi LLM 的工具名（8 个，顺序即注册顺序）。 */
 export const WORKBENCH_TOOL_NAMES = [
   "cp_dispatch",
   "cp_sessions",
@@ -21,6 +21,7 @@ export const WORKBENCH_TOOL_NAMES = [
   "cp_interrupt",
   "cp_handoff",
   "cp_checkpoint",
+  "cp_lease",
 ] as const;
 
 export type WorkbenchToolName = (typeof WORKBENCH_TOOL_NAMES)[number];
@@ -136,6 +137,22 @@ export type HandoffResult = {
 
 export type HandbackResult = { resumed: boolean; deltaSummary: string };
 
+/** `POST /sessions/:key/lease` 的三种动作 */
+export type LeaseAction = "acquire" | "release" | "heartbeat";
+
+/** acquire / heartbeat 返回的租约（release 返回 ReleaseResult） */
+export type LeaseRecord = {
+  sessionKey: string;
+  driver: "pi" | "human" | "none";
+  clientId: string;
+  expiresAt: string;
+  heartbeatAt: string;
+};
+
+export type ReleaseResult = { released: boolean; sessionKey: string; clientId: string };
+
+export type LeaseResult = LeaseRecord | ReleaseResult;
+
 /** daemon HTTP 契约（A09）。全部返回解析后的 JSON；非 2xx 抛 `WorkbenchHttpError`。 */
 export type WorkbenchClient = {
   /** 本 client 的写操作身份（`pi:<pid>`，可覆盖） */
@@ -151,6 +168,11 @@ export type WorkbenchClient = {
   checkpoint(key: string, input: CheckpointInput): Promise<Checkpoint>;
   handoff(key: string, to: "human" | "pi", input?: CheckpointInput): Promise<HandoffResult>;
   handback(key: string): Promise<HandbackResult>;
+  /**
+   * 取/续/还租约（A09 补）。写操作（inject/interrupt/checkpoint/handoff）都要求
+   * 同一 `clientId` 先 acquire；没有这个方法，Pi 侧工具在真实宿主里全是 E_NO_LEASE。
+   */
+  lease(key: string, action: LeaseAction, options?: { driver?: "pi" | "human"; ttlMs?: number }): Promise<LeaseResult>;
 };
 
 /** T1 的旧名字，等价于 `WorkbenchClient`（R43：不破坏既有导入） */
@@ -290,6 +312,12 @@ export function createWorkbenchClient(options: WorkbenchClientOptions = {}): Wor
     },
     handback: async (key) =>
       (await call("POST", sessionPath(key, "/handback"), { clientId })) as HandbackResult,
+    lease: async (key, action, options) => {
+      const body: Record<string, unknown> = { action, clientId };
+      if (options?.driver !== undefined) body["driver"] = options.driver;
+      if (options?.ttlMs !== undefined) body["ttlMs"] = options.ttlMs;
+      return (await call("POST", sessionPath(key, "/lease"), body)) as LeaseResult;
+    },
   };
 }
 
@@ -544,6 +572,48 @@ export function registerWorkbenchTools(
         return (
           "checkpoint saved for " + key + " @ " + checkpoint.createdAt + " (cursor=" + checkpoint.transcriptCursor + ")"
         );
+      } catch (error) {
+        return formatToolError(error);
+      }
+    },
+  });
+
+  api.registerTool("cp_lease", {
+    description:
+      "取 / 续 / 还会话租约。inject、interrupt、checkpoint、handoff 这些写操作都要求本客户端先 acquire（同一 clientId）。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        key: { type: "string", description: "会话 key（必填）" },
+        action: { type: "string", enum: ["acquire", "release", "heartbeat"], description: "动作（必填）" },
+        driver: { type: "string", enum: ["pi", "human"], description: "acquire 时的驱动方（可选，默认 pi）" },
+        ttlMs: { type: "number", description: "租约时长毫秒（可选；human 接管给大值，如 30 分钟）" },
+      },
+      required: ["key", "action"],
+    },
+    handler: async (input: unknown): Promise<string> => {
+      try {
+        const key = requireField(input, "key");
+        const action = requireField(input, "action");
+        if (action !== "acquire" && action !== "release" && action !== "heartbeat") {
+          throw new ToolInputError("action 必须是 acquire / release / heartbeat");
+        }
+        const driverRaw = fieldOf(input, "driver");
+        if (driverRaw !== undefined && driverRaw !== "pi" && driverRaw !== "human") {
+          throw new ToolInputError("driver 只能是 pi / human");
+        }
+        const ttlRaw = isRecord(input) ? input["ttlMs"] : undefined;
+        if (ttlRaw !== undefined && (typeof ttlRaw !== "number" || !Number.isFinite(ttlRaw) || ttlRaw <= 0)) {
+          throw new ToolInputError("ttlMs 必须是正数");
+        }
+        const options: { driver?: "pi" | "human"; ttlMs?: number } = {};
+        if (driverRaw !== undefined) options.driver = driverRaw;
+        if (typeof ttlRaw === "number") options.ttlMs = ttlRaw;
+        const result = await client.lease(key, action, options);
+        if ("released" in result) {
+          return "lease released for " + key;
+        }
+        return "lease " + action + " ok for " + key + " (driver=" + result.driver + ", expiresAt=" + result.expiresAt + ")";
       } catch (error) {
         return formatToolError(error);
       }

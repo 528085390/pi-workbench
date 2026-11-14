@@ -220,12 +220,12 @@ function fakeApi(): { api: PiToolApi; tools: Array<{ name: string; def: PiToolDe
   };
 }
 
-test("registerWorkbenchTools 只注册 7 个 cp_* 工具，各带 description/inputSchema/handler", () => {
+test("registerWorkbenchTools 只注册 8 个 cp_* 工具，各带 description/inputSchema/handler", () => {
   const { api, tools } = fakeApi();
   const { fetchImpl } = recorder();
   registerWorkbenchTools(api, { baseUrl: "http://h:1", fetch: fetchImpl });
 
-  assert.equal(tools.length, 7);
+  assert.equal(tools.length, 8);
   assert.deepEqual(
     tools.map((tool) => tool.name),
     [...WORKBENCH_TOOL_NAMES],
@@ -237,6 +237,47 @@ test("registerWorkbenchTools 只注册 7 个 cp_* 工具，各带 description/in
     assert.equal(typeof tool.def.inputSchema, "object");
     assert.equal(typeof tool.def.handler, "function");
   }
+});
+
+test("cp_lease 三种 action 打到 /lease 并带 clientId/driver/ttlMs", async () => {
+  const { api, tools } = fakeApi();
+  const { calls, fetchImpl } = recorder((call) => {
+    if (call.body !== null && typeof call.body === "object" && (call.body as Record<string, unknown>)["action"] === "release") {
+      return { body: { released: true, sessionKey: "claude:abc", clientId: "pi:7" } };
+    }
+    return {
+      body: {
+        sessionKey: "claude:abc",
+        driver: "pi",
+        clientId: "pi:7",
+        expiresAt: "2026-11-15T00:00:00.000Z",
+        heartbeatAt: "2026-11-14T23:30:00.000Z",
+      },
+    };
+  });
+  registerWorkbenchTools(api, { baseUrl: "http://h:1", clientId: "pi:7", fetch: fetchImpl });
+
+  const lease = tools.find((tool) => tool.name === "cp_lease");
+  assert.ok(lease !== undefined, "必须注册 cp_lease —— 否则 Pi 侧写操作全 E_NO_LEASE");
+
+  const acquired = await lease.def.handler({ key: "claude:abc", action: "acquire", ttlMs: 60000 });
+  assert.equal(typeof acquired, "string");
+  assert.match(acquired as string, /lease acquire ok/);
+
+  const released = await lease.def.handler({ key: "claude:abc", action: "release" });
+  assert.equal(released, "lease released for claude:abc");
+
+  const acquireCall = calls.find(
+    (call) => call.body !== null && typeof call.body === "object" && (call.body as Record<string, unknown>)["action"] === "acquire",
+  );
+  assert.ok(acquireCall !== undefined);
+  assert.equal(acquireCall.method, "POST");
+  assert.ok(acquireCall.url.endsWith("/api/cp/sessions/claude%3Aabc/lease"), acquireCall.url);
+  assert.equal((acquireCall.body as Record<string, unknown>)["clientId"], "pi:7");
+  assert.equal((acquireCall.body as Record<string, unknown>)["ttlMs"], 60000);
+
+  const bad = await lease.def.handler({ key: "claude:abc", action: "take" });
+  assert.equal(bad, "E_BAD_REQUEST: action 必须是 acquire / release / heartbeat");
 });
 
 test("cp_dispatch / cp_inject handler 委托给 client，返回人读摘要", async () => {

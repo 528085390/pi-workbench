@@ -48,7 +48,7 @@ export const USAGE = [
   "接管原语（HTTP /api/cp/*）：",
   "  sessions [--agent A] [--status S] [--json]   列出会话",
   "  see <key> [--after 游标] [--limit N] [--json] 读 transcript 增量（只读）",
-  "  lease <key> --action acquire|release|heartbeat --driver pi|human [--client-id ID] [--ttl-ms N]",
+  "  lease <key> --action acquire|release|heartbeat --driver pi|human [--client-id ID] [--ttl-ms N]（恒输出 JSON，方便脚本取 expiresAt）",
   "                                               取 / 续 / 放租约（写操作的前置条件），打印租约 JSON",
   "  inject <key> <文本...> [--client-id ID] [--json]",
   "                                               向会话注入一条用户消息",

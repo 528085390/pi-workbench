@@ -79,6 +79,27 @@ test("loadConfig: env 覆盖端口与主机", () => {
   }
 });
 
+test("loadConfig: token 兼容两个环境变量名（AUTH_TOKEN 优先）", () => {
+  const home = freshHome();
+  try {
+    // 客户端 / CLI / e2e 用 PI_WORKBENCH_TOKEN；只认 AUTH_TOKEN 会导致「静默无鉴权」
+    const viaClient = loadConfig({ PI_WORKBENCH_HOME: home, PI_WORKBENCH_TOKEN: "client-token" });
+    assert.equal(viaClient.authToken, "client-token");
+
+    const viaDaemon = loadConfig({ PI_WORKBENCH_HOME: home, PI_WORKBENCH_AUTH_TOKEN: "daemon-token" });
+    assert.equal(viaDaemon.authToken, "daemon-token");
+
+    const both = loadConfig({
+      PI_WORKBENCH_HOME: home,
+      PI_WORKBENCH_AUTH_TOKEN: "daemon-token",
+      PI_WORKBENCH_TOKEN: "client-token",
+    });
+    assert.equal(both.authToken, "daemon-token", "AUTH_TOKEN 优先");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("loadConfig: 文件字段优先，缺失字段回填并回写", () => {
   const home = freshHome();
   try {

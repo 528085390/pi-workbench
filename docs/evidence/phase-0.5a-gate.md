@@ -2,7 +2,7 @@
 
 - 日期：2026-11-15
 - 阶段：Phase 0.5-A / A11（真实闭环验收）
-- 分支 / commit：`feat/phase-0.5a` @ `92e4b5e`（Gate 主体证据采于 `bbfd200`；Gate #6 与 handback 复验、严格版 e2e 由控制者在其后补做）
+- 分支 / commit：`feat/phase-0.5a`（Gate 主体证据采于 `bbfd200`；Gate #6、handback 复验与严格版 e2e 由控制者在其后补做，终审修复见 `git log`）
 - 执行者：Task 10（Gate 执行代理）；Gate #6 原生 TUI 接管由控制者补做
 - 结论：**9 条全部 ✅ 通过** → Gate 0.5-A **通过**（Gate #6 的原生 TUI 抓屏由控制者用 ConPTY 补做，见 §8；严格版 e2e 两轮 PASS 见 §12.5）
 - 原始产物目录：`docs/evidence/phase-0.5a/`
