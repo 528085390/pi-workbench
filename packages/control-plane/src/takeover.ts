@@ -272,8 +272,10 @@ export class TakeoverEngine {
     this.#registry.upsert(next);
     this.#appendState(next, { state: "idle", driver: "pi", clientId }, "handback");
 
+    // 租约交还给**调用方自己**：handback 的语义是「控制权回到 pi 驱动」，调用方接下来要
+    // inject/interrupt，若挂到 "handback-<id>" 这种派生 id 上，原 clientId 立刻会 E_NO_LEASE。
     this.#leases.release(key, clientId);
-    this.#leases.acquire(key, "pi", "handback-" + clientId, DEFAULT_LEASE_TTL_MS);
+    this.#leases.acquire(key, "pi", clientId, DEFAULT_LEASE_TTL_MS);
     return { resumed: true, deltaSummary };
   }
 
