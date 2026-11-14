@@ -8,7 +8,7 @@
  *   重放靠 `EventStore.append` 的 INSERT OR IGNORE，管线本身不缓存去重。
  * - R18 状态同步：`state` 已经是 `SessionStatus`，管线只透传并调 `SessionRegistry.updateStatus`；
  *   未知会话只记一次 stderr，绝不抛。
- * - R19 transcript 去重：每个会话维护「ACP 已见 messageId」集合，命中即跳过；`ts` 不参与去重。
+ * - R19 transcript 去重：每个会话维护「ACP 已见 messageId」集合，**只记真正落库的 update**，命中即跳过；`ts` 不参与去重。
  * - R20 attach 语义：重复 attach 同一会话先退订旧的；`dispose()` 退订全部；单条事件处理异常不外溢。
  *
  * 该模块不碰 WS / HTTP：广播由上层（Task 8/9 的 server）订阅 `EventStore.subscribe`。
@@ -190,12 +190,6 @@ export class EventPipeline {
         return;
       }
 
-      // R19：先把 ACP 见过的 messageId 记下来，供 transcript 去重（取不到就不记）
-      const messageId = extractMessageId(update.raw);
-      if (messageId !== undefined) {
-        this.#seenAcp(sessionKey).add(messageId);
-      }
-
       if (update.id.length === 0) {
         this.#logger.debug("AdapterUpdate 缺少 id（会话 " + sessionKey + "），已丢弃");
         return;
@@ -213,6 +207,14 @@ export class EventPipeline {
         source: ref.agent,
         idempotencyKey: ref.agent + ":" + ref.nativeId + ":" + update.id,
       });
+
+      // R19：只有**真正落库**的 update 才把 messageId 记入去重集合（取不到就不记）。
+      // 提前记账会让被丢弃的 update（坏 id / state 缺 state / store 抛错）毒化集合，
+      // 使后续携带同一 messageId 的 transcript 消息被静默跳过。
+      const messageId = extractMessageId(update.raw);
+      if (messageId !== undefined) {
+        this.#seenAcp(sessionKey).add(messageId);
+      }
 
       // R18：状态投影（落内存 + sessions 表）；这里只透传，不猜字符串
       if (update.kind === "state" && update.state !== undefined) {

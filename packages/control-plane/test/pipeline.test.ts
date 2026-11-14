@@ -5,11 +5,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { DatabaseSync } from "node:sqlite";
-import type { SessionRef } from "@pi-workbench/shared";
+import type { SessionEvent, SessionRef } from "@pi-workbench/shared";
 
 import type { AdapterUpdate, AdapterUpdateKind, AgentAdapter } from "../src/adapters/types.ts";
 import { migrate, openDb } from "../src/db.ts";
-import { EventStore } from "../src/events.ts";
+import { EventStore, type NewEvent } from "../src/events.ts";
 import { EventPipeline, type PipelineLogger } from "../src/pipeline.ts";
 import { SessionRegistry } from "../src/registry.ts";
 import type { UnifiedMessage } from "../src/transcript/claude.ts";
@@ -358,6 +358,107 @@ test("R20 dispose: 退订所有 adapter，之后不再写入", () => {
     h.adapter.emit({ kind: "text", id: "m-1", text: "a", raw: { messageId: "m-1" } });
     assert.equal(eventCount(h.db), 0);
     assert.doesNotThrow(() => h.pipeline.dispose(), "dispose 可重复调用");
+  } finally {
+    h.close();
+  }
+});
+
+
+test("R19 回归: 被丢弃的 update 不得毒化去重集合（只有落库成功的 update 才记账）", () => {
+  const h = makeHarness();
+  try {
+    h.pipeline.attach(h.adapter, "claude:sess-1");
+
+    // kind=state 缺 state → 该 update 被丢弃，但 raw 里带着 messageId
+    assert.doesNotThrow(() => {
+      h.adapter.emit({ kind: "state", id: "st-dropped", raw: { messageId: "m-shared" } });
+    });
+    assert.deepEqual(h.store.list("claude:sess-1"), [], "缺 state 的 update 不得落事件");
+
+    // 同 id 的 transcript 消息仍必须落库（旧实现把它记进 seenAcp 后此处会静默跳过）
+    const added = h.pipeline.ingestTranscript("claude:sess-1", [
+      transcriptMessage({ id: "m-shared", text: "must not be skipped" }),
+    ]);
+    assert.equal(added, 1, "被丢弃 update 的 messageId 不得拦住 transcript 消息");
+
+    const events = h.store.list("claude:sess-1");
+    assert.equal(events.length, 1);
+    assert.equal(events[0].type, "token");
+    assert.equal(events[0].idempotencyKey, "claude:sess-1:transcript:m-shared");
+    assert.deepEqual(events[0].payload, { text: "must not be skipped" });
+  } finally {
+    h.close();
+  }
+});
+
+test("R20 异常隔离: store.append 抛错一次不中断管线，第二条 update 仍落库且错误被记录", () => {
+  const db = openDb(":memory:");
+  migrate(db);
+  try {
+    const registry = new SessionRegistry(db);
+    registry.upsert(makeRef());
+
+    // 薄 stub：只实现管线实际用到的 append / list / subscribe
+    let appendCalls = 0;
+    const written: SessionEvent[] = [];
+    const stub: Pick<EventStore, "append" | "list" | "subscribe"> = {
+      append: (event: NewEvent): SessionEvent => {
+        appendCalls += 1;
+        if (appendCalls === 1) {
+          throw new Error("stub: 磁盘写入失败");
+        }
+        const stored: SessionEvent = { seq: appendCalls, ts: new Date().toISOString(), ...event };
+        written.push(stored);
+        return stored;
+      },
+      list: (sessionKey: string): SessionEvent[] => written.filter((event) => event.sessionKey === sessionKey),
+      subscribe: (): (() => void) => () => {},
+    };
+
+    const logs: string[] = [];
+    const pipeline = new EventPipeline(stub as unknown as EventStore, registry, {
+      debug: (message) => logs.push(message),
+      error: (message) => logs.push(message),
+    });
+    const adapter = makeAdapter();
+    pipeline.attach(adapter, "claude:sess-1");
+
+    assert.doesNotThrow(() => {
+      adapter.emit({ kind: "text", id: "boom-1", text: "first", raw: { messageId: "boom-1" } });
+      adapter.emit({ kind: "text", id: "ok-2", text: "second", raw: { messageId: "ok-2" } });
+    }, "store 抛错不得冒泡出管线");
+
+    assert.equal(appendCalls, 2, "两次 update 都必须到 store（第一条的异常不得拦住第二条）");
+    assert.deepEqual(written.map((e) => e.idempotencyKey), ["claude:sess-1:ok-2"], "第二条必须写成功");
+    assert.equal(logs.length, 1, "错误只记一条，不刷屏");
+    assert.match(logs[0], /磁盘写入失败/, "日志带上原始错误");
+    assert.match(logs[0], /claude:sess-1/);
+  } finally {
+    db.close();
+  }
+});
+
+test("R18 未知会话: 所有 kind 都丢弃且不抛，每个会话只记一条 error", () => {
+  const h = makeHarness({ seed: [] });
+  try {
+    h.pipeline.attach(h.adapter, "claude:ghost-a");
+    h.pipeline.attach(h.adapter, "claude:ghost-b");
+
+    assert.doesNotThrow(() => {
+      h.adapter.emit({ kind: "text", id: "g-1", text: "x", raw: { messageId: "g-1" } });
+      h.adapter.emit({ kind: "tool_call", id: "g-2", toolName: "Read", raw: { messageId: "g-2" } });
+      h.adapter.emit({ kind: "state", id: "g-3", state: "idle", raw: { messageId: "g-3" } });
+    });
+
+    assert.deepEqual(h.store.list("claude:ghost-a"), [], "未知会话不落事件");
+    assert.deepEqual(h.store.list("claude:ghost-b"), [], "未知会话不落事件");
+    assert.equal(eventCount(h.db), 0);
+    assert.equal(h.logs.length, 2, "两个未知会话各记一条，后续 update 不再刷屏");
+    assert.match(h.logs[0], /claude:ghost-a/);
+    assert.match(h.logs[1], /claude:ghost-b/);
+
+    assert.equal(h.pipeline.ingestTranscript("claude:ghost-a", [transcriptMessage({ id: "tr-ghost" })]), 0);
+    assert.equal(h.logs.length, 2, "同一会话的第二次告警被抑制");
   } finally {
     h.close();
   }
