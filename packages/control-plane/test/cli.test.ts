@@ -200,18 +200,21 @@ function output() {
   return { logs, errors, options };
 }
 
-test("--help 列出全部 10 个子命令", async () => {
+test("--help 列出全部 11 个子命令", async () => {
   const out = output();
   const code = await main(["node", "pi-workbench", "--help"], out.options);
   const text = out.logs.join("\n");
 
   assert.equal(code, 0);
-  assert.equal(SUBCOMMANDS.length, 10);
+  assert.equal(SUBCOMMANDS.length, 11);
   for (const name of SUBCOMMANDS) {
     assert.ok(text.includes(name), "用法里缺少子命令 " + name);
     assert.ok(USAGE.includes(name), "USAGE 常量里缺少子命令 " + name);
   }
   assert.ok(text.includes("checkpoint") && text.includes("handback") && text.includes("sessions"));
+  assert.ok(text.includes("lease"), "用法里必须有 lease（写操作取租约的唯一入口）");
+  assert.ok(text.includes("退出码"), "用法必须写清 0/1/2 退出码");
+  assert.ok(text.includes("E_NO_LEASE"), "用法必须写明写操作需要持有租约");
 });
 
 test("缺少 key ⇒ 退出码 2，原因与用法都打到 stderr", async () => {
@@ -351,6 +354,256 @@ test("daemon 返回 409 ⇒ 退出 1，stderr 打印 code: message", async () =>
     assert.equal(out.errors.join("\n"), "E_NO_LEASE: 无有效租约：claude:abc");
   } finally {
     await daemon.close();
+  }
+});
+
+
+
+// ---------------------------------------------------------------------------
+// I1：interrupt / checkpoint / handback 的 method + url + body 断言
+// （旧用例只断言退出码，把 /interrupt 改成 /interrupts 也照样绿）
+// ---------------------------------------------------------------------------
+
+test("interrupt 打到 /interrupt，body 只有 clientId", async () => {
+  const daemon = await fakeDaemon(() => ({ body: { stopReason: "user_cancelled" } }));
+  try {
+    const out = output();
+    const code = await main(
+      ["node", "pi-workbench", "interrupt", "claude:abc", "--client-id", "pi:7", "--url", daemon.url],
+      out.options,
+    );
+
+    assert.equal(code, 0);
+    assert.equal(daemon.requests.length, 1);
+    assert.equal(daemon.requests[0]?.method, "POST");
+    assert.equal(daemon.requests[0]?.url, "/api/cp/sessions/claude%3Aabc/interrupt");
+    assert.deepEqual(daemon.requests[0]?.body, { clientId: "pi:7" });
+    assert.ok(out.logs.join("\n").includes("user_cancelled"), out.logs.join("\n"));
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("checkpoint 打到 /checkpoint，body 含 summary / nextStep / touchedFiles / clientId", async () => {
+  const daemon = await fakeDaemon(() => ({
+    body: {
+      sessionKey: "claude:abc",
+      summary: "做了一半",
+      touchedFiles: ["a.ts"],
+      nextStep: "继续",
+      transcriptCursor: "7",
+      createdAt: "2026-11-15T00:00:00.000Z",
+    },
+  }));
+  try {
+    const out = output();
+    const code = await main(
+      [
+        "node",
+        "pi-workbench",
+        "checkpoint",
+        "claude:abc",
+        "--summary",
+        "做了一半",
+        "--next-step",
+        "继续",
+        "--file",
+        "a.ts",
+        "--file",
+        "b.ts",
+        "--client-id",
+        "pi:9",
+        "--url",
+        daemon.url,
+      ],
+      out.options,
+    );
+
+    assert.equal(code, 0);
+    assert.equal(daemon.requests.length, 1);
+    assert.equal(daemon.requests[0]?.method, "POST");
+    assert.equal(daemon.requests[0]?.url, "/api/cp/sessions/claude%3Aabc/checkpoint");
+    assert.deepEqual(daemon.requests[0]?.body, {
+      clientId: "pi:9",
+      summary: "做了一半",
+      nextStep: "继续",
+      touchedFiles: ["a.ts", "b.ts"],
+    });
+    assert.ok(out.logs.join("\n").includes("cursor=7"), out.logs.join("\n"));
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("handback 打到 /handback，body 只有 clientId，并打印 resumed / 增量", async () => {
+  const daemon = await fakeDaemon(() => ({ body: { resumed: true, deltaSummary: "人类改了两行" } }));
+  try {
+    const out = output();
+    const code = await main(
+      ["node", "pi-workbench", "handback", "claude:abc", "--client-id", "handoff-pi:7", "--url", daemon.url],
+      out.options,
+    );
+
+    assert.equal(code, 0);
+    assert.equal(daemon.requests.length, 1);
+    assert.equal(daemon.requests[0]?.method, "POST");
+    assert.equal(daemon.requests[0]?.url, "/api/cp/sessions/claude%3Aabc/handback");
+    assert.deepEqual(daemon.requests[0]?.body, { clientId: "handoff-pi:7" });
+    const text = out.logs.join("\n");
+    assert.ok(text.includes("resumed=true"), text);
+    assert.ok(text.includes("人类改了两行"), text);
+  } finally {
+    await daemon.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// I2：lease 子命令（写操作的前置条件，第 11 个子命令）
+// ---------------------------------------------------------------------------
+
+test("lease acquire 打到 /lease，body 含 action/driver/clientId/ttlMs，输出租约 JSON", async () => {
+  const daemon = await fakeDaemon(() => ({
+    body: {
+      sessionKey: "claude:abc",
+      driver: "pi",
+      clientId: "e2e-1",
+      expiresAt: "2026-11-15T00:00:30.000Z",
+      heartbeatAt: "2026-11-15T00:00:00.000Z",
+    },
+  }));
+  try {
+    const out = output();
+    const code = await main(
+      [
+        "node",
+        "pi-workbench",
+        "lease",
+        "claude:abc",
+        "--action",
+        "acquire",
+        "--driver",
+        "pi",
+        "--client-id",
+        "e2e-1",
+        "--ttl-ms",
+        "60000",
+        "--url",
+        daemon.url,
+      ],
+      out.options,
+    );
+
+    assert.equal(code, 0);
+    assert.equal(daemon.requests.length, 1);
+    assert.equal(daemon.requests[0]?.method, "POST");
+    assert.equal(daemon.requests[0]?.url, "/api/cp/sessions/claude%3Aabc/lease");
+    assert.deepEqual(daemon.requests[0]?.body, {
+      action: "acquire",
+      clientId: "e2e-1",
+      driver: "pi",
+      ttlMs: 60000,
+    });
+
+    // 租约必须原样打 JSON：expiresAt / clientId 是后续子命令要用的字段
+    const printed = out.logs.join("\n");
+    const parsed = JSON.parse(printed) as Record<string, unknown>;
+    assert.equal(parsed["clientId"], "e2e-1");
+    assert.equal(parsed["expiresAt"], "2026-11-15T00:00:30.000Z");
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("lease release 不发 driver（服务端按 clientId 释放）", async () => {
+  const daemon = await fakeDaemon(() => ({
+    body: { released: true, sessionKey: "claude:abc", clientId: "pi:7" },
+  }));
+  try {
+    const out = output();
+    const code = await main(
+      ["node", "pi-workbench", "lease", "claude:abc", "--action", "release", "--client-id", "pi:7", "--url", daemon.url],
+      out.options,
+    );
+
+    assert.equal(code, 0);
+    assert.equal(daemon.requests[0]?.url, "/api/cp/sessions/claude%3Aabc/lease");
+    assert.deepEqual(daemon.requests[0]?.body, { action: "release", clientId: "pi:7" });
+    assert.ok(out.logs.join("\n").includes("released"));
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("lease 的用法错误一律退出码 2：缺 --action / 非法 action / acquire 缺 --driver / --ttl-ms 非正整数", async () => {
+  const cases: Array<{ args: string[]; match: string }> = [
+    { args: ["lease", "claude:abc"], match: "--action" },
+    { args: ["lease", "claude:abc", "--action", "steal"], match: "acquire / release / heartbeat" },
+    { args: ["lease", "claude:abc", "--action", "acquire"], match: "--driver" },
+    { args: ["lease", "claude:abc", "--action", "heartbeat", "--ttl-ms", "abc"], match: "正整数" },
+  ];
+
+  for (const item of cases) {
+    const out = output();
+    const code = await main(["node", "pi-workbench", ...item.args], out.options);
+    assert.equal(code, 2, JSON.stringify(item.args));
+    assert.equal(out.logs.length, 0, "用法错误不写 stdout：" + JSON.stringify(item.args));
+    assert.ok(out.errors.join("\n").includes(item.match), JSON.stringify(item.args) + " → " + out.errors.join("\n"));
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 其它评审修复：--limit 本地校验、start/stop/status 拒远端参数、start --help
+// ---------------------------------------------------------------------------
+
+test("see --limit abc ⇒ 退出 2，且一个请求都不发（以前会变成服务端 400 ⇒ exit 1）", async () => {
+  const daemon = await fakeDaemon(() => ({ body: { messages: [], nextCursor: "0" } }));
+  try {
+    const out = output();
+    const code = await main(
+      ["node", "pi-workbench", "see", "claude:abc", "--limit", "abc", "--url", daemon.url],
+      out.options,
+    );
+
+    assert.equal(code, 2);
+    assert.ok(out.errors.join("\n").includes("正整数"));
+    assert.equal(daemon.requests.length, 0);
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("I5：start/stop/status 收到 --url/--json/--client-id ⇒ 退出 2 并指向远端子命令", async () => {
+  const cases: string[][] = [
+    ["start", "--url", "http://remote:7331"],
+    ["stop", "--token", "t"],
+    ["status", "--json"],
+    ["status", "--client-id", "x"],
+  ];
+
+  for (const item of cases) {
+    const out = output();
+    const code = await main(["node", "pi-workbench", ...item], out.options);
+    assert.equal(code, 2, JSON.stringify(item));
+    const stderr = out.errors.join("\n");
+    assert.ok(stderr.includes("只操作本机 daemon"), JSON.stringify(item) + " → " + stderr);
+    assert.ok(stderr.includes("sessions/see/inject"), stderr);
+    assert.equal(out.logs.length, 0, "用法错误不写 stdout");
+  }
+});
+
+test("start --help 打印用法，不启动 daemon", async () => {
+  const home = freshHome();
+  try {
+    const paths = resolvePaths(home);
+    const logs: string[] = [];
+    const code = await main(["node", "pi-workbench", "start", "--help"], { log: (line) => logs.push(line), env: { PI_WORKBENCH_HOME: home } });
+
+    assert.equal(code, 0);
+    assert.ok(logs.join("\n").includes("用法：pi-workbench"), logs.join("\n"));
+    assert.equal(existsSync(paths.pid), false, "不应写 pid 文件");
+    assert.equal(existsSync(join(paths.logs, "daemon.log")), false, "不应 spawn daemon（start 一定会先建日志文件）");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
   }
 });
 

@@ -1,0 +1,13 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "noEmit": true,
+    // 只给 test/ 关掉下标访问的 undefined 收窄：本包 test/ 在 Task 10 之前
+    // 从未被 tsc 覆盖，存量用例大量依赖 arr[0].x 这种写法（55 处 noUncheckedIndexedAccess 报错）。
+    // 关它换来的是「测试也被 tsc 覆盖」——签名、参数个数、字段名写错照样报错；
+    // 收窄存量用例留给后续清理，src/ 仍由 tsconfig.json 严格检查。
+    "noUncheckedIndexedAccess": false
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"]
+}

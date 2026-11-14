@@ -32,6 +32,7 @@ export const SUBCOMMANDS = [
   "handoff",
   "handback",
   "checkpoint",
+  "lease",
 ] as const;
 
 export type Subcommand = (typeof SUBCOMMANDS)[number];
@@ -47,6 +48,8 @@ export const USAGE = [
   "接管原语（HTTP /api/cp/*）：",
   "  sessions [--agent A] [--status S] [--json]   列出会话",
   "  see <key> [--after 游标] [--limit N] [--json] 读 transcript 增量（只读）",
+  "  lease <key> --action acquire|release|heartbeat --driver pi|human [--client-id ID] [--ttl-ms N]",
+  "                                               取 / 续 / 放租约（写操作的前置条件），打印租约 JSON",
   "  inject <key> <文本...> [--client-id ID] [--json]",
   "                                               向会话注入一条用户消息",
   "  interrupt <key> [--client-id ID] [--json]    打断当前回合",
@@ -54,7 +57,7 @@ export const USAGE = [
   "                                               写 checkpoint",
   "  handoff <key> [--to human|pi] [--summary S] [--next-step N] [--file F]... [--client-id ID] [--json]",
   "                                               交给人类（默认 human），打印接管命令",
-  "  handback <key> [--client-id ID] [--json]     从人类手里接回（--client-id 传 handoff-<原 client-id>）",
+  "  handback <key> [--client-id ID] [--json]     从人类手里接回（ID 用 GET /api/cp/sessions/<key> 的 lease.clientId）",
   "",
   "通用参数：",
   "  --url URL        控制面地址（默认 $PI_WORKBENCH_URL，再回落配置里的 host:port）",
@@ -62,6 +65,16 @@ export const USAGE = [
   "  --client-id ID   写操作身份（默认 cli:<pid>；必须与租约持有者一致，否则 E_NO_LEASE）",
   "  --json           输出原始 JSON",
   "  -h, --help       显示本帮助",
+  "",
+  "退出码：",
+  "  0  成功",
+  "  1  运行失败（stderr 打印 <code>: <message>，例如 E_NO_LEASE / E_DAEMON_DOWN）",
+  "  2  用法错误（stderr 打印原因 + 本用法，stdout 不写）",
+  "",
+  "写操作需要租约：inject / interrupt / checkpoint / handoff / handback 都要求调用方持有该会话的租约，",
+  "  否则 daemon 回 E_NO_LEASE（退出码 1）。先取租约：",
+  "    pi-workbench lease <key> --action acquire --driver pi --client-id <id>",
+  "  之后写操作带同一个 --client-id（省略时缺省 cli:<pid>，同一进程内取租约与写操作天然一致）。",
 ].join("\n");
 
 /** 运行期失败：打印 `<code>: <message>`，退出码 1 */
@@ -345,6 +358,9 @@ const VALUE_FLAGS = new Set([
   "next-step",
   "file",
   "to",
+  "action",
+  "driver",
+  "ttl-ms",
 ]);
 
 /** 布尔开关 */
@@ -405,6 +421,17 @@ function stringFlag(parsed: ParsedArgs, name: string): string | undefined {
 
 function hasFlag(parsed: ParsedArgs, name: string): boolean {
   return parsed.flags.get(name) === true;
+}
+
+/** 正整数参数：本地就挡住（交给服务端校验会变成 exit 1，而它其实是用法错误 exit 2） */
+function positiveIntFlag(parsed: ParsedArgs, name: string, command: string): number | undefined {
+  const raw = stringFlag(parsed, name);
+  if (raw === undefined) return undefined;
+  const value = Number(raw);
+  if (!/^[0-9]+$/.test(raw.trim()) || !Number.isSafeInteger(value) || value <= 0) {
+    throw new UsageError(command + " 的 --" + name + " 必须是正整数（收到：" + raw + "）");
+  }
+  return value;
 }
 
 function requireKey(parsed: ParsedArgs, command: Subcommand): string {
@@ -562,9 +589,9 @@ async function cmdSee(parsed: ParsedArgs, options: CliOptions, deps: Deps): Prom
   const endpoint = endpointOf(parsed, options);
   const query = new URLSearchParams();
   const after = stringFlag(parsed, "after");
-  const limit = stringFlag(parsed, "limit");
+  const limit = positiveIntFlag(parsed, "limit", "see");
   if (after !== undefined) query.set("after", after);
-  if (limit !== undefined) query.set("limit", limit);
+  if (limit !== undefined) query.set("limit", String(limit));
   const suffix = query.toString().length === 0 ? "" : "?" + query.toString();
 
   const payload = await requestJson(
@@ -701,8 +728,12 @@ async function cmdHandoff(parsed: ParsedArgs, options: CliOptions, deps: Deps): 
     .join(" ");
   deps.log("已交给 " + to + "（mode=" + str(result, "mode") + "）");
   if (command.length > 0) deps.log("接管命令：" + command);
+  // 历史口径是 handoff-<原 client-id>，但真正的租约持有者以服务端为准；
+  // 这里只做提示，权威读法是 GET /api/cp/sessions/<key> 的 lease.clientId
   const handbackClientId = "handoff-" + clientIdOf(parsed);
-  deps.log("接回（handback）时用：--client-id " + handbackClientId);
+  deps.log(
+    "接回（handback）时用：--client-id " + handbackClientId + "（以 GET /api/cp/sessions/<key> 的 lease.clientId 为准）",
+  );
   return 0;
 }
 
@@ -727,6 +758,64 @@ async function cmdHandback(parsed: ParsedArgs, options: CliOptions, deps: Deps):
   return 0;
 }
 
+const LEASE_ACTIONS = ["acquire", "release", "heartbeat"] as const;
+
+type LeaseAction = (typeof LEASE_ACTIONS)[number];
+
+function leaseActionOf(parsed: ParsedArgs): LeaseAction {
+  const raw = stringFlag(parsed, "action");
+  if (raw === undefined) {
+    throw new UsageError("lease 需要 --action acquire|release|heartbeat");
+  }
+  const action = LEASE_ACTIONS.find((candidate) => candidate === raw);
+  if (action === undefined) {
+    throw new UsageError("lease 的 --action 只能是 acquire / release / heartbeat（收到：" + raw + "）");
+  }
+  return action;
+}
+
+/**
+ * 租约身份：只有 acquire 需要 --driver（服务端据此判单 writer）；release / heartbeat 沿用已有租约的 driver。
+ * 传了就必须合法，不静默忽略。
+ */
+function leaseDriverOf(parsed: ParsedArgs, action: LeaseAction): "pi" | "human" | "none" | undefined {
+  const raw = stringFlag(parsed, "driver");
+  if (raw === undefined) {
+    if (action === "acquire") {
+      throw new UsageError("lease --action acquire 需要 --driver pi|human");
+    }
+    return undefined;
+  }
+  if (raw === "pi" || raw === "human" || raw === "none") return raw;
+  throw new UsageError("lease 的 --driver 只能是 pi / human / none（收到：" + raw + "）");
+}
+
+/**
+ * 租约子命令（I2）：写操作的前置条件。响应一律打 JSON ——
+ * Lease 的 expiresAt / clientId 是要续期、要传给后续子命令的结构化字段，压成人读摘要只会丢信息。
+ */
+async function cmdLease(parsed: ParsedArgs, options: CliOptions, deps: Deps): Promise<number> {
+  const key = requireKey(parsed, "lease");
+  const action = leaseActionOf(parsed);
+  const driver = leaseDriverOf(parsed, action);
+  const ttlMs = positiveIntFlag(parsed, "ttl-ms", "lease");
+
+  const body: Record<string, unknown> = { action, clientId: clientIdOf(parsed) };
+  if (driver !== undefined) body["driver"] = driver;
+  if (ttlMs !== undefined) body["ttlMs"] = ttlMs;
+
+  const endpoint = endpointOf(parsed, options);
+  const payload = await requestJson(
+    endpoint,
+    "POST",
+    "/api/cp/sessions/" + encodeURIComponent(key) + "/lease",
+    body,
+    fetchOf(options),
+  );
+  deps.log(JSON.stringify(payload, null, 2));
+  return 0;
+}
+
 function isRemoteCommand(command: string): command is Subcommand {
   return (
     command === "sessions" ||
@@ -735,7 +824,8 @@ function isRemoteCommand(command: string): command is Subcommand {
     command === "interrupt" ||
     command === "handoff" ||
     command === "handback" ||
-    command === "checkpoint"
+    command === "checkpoint" ||
+    command === "lease"
   );
 }
 
@@ -760,9 +850,40 @@ async function runRemote(command: Subcommand, args: string[], options: CliOption
       return await cmdHandoff(parsed, options, deps);
     case "handback":
       return await cmdHandback(parsed, options, deps);
+    case "lease":
+      return await cmdLease(parsed, options, deps);
     default:
       return 2;
   }
+}
+
+/** start/stop/status 只操作本机 daemon：任何远端参数/位置参数都明确拒绝，而不是静默忽略（I5） */
+const LOCAL_ONLY_HINT = "start/stop/status 只操作本机 daemon；远端请用 sessions/see/inject/... 子命令";
+
+async function runLocal(
+  command: "start" | "stop" | "status",
+  args: string[],
+  options: CliOptions,
+  deps: Deps,
+): Promise<number> {
+  const parsed = parseArgs(args);
+  if (hasFlag(parsed, "help")) {
+    // 顺手修掉的 minor：以前 start --help 会真的把 daemon 拉起来
+    deps.log(USAGE);
+    return 0;
+  }
+  const offending = [...parsed.flags.keys(), ...parsed.lists.keys()].filter((name) => name !== "help").sort();
+  if (offending.length > 0) {
+    throw new UsageError(
+      command + " 不接受 " + offending.map((name) => "--" + name).join(" / ") + "：" + LOCAL_ONLY_HINT,
+    );
+  }
+  if (parsed.positionals.length > 0) {
+    throw new UsageError(command + " 不接受位置参数（收到：" + parsed.positionals.join(" ") + "）：" + LOCAL_ONLY_HINT);
+  }
+  if (command === "start") return await start(options);
+  if (command === "stop") return await stop(options);
+  return await status(options);
 }
 
 /** 分发子命令，返回退出码（不直接 process.exit，方便测试） */
@@ -783,11 +904,9 @@ export async function main(argv: string[] = process.argv, options: CliOptions = 
   try {
     switch (command) {
       case "start":
-        return await start(options);
       case "stop":
-        return await stop(options);
       case "status":
-        return await status(options);
+        return await runLocal(command, args.slice(1), options, deps);
       default:
         if (isRemoteCommand(command)) {
           return await runRemote(command, args.slice(1), options, deps);

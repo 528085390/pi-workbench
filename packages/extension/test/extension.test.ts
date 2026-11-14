@@ -18,7 +18,8 @@ type Call = {
   body: unknown;
 };
 
-type Reply = { status?: number; body: unknown };
+/** raw 用来伪造非 JSON 响应体（网关 HTML 错误页） */
+type Reply = { status?: number; body: unknown; raw?: string };
 
 /**
  * 假 fetch：记录每次调用，按 handler 返回固定响应。
@@ -43,9 +44,10 @@ function recorder(handler?: (call: Call) => Reply): { calls: Call[]; fetchImpl: 
     calls.push(call);
 
     const reply: Reply = handler === undefined ? { body: {} } : handler(call);
-    return new Response(JSON.stringify(reply.body), {
+    const text = reply.raw ?? JSON.stringify(reply.body);
+    return new Response(text, {
       status: reply.status ?? 200,
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": reply.raw === undefined ? "application/json" : "text/html" },
     });
   };
   return { calls, fetchImpl };
@@ -129,11 +131,18 @@ test("写操作 body 带上 clientId 与各自的字段", async () => {
   await client.inject("claude:abc", "你好");
   await client.checkpoint("claude:abc", { summary: "s" });
   await client.handoff("claude:abc", "human");
+  await client.interrupt("claude:abc");
+  await client.handback("claude:abc");
 
   assert.deepEqual(calls[0]?.body, { agent: "claude", task: "干活", idempotencyKey: "k1", cwd: "/tmp/w" });
   assert.deepEqual(calls[1]?.body, { text: "你好", clientId: "pi:7" });
   assert.deepEqual(calls[2]?.body, { clientId: "pi:7", summary: "s", touchedFiles: [], nextStep: "" });
   assert.deepEqual(calls[3]?.body, { to: "human", clientId: "pi:7" });
+  // interrupt / handback 的 body 只有 clientId（I1 评审点：以前没断言）
+  assert.deepEqual(calls[4]?.body, { clientId: "pi:7" });
+  assert.deepEqual(calls[4]?.url, "http://h:1/api/cp/sessions/claude%3Aabc/interrupt");
+  assert.deepEqual(calls[5]?.body, { clientId: "pi:7" });
+  assert.deepEqual(calls[5]?.url, "http://h:1/api/cp/sessions/claude%3Aabc/handback");
 });
 
 test("404 抛 WorkbenchHttpError，字段 status/code/message 齐全", async () => {
@@ -178,6 +187,29 @@ test("错误体不是标准结构时回落 E_HTTP_<status>", async () => {
     assert.equal(error.code, "E_HTTP_500");
     return true;
   });
+});
+
+test("错误体不是 JSON（网关 HTML 页）⇒ 回落 E_HTTP_<status>，handler 给可读文本", async () => {
+  const { fetchImpl } = recorder(() => ({
+    status: 502,
+    body: undefined,
+    raw: "<html><body><h1>502 Bad Gateway</h1></body></html>",
+  }));
+  const client = createWorkbenchClient({ baseUrl: "http://h:1", fetch: fetchImpl });
+
+  await assert.rejects(client.health(), (error: unknown) => {
+    assert.ok(error instanceof WorkbenchHttpError, "必须是 WorkbenchHttpError");
+    assert.equal(error.status, 502);
+    assert.equal(error.code, "E_HTTP_502");
+    assert.equal(error.message, "HTTP 502");
+    return true;
+  });
+
+  const { api, tools } = fakeApi();
+  registerWorkbenchTools(api, { baseUrl: "http://h:1", fetch: fetchImpl });
+  const see = tools.find((tool) => tool.name === "cp_see");
+  assert.ok(see !== undefined);
+  assert.equal(await see.def.handler({ key: "claude:abc" }), "E_HTTP_502: HTTP 502");
 });
 
 function fakeApi(): { api: PiToolApi; tools: Array<{ name: string; def: PiToolDefinition }> } {

@@ -152,7 +152,7 @@ async function pollSee(sessionKey, startCursor, predicate) {
       return { hit: true, cursor, messages, status: lastStatus, waitedMs: POLL_TIMEOUT_MS - (deadline - Date.now()) };
     }
 
-    await sleepMs(POLL_INTERVAL_MS);
+    await sleep(POLL_INTERVAL_MS);
   }
 
   return { hit: false, cursor, messages, status: lastStatus, waitedMs: POLL_TIMEOUT_MS };
@@ -251,8 +251,23 @@ async function main() {
     record("handoff", true, { mode: handoff.mode, command });
     process.stdout.write("\n>>> 接管命令：" + command + "\n\n");
 
-    // 10. handback：租约此时在 handoff-<clientId> 手上（engine 的命名口径）
-    const handbackClientId = "handoff-" + clientId;
+    // 10. handback：先问服务端「现在谁持有租约」，不靠客户端猜命名。
+    //     历史实现把租约换成了 handoff-<原 clientId>（engine 口径），但那是实现细节：
+    //     脚本一旦抄这个前缀，engine 改口径就静默失效 —— 因此一律读 lease.clientId。
+    const detail = await request("GET", "/api/cp/sessions/" + encodeURIComponent(sessionKey));
+    const currentLease = detail !== null && typeof detail === "object" ? detail.lease : null;
+    const handbackClientId =
+      currentLease !== null && typeof currentLease === "object" && typeof currentLease.clientId === "string"
+        ? currentLease.clientId
+        : null;
+    if (handbackClientId === null) {
+      throw new Error(
+        "handback 前 GET /api/cp/sessions/" +
+          sessionKey +
+          " 没有返回 lease.clientId（租约可能已过期）——先 lease acquire 再 handback，别用 handoff- 前缀去猜",
+      );
+    }
+    record("lease-handback", true, { clientId: handbackClientId });
     const handback = await request("POST", "/api/cp/sessions/" + encodeURIComponent(sessionKey) + "/handback", {
       clientId: handbackClientId,
     });

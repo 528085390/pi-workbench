@@ -81,11 +81,16 @@ export type HealthBody = {
   uptimeMs?: number;
 };
 
+/**
+ * `GET /api/cp/agents` 的一条。能力字段名以服务端为准：服务端返回 `caps`
+ * （server.ts 的 agent list），T9 评审 M1 指出这里曾误写成 `capabilities`，
+ * 导致类型与真实响应不符 —— 只保留 `caps` 这一个名字，别再加别名。
+ */
 export type AgentDescriptor = {
   agent: AgentName;
   available?: boolean;
   version?: string;
-  capabilities: SessionCaps;
+  caps: SessionCaps;
 };
 
 /** transcript 归一化后的一条消息（与控制面 UnifiedMessage 同构的最小形状） */
