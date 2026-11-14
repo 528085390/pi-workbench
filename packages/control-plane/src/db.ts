@@ -8,7 +8,8 @@ import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 /** 当前 schema 版本，写入 `PRAGMA user_version`。 */
-export const SCHEMA_VERSION = 1;
+/** 当前 schema 版本，写入 `PRAGMA user_version`。v2：新增 dispatches（dispatch 幂等预留表）。 */
+export const SCHEMA_VERSION = 2;
 
 const MEMORY_PATH = ":memory:";
 
@@ -42,8 +43,10 @@ export function migrate(db: DatabaseSync): void {
     return;
   }
 
+  const current = schemaVersion(db);
   db.exec("BEGIN");
   try {
+    if (current < 1) {
     db.exec(`
 CREATE TABLE IF NOT EXISTS sessions (
   key TEXT PRIMARY KEY,              -- 'claude:<nativeId>'
@@ -87,6 +90,23 @@ CREATE TABLE IF NOT EXISTS checkpoints (
   created_at TEXT NOT NULL
 );
 `);
+    }
+
+    if (current < 2) {
+      // v2：dispatch 幂等预留表。主键 + INSERT OR IGNORE 提供原子占位，避免并发重复 dispatch。
+      db.exec(`
+CREATE TABLE IF NOT EXISTS dispatches (
+  idempotency_key TEXT PRIMARY KEY,
+  payload_hash TEXT NOT NULL,
+  session_key TEXT,
+  status TEXT NOT NULL,              -- reserved | done | failed
+  error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+`);
+    }
+
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     db.exec("COMMIT");
   } catch (err) {
