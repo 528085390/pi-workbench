@@ -182,10 +182,12 @@ async function main() {
     record("dispatch", true, { key: sessionKey, status: statusOf(ref), nativeId: ref.nativeId });
 
     // 3. 取租约：后面所有写操作（inject / interrupt / checkpoint / handoff）都要它
+    // 真 claude 首轮可能 >30s（默认 TTL），这里直接要 30 分钟，避免中途 E_NO_LEASE
     const lease = await request("POST", "/api/cp/sessions/" + encodeURIComponent(sessionKey) + "/lease", {
       action: "acquire",
       driver: "pi",
       clientId,
+      ttlMs: 30 * 60 * 1000,
     });
     record("lease", true, { clientId, expiresAt: lease !== null && typeof lease === "object" ? lease.expiresAt : null });
 
