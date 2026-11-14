@@ -307,6 +307,16 @@ curl -s 127.0.0.1:7331/api/cp/sessions/<key>/checkpoint
 | D6 | `packages/control-plane/src/lease.ts` | 无后台清扫，`expires_at` 到期仅读取时惰性判定；崩溃后过期租约行仍在表里（本次 5 行全留） | `leases` 表持续增长；不破坏单 driver 保护 | 后续加 TTL 清扫或归档 |
 | D7 | spec §10 #7「崩溃后租约不永久锁死」 | 只证了「租约行不丢 + 到期即视为无租约」，没有等 30 s 租约自然过期后重新 acquire 的实测 | 该条 TTL 回收仍是推理而非实测 | 补一条 TTL 到期后重新 acquire 的用例 |
 
+## 15.5 终审修复（整分支评审 FIX-FIRST，commit `6438f3e`）
+
+| ID | 问题 | 修法 | 验证 |
+|---|---|---|---|
+| I-1 | daemon 只认 `PI_WORKBENCH_AUTH_TOKEN`，CLI/扩展/e2e 只认 `PI_WORKBENCH_TOKEN` → 用后者启动等于**静默无鉴权** | `config.ts` 两个名字都认（AUTH_TOKEN 优先）；spec §6 写明唯一名字 | 新增 `config.test.ts` 用例 3 attrs；真机 `0.0.0.0` + `PI_WORKBENCH_TOKEN=s3cr3t`：无 header 401、未知路由 401、带 header 200 |
+| I-2 | spec 里 checkpoint / handoff 表体没写 `clientId`，实现却要求 | spec §6 两行补 `clientId` | 与 `server.ts` 的 `requireString("clientId")` 对齐 |
+| I-3 | Pi 扩展 7 个 `cp_*` 无取租约入口 → 真实宿主里写工具全 `E_NO_LEASE` | 新增第 8 个工具 `cp_lease`（acquire/release/heartbeat，driver/ttlMs 校验）+ client 方法 | `extension.test.ts` 用例断言 URL/body/错误文案；全量 16 pass |
+
+回归：`pnpm -r build`/typecheck 三包 Done；control-plane 212 tests / 211 pass / 1 skip；extension 16 pass。
+
 ## 16. 遗留与下一步
 
 1. **Gate #6 已补**：ConPTY 打开 `claude --resume <id>` → 看到历史 → 注入 `TUI_INJECT_7788` → transcript 落 assistant 文本（§8）。Gate 0.5-A 据此翻为 ✅。
