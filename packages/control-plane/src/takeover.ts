@@ -40,6 +40,9 @@ export const CURSOR_ZERO = "0";
 export const DISPATCH_KEY_PREFIX = "dispatch:";
 
 /** reserved 状态的等待口径（C1）：每 50ms 复查一次，最多等 5s */
+/** 人类接管租约的 clientId 前缀：handoff 时派生，handback 时剥掉还给 pi 侧 */
+const HANDOFF_CLIENT_PREFIX = "handoff-";
+
 const DISPATCH_POLL_INTERVAL_MS = 50;
 const DISPATCH_POLL_TIMEOUT_MS = 5000;
 
@@ -229,7 +232,7 @@ export class TakeoverEngine {
 
     // 5. 租约转给接管的 driver，人类窗口固定 30 分钟
     this.#leases.release(key, clientId);
-    this.#leases.acquire(key, to, "handoff-" + clientId, HUMAN_HANDOFF_TTL_MS);
+    this.#leases.acquire(key, to, HANDOFF_CLIENT_PREFIX + clientId, HUMAN_HANDOFF_TTL_MS);
 
     // 6. 注册表 + 事件
     const next: SessionRef = { ...ref, driver: to, status: "handoff" };
@@ -272,10 +275,12 @@ export class TakeoverEngine {
     this.#registry.upsert(next);
     this.#appendState(next, { state: "idle", driver: "pi", clientId }, "handback");
 
-    // 租约交还给**调用方自己**：handback 的语义是「控制权回到 pi 驱动」，调用方接下来要
-    // inject/interrupt，若挂到 "handback-<id>" 这种派生 id 上，原 clientId 立刻会 E_NO_LEASE。
+    // 租约交还给 **pi 侧身份**：handback 的语义是「控制权回到 pi 驱动」。人类租约的 id 是
+    // handoff 时派生的 "handoff-<piClientId>"（见 handoff），所以要剥掉这层前缀再发回去，
+    // 否则 Pi 扩展用原来的 clientId 写会立刻 E_NO_LEASE。
+    const piClientId = clientId.startsWith(HANDOFF_CLIENT_PREFIX) ? clientId.slice(HANDOFF_CLIENT_PREFIX.length) : clientId;
     this.#leases.release(key, clientId);
-    this.#leases.acquire(key, "pi", clientId, DEFAULT_LEASE_TTL_MS);
+    this.#leases.acquire(key, "pi", piClientId, DEFAULT_LEASE_TTL_MS);
     return { resumed: true, deltaSummary };
   }
 

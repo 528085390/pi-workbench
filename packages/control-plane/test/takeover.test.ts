@@ -552,7 +552,7 @@ test("handback: resume 同一 nativeId + 从 checkpoint 游标起读 transcript 
     assert.equal(ref?.status, "idle");
     const lease = h.leases.current(KEY);
     assert.equal(lease?.driver, "pi");
-    assert.equal(lease?.clientId, "handoff-pi-1", "handback 后租约回到调用方自己手里");
+    assert.equal(lease?.clientId, "pi-1", "handback 后租约剥掉 handoff- 前缀，回到 pi 侧身份");
   } finally {
     h.close();
   }
@@ -846,11 +846,11 @@ test("handback: 真重启（全新 store/registry/leases + loadFromDb）仍用�
     assert.equal(result.resumed, true, "重启后 handback 必须成功");
     assert.equal(result.deltaSummary, "user: 我把 auth 改成抛错了", "必须从库里 checkpoint 的游标起读");
     assert.equal(after.registry.get(KEY)?.driver, "pi");
-    assert.equal(after.leases.current(KEY)?.clientId, "handoff-pi-1", "租约转回调用方并落库");
+    assert.equal(after.leases.current(KEY)?.clientId, "pi-1", "租约剥掉 handoff- 前缀后回到 pi 侧身份");
     // 回归：handback 后控制权在 pi 手里，调用方用同一个 clientId 必须能直接写（旧实现挂在
     // "handback-<id>" 上，这一句会 E_NO_LEASE）
-    const injected = await after.engine.inject(KEY, "接着把测试补上", "handoff-pi-1");
-    assert.equal(injected.effective, "now", "handback 后同 clientId 仍持有租约，可继续 inject");
+    const injected = await after.engine.inject(KEY, "接着把测试补上", "pi-1");
+    assert.equal(injected.effective, "now", "handback 后 pi 侧原 clientId 直接持有租约，可继续 inject");
   } finally {
     h.close();
   }
