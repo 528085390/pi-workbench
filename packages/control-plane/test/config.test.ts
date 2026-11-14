@@ -2,13 +2,16 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, sep } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { parse as parseYaml } from "yaml";
 
+import { DEFAULT_PORT } from "@pi-workbench/shared";
+
 import { loadConfig } from "../src/config.ts";
-import { acquireInstanceLock, resolvePaths } from "../src/paths.ts";
+import { MAX_LOCK_ATTEMPTS, acquireInstanceLock, resolvePaths } from "../src/paths.ts";
 
 function freshHome(): string {
   return mkdtempSync(join(tmpdir(), "pi-wb-cfg-"));
@@ -22,12 +25,17 @@ function errCode(err: unknown): string | undefined {
   return undefined;
 }
 
+function pathsModuleUrl(): string {
+  const here = fileURLToPath(import.meta.url);
+  return pathToFileURL(join(here, "..", "..", "src", "paths.ts")).href;
+}
+
 test("loadConfig: 空目录时写入默认值", () => {
   const home = freshHome();
   try {
     const cfg = loadConfig({ PI_WORKBENCH_HOME: home });
     assert.equal(cfg.host, "127.0.0.1");
-    assert.equal(cfg.port, 7331);
+    assert.equal(cfg.port, DEFAULT_PORT);
     assert.equal(cfg.leaseTtlMs, 30000);
     assert.equal(cfg.authToken, null);
     assert.equal(cfg.home, home);
@@ -52,7 +60,7 @@ test("loadConfig: 缺省时在 home 下生成 config.yaml", () => {
     assert.equal(typeof written, "object");
     const obj = written as Record<string, unknown>;
     assert.equal(obj["host"], "127.0.0.1");
-    assert.equal(obj["port"], 7331);
+    assert.equal(obj["port"], DEFAULT_PORT);
     assert.equal(obj["leaseTtlMs"], 30000);
   } finally {
     rmSync(home, { recursive: true, force: true });
@@ -158,6 +166,131 @@ test("acquireInstanceLock: 残留死进程 pid 文件可被接管", async () => 
     const lock = acquireInstanceLock(paths.pid);
     assert.equal(readFileSync(paths.pid, "utf8").trim(), String(process.pid));
     lock.release();
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("acquireInstanceLock: 新鲜的空 pid 文件不被当作残留（不删别人的锁）", () => {
+  const home = freshHome();
+  try {
+    const paths = resolvePaths(home);
+    // 模拟 P1 刚 openSync("wx") 成功、还没写 pid 的窗口
+    writeFileSync(paths.pid, "", "utf8");
+    const age = Date.now() - statSync(paths.pid).mtimeMs;
+    assert.ok(age < 1000, `空 pid 文件应当是新鲜的（age=${age}ms）`);
+
+    assert.throws(
+      () => acquireInstanceLock(paths.pid),
+      (err: unknown) => errCode(err) === "EEXIST",
+      "新鲜的空 pid 文件必须拒绝抢锁（原样抛 EEXIST），而不是接管",
+    );
+    // 关键断言：拒绝时不能删掉别人正在持有的锁文件
+    assert.equal(existsSync(paths.pid), true);
+    assert.equal(readFileSync(paths.pid, "utf8"), "");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("acquireInstanceLock: 已过期（mtime 老）的空 pid 文件才按残留接管", () => {
+  const home = freshHome();
+  try {
+    const paths = resolvePaths(home);
+    writeFileSync(paths.pid, "", "utf8");
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(paths.pid, old, old);
+
+    const lock = acquireInstanceLock(paths.pid);
+    assert.equal(readFileSync(paths.pid, "utf8").trim(), String(process.pid));
+    lock.release();
+    assert.equal(existsSync(paths.pid), false);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("acquireInstanceLock: 重试耗尽仍 EEXIST 时抛原始 EEXIST（不臆造 pid -1）", () => {
+  const home = freshHome();
+  try {
+    const paths = resolvePaths(home);
+    // 新鲜空文件 + 退避重读也追不上写锁者：重试耗尽后应原样抛 EEXIST
+    writeFileSync(paths.pid, "", "utf8");
+    let thrown: unknown = null;
+    const startedAt = Date.now();
+    try {
+      acquireInstanceLock(paths.pid);
+    } catch (err) {
+      thrown = err;
+    }
+    assert.ok(thrown !== null, "应当抛错");
+    assert.equal(errCode(thrown), "EEXIST");
+    assert.equal((thrown as Error).name, "Error", "不应再被包装成 InstanceLockError(pid -1)");
+    assert.ok(!String((thrown as Error).message).includes("pid -1"), "错误信息里不应出现 pid -1");
+    assert.ok(Date.now() - startedAt >= (MAX_LOCK_ATTEMPTS - 1) * 50, "应做过退避重读");
+    assert.equal(existsSync(paths.pid), true);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("acquireInstanceLock: 两个并发进程抢同一 pid 文件，只有一个成功", async () => {
+  const home = freshHome();
+  try {
+    const paths = resolvePaths(home);
+    const script = join(home, "lock-race.mjs");
+    writeFileSync(
+      script,
+      [
+        `import { acquireInstanceLock } from "${pathsModuleUrl()}";`,
+        "const pidPath = process.argv[2];",
+        "const startAt = Number(process.argv[3]);",
+        "while (Date.now() < startAt) { /* 同步对齐起跑线 */ }",
+        "try {",
+        "  const lock = acquireInstanceLock(pidPath);",
+        '  process.stdout.write("ACQUIRED:" + String(process.pid) + "\\n");',
+        // 故意不 release：保证败者在竞态窗口里始终看到「活着的持有者」，
+        // 也让测试结束后还能验证 pid 文件没被别人删掉
+        "  void lock;",
+        "  setTimeout(() => process.exit(0), 500);",
+        "} catch (err) {",
+        '  const code = err && err.code ? String(err.code) : String(err);',
+        '  process.stdout.write("REJECTED:" + code + "\\n");',
+        "  process.exit(0);",
+        "}",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const startAt = Date.now() + 250;
+    const run = () =>
+      spawn(process.execPath, ["--experimental-strip-types", script, paths.pid, String(startAt)], {
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    const children = [run(), run()];
+    const outs = await Promise.all(
+      children.map(async (child) => {
+        let out = "";
+        child.stdout.setEncoding("utf8");
+        child.stdout.on("data", (chunk: string) => {
+          out += chunk;
+        });
+        await once(child, "exit");
+        return out.trim();
+      }),
+    );
+
+    const acquired = outs.filter((line) => line.startsWith("ACQUIRED:"));
+    const rejected = outs.filter((line) => line.startsWith("REJECTED:"));
+    assert.equal(acquired.length, 1, `只能有一个进程抢到锁，实际输出：${JSON.stringify(outs)}`);
+    assert.equal(rejected.length, 1, `另一个进程必须被拒绝，实际输出：${JSON.stringify(outs)}`);
+    assert.ok(
+      ["E_ALREADY_RUNNING", "EEXIST"].includes(rejected[0]?.split(":")[1] ?? ""),
+      `被拒绝方应给出 E_ALREADY_RUNNING / EEXIST，实际：${rejected[0]}`,
+    );
+    const winnerPid = Number(acquired[0]?.split(":")[1]);
+    assert.equal(readFileSync(paths.pid, "utf8").trim(), String(winnerPid), "pid 文件应属于胜者");
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
