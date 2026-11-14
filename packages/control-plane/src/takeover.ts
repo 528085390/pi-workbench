@@ -19,7 +19,9 @@ import type { AgentName, Checkpoint, SessionRef } from "@pi-workbench/shared";
 
 import type { AgentAdapter } from "./adapters/types.ts";
 import { CLAUDE_CAPABILITIES } from "./capabilities.ts";
-import { WorkbenchError } from "./errors.ts";
+import type { CheckpointStore, StoredCheckpoint } from "./checkpoints.ts";
+import type { DispatchRecord, DispatchStore } from "./dispatch-store.ts";
+import { isWorkbenchError, WorkbenchError } from "./errors.ts";
 import type { EventStore } from "./events.ts";
 import { DEFAULT_LEASE_TTL_MS } from "./lease.ts";
 import type { LeaseManager } from "./lease.ts";
@@ -35,6 +37,10 @@ export const CURSOR_ZERO = "0";
 
 /** dispatch 事件的幂等键前缀：dispatch:<idempotencyKey>（R28） */
 export const DISPATCH_KEY_PREFIX = "dispatch:";
+
+/** reserved 状态的等待口径（C1）：每 50ms 复查一次，最多等 5s */
+const DISPATCH_POLL_INTERVAL_MS = 50;
+const DISPATCH_POLL_TIMEOUT_MS = 5000;
 
 /** deltaSummary 的口径（R27）：每条消息一行，最多 20 条，每条截 120 字 */
 const DELTA_MAX_LINES = 20;
@@ -73,6 +79,10 @@ export type TakeoverDeps = {
   leases: LeaseManager;
   registry: SessionRegistry;
   adapter: AgentAdapter;
+  /** checkpoints 表（C3：handback 从这里读游标，不靠进程内存） */
+  checkpoints: CheckpointStore;
+  /** dispatches 表（C1/C2：原子占位保证并发与跨进程幂等） */
+  dispatches: DispatchStore;
   /** checkpoint 文件目录，通常是 <home>/handoffs */
   handoffDir: string;
   /** 注入时钟（测试用），默认 Date.now */
@@ -92,19 +102,19 @@ export type HandoffResult = {
 export type HandbackResult = { resumed: boolean; deltaSummary: string };
 
 /**
- * 接管原语集合。一个实例服务所有会话；无状态查询走 registry / store，
- * 唯一的内存态是「每个会话最近一次 checkpoint」（handback 需要它的 transcriptCursor）。
+ * 接管原语集合。一个实例服务所有会话；状态全部走 registry / store / checkpoints / dispatches 表，
+ * 引擎本身不持有跨调用的内存态（重启后 handback 仍能拿到 checkpoint 游标）。
  */
 export class TakeoverEngine {
   readonly #store: EventStore;
   readonly #leases: LeaseManager;
   readonly #registry: SessionRegistry;
   readonly #adapter: AgentAdapter;
+  readonly #checkpoints: CheckpointStore;
+  readonly #dispatches: DispatchStore;
   readonly #handoffDir: string;
   readonly #now: () => number;
   readonly #readTranscript: TranscriptReader;
-  /** sessionKey → 最近一次 checkpoint（handoff / handback 在同一进程内配对） */
-  readonly #checkpoints = new Map<string, Checkpoint>();
   /** 事件幂等键的进程内序号，避免同一毫秒内多次操作撞键 */
   #eventSeq = 0;
 
@@ -113,6 +123,8 @@ export class TakeoverEngine {
     this.#leases = deps.leases;
     this.#registry = deps.registry;
     this.#adapter = deps.adapter;
+    this.#checkpoints = deps.checkpoints;
+    this.#dispatches = deps.dispatches;
     this.#handoffDir = deps.handoffDir;
     this.#now = deps.now ?? Date.now;
     this.#readTranscript = deps.readTranscript ?? defaultTranscriptReader;
@@ -130,7 +142,9 @@ export class TakeoverEngine {
       return { messages: [], cursor, pending: true };
     }
     const page = this.#readTranscript(path, cursor);
-    return { messages: page.messages, cursor: page.nextCursor, pending: page.pending };
+    // M5：reader 报 pending 且一条消息都没有时，游标停在调用方给的位置，绝不倒退成 "0"
+    const next = page.pending && page.messages.length === 0 ? cursor : page.nextCursor;
+    return { messages: page.messages, cursor: next, pending: page.pending };
   }
 
   /**
@@ -174,16 +188,25 @@ export class TakeoverEngine {
     const ref = this.#requireSession(key);
 
     // 2. quiesce：运行中先 cancel 并等回合结束（adapter 没有 waitForTurn 就跳过）
-    if (ref.status === "running") {
-      await this.#adapter.cancel(ref.nativeId);
-      await this.#waitForTurn(ref.nativeId);
+    // I4：cancel / close 失败必须留痕 —— 否则租约还指着 pi、状态还是 running，却一条事件都没有
+    try {
+      if (ref.status === "running") {
+        await this.#adapter.cancel(ref.nativeId);
+        await this.#waitForTurn(ref.nativeId);
+      }
+    } catch (err) {
+      throw this.#handoffAborted(ref, "cancel", err);
     }
 
-    // 3. checkpoint（文件 + 内存态）
+    // 3. checkpoint（文件 + checkpoints 表）
     const { checkpoint, path } = this.#writeCheckpoint(ref, input ?? defaultHandoffInput(to));
 
     // 4. 释放 adapter 里的会话，交给原生终端
-    await this.#adapter.close(ref.nativeId);
+    try {
+      await this.#adapter.close(ref.nativeId);
+    } catch (err) {
+      throw this.#handoffAborted(ref, "close", err);
+    }
 
     // 5. 租约转给接管的 driver，人类窗口固定 30 分钟
     this.#leases.release(key, clientId);
@@ -221,7 +244,9 @@ export class TakeoverEngine {
       });
     }
 
-    const cursor = this.#checkpoints.get(key)?.transcriptCursor ?? CURSOR_ZERO;
+    // C3：游标以库里的最新 checkpoint 为准 —— 进程重启后 handback 仍从正确位置读增量
+    const latest = this.#checkpoints.latest(key);
+    const cursor = latest === null ? CURSOR_ZERO : latest.transcriptCursor;
     const deltaSummary = this.#deltaSummary(ref, cursor);
 
     const next: SessionRef = { ...ref, driver: "pi", status: "idle" };
@@ -234,8 +259,8 @@ export class TakeoverEngine {
   }
 
   /**
-   * 起一个新会话（R28）。幂等：同 idempotencyKey 且 payload 一致 → 返回原 SessionRef，
-   * 不再调 adapter.newSession；payload 不一致 → E_IDEMPOTENCY_CONFLICT。
+   * 起一个新会话（R28 / C1 / C2）。幂等与并发都由 dispatches 表的原子占位保证：
+   * reserve 的赢家负责 newSession → complete，输家按记录的 hash / 状态复用、等待或报错。
    * prompt 只负责投递，不等回合结束，投递失败也不影响本次返回。
    */
   async dispatch(input: DispatchInput): Promise<SessionRef> {
@@ -254,20 +279,23 @@ export class TakeoverEngine {
     }
 
     const cwd = input.cwd ?? process.cwd();
-    const hash = hashOf({ agent: input.agent, task, cwd });
+    // C1：hash 口径固定为 {agent, task, cwd ?? null}
+    const hash = hashOf({ agent: input.agent, task, cwd: input.cwd ?? null });
 
-    const existing = this.#findDispatch(idempotencyKey);
-    if (existing !== null) {
-      if (existing.hash !== hash) {
-        throw new WorkbenchError("E_IDEMPOTENCY_CONFLICT", "幂等键已用于另一个任务：" + idempotencyKey, {
-          idempotencyKey,
-          sessionKey: existing.ref.key,
-        });
-      }
-      return existing.ref;
+    // C1 / C2：INSERT OR IGNORE 原子占位，同 key 并发只有一个赢家
+    const { record, created } = this.#dispatches.reserve(idempotencyKey, hash);
+    if (!created) {
+      return await this.#resolveReserved(record, hash, idempotencyKey);
     }
 
-    const { sessionId } = await this.#adapter.newSession(cwd);
+    let sessionId: string;
+    try {
+      const opened = await this.#adapter.newSession(cwd);
+      sessionId = opened.sessionId;
+    } catch (err) {
+      throw this.#dispatchFailed(idempotencyKey, "newSession", err);
+    }
+
     const ref: SessionRef = {
       key: "claude:" + sessionId,
       agent: "claude",
@@ -281,14 +309,24 @@ export class TakeoverEngine {
       kind: "interactive",
     };
 
-    this.#registry.upsert(ref);
+    try {
+      this.#registry.upsert(ref);
+    } catch (err) {
+      throw this.#dispatchFailed(idempotencyKey, "registry.upsert", err);
+    }
+
+    // 会话已落库：先把幂等记录标成 done，等待方（并发 / 重启）才能按 key 复用它
+    this.#dispatches.complete(idempotencyKey, ref.key);
+
     this.#store.append({
       sessionKey: ref.key,
       type: "notice",
-      payload: { kind: "dispatch", idempotencyKey, hash, task, cwd, ref },
+      payload: { kind: "dispatch", idempotencyKey, hash, task, cwd },
       source: "claude",
       idempotencyKey: DISPATCH_KEY_PREFIX + idempotencyKey,
     });
+    // M6：dispatch 让会话进入 running，除 notice 外再发一条 state_update，按状态分发的消费者才看得到
+    this.#appendState(ref, { state: "running", driver: "pi", kind: "dispatch", idempotencyKey }, "dispatch");
 
     try {
       await this.#adapter.prompt(sessionId, task);
@@ -311,8 +349,8 @@ export class TakeoverEngine {
     }
   }
 
-  /** 落 checkpoint 文件 + 记内存态，返回对象与文件路径 */
-  #writeCheckpoint(ref: SessionRef, input: CheckpointInput): { checkpoint: Checkpoint; path: string } {
+  /** 落 checkpoint 文件 + 落库，返回对象与文件路径（C3） */
+  #writeCheckpoint(ref: SessionRef, input: CheckpointInput): { checkpoint: StoredCheckpoint; path: string } {
     const nowMs = this.#now();
     const checkpoint: Checkpoint = {
       sessionKey: ref.key,
@@ -326,8 +364,11 @@ export class TakeoverEngine {
     const path = join(this.#handoffDir, sanitizeKey(ref.key) + "-" + isoForFile(nowMs) + ".md");
     mkdirSync(this.#handoffDir, { recursive: true });
     writeFileSync(path, renderCheckpoint(checkpoint), "utf8");
-    this.#checkpoints.set(ref.key, checkpoint);
-    return { checkpoint, path };
+
+    // C3：文件之外必须落库，否则进程重启后 handback 拿不到游标
+    const stored: StoredCheckpoint = { ...checkpoint, path };
+    this.#checkpoints.save(stored);
+    return { checkpoint: stored, path };
   }
 
   /** 把 transcript 游标推进到当前末尾（handback 从该偏移读人类接管期间的增量） */
@@ -362,27 +403,105 @@ export class TakeoverEngine {
     }
   }
 
-  /** 按 dispatch:<idempotencyKey> 事件回溯幂等记录（R28：不新增表） */
-  #findDispatch(idempotencyKey: string): { ref: SessionRef; hash: string } | null {
-    const wanted = DISPATCH_KEY_PREFIX + idempotencyKey;
-    for (const ref of this.#registry.list()) {
-      for (const event of this.#store.list(ref.key)) {
-        if (event.idempotencyKey !== wanted) {
-          continue;
-        }
-        const payload = event.payload;
-        if (!isRecord(payload)) {
-          continue;
-        }
-        const hash = payload["hash"];
-        const stored = payload["ref"];
-        if (typeof hash !== "string" || !isSessionRef(stored)) {
-          continue;
-        }
-        return { ref: stored, hash };
+  /**
+   * 幂等键已被占用（created=false，C1）：按记录状态复用 / 等待 / 报错。
+   * 顺序固定为 hash 比对 → failed → done → reserved 轮询。
+   */
+  async #resolveReserved(record: DispatchRecord, hash: string, idempotencyKey: string): Promise<SessionRef> {
+    if (record.payloadHash !== hash) {
+      throw new WorkbenchError("E_IDEMPOTENCY_CONFLICT", "幂等键已用于另一个任务：" + idempotencyKey, {
+        idempotencyKey,
+        sessionKey: record.sessionKey,
+      });
+    }
+    if (record.status === "failed") {
+      throw dispatchFailedError(idempotencyKey, record.error);
+    }
+    if (record.status === "done") {
+      return this.#refOf(record, idempotencyKey);
+    }
+
+    // reserved：另一个调用方正在跑 newSession，轮询到它落定（C1：每 50ms，最多 5s）
+    const deadline = Date.now() + DISPATCH_POLL_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      await delay(DISPATCH_POLL_INTERVAL_MS);
+      const current = this.#dispatches.get(idempotencyKey);
+      if (current === null) {
+        throw new WorkbenchError("E_ADAPTER_DOWN", "dispatch 的预留记录在等待中消失：" + idempotencyKey, {
+          idempotencyKey,
+        });
+      }
+      if (current.payloadHash !== hash) {
+        throw new WorkbenchError("E_IDEMPOTENCY_CONFLICT", "幂等键已用于另一个任务：" + idempotencyKey, {
+          idempotencyKey,
+          sessionKey: current.sessionKey,
+        });
+      }
+      if (current.status === "failed") {
+        throw dispatchFailedError(idempotencyKey, current.error);
+      }
+      if (current.status === "done") {
+        return this.#refOf(current, idempotencyKey);
       }
     }
-    return null;
+    throw new WorkbenchError("E_ADAPTER_DOWN", "dispatch 仍在进行中：" + idempotencyKey, { idempotencyKey });
+  }
+
+  /** 幂等命中：会话必须仍在注册表里，否则是库与注册表不一致（C1） */
+  #refOf(record: DispatchRecord, idempotencyKey: string): SessionRef {
+    const sessionKey = record.sessionKey;
+    if (sessionKey === null) {
+      throw new WorkbenchError("E_SESSION_NOT_FOUND", "dispatch 记录缺少会话 key（幂等键 " + idempotencyKey + "）", {
+        idempotencyKey,
+      });
+    }
+    const ref = this.#registry.get(sessionKey);
+    if (ref === null) {
+      throw new WorkbenchError(
+        "E_SESSION_NOT_FOUND",
+        "dispatch 幂等命中，但会话不在注册表：" + sessionKey + "（sessions 表被清空？需要重新 dispatch）",
+        { idempotencyKey, sessionKey },
+      );
+    }
+    return ref;
+  }
+
+  /** newSession / upsert 失败：先落 failed 记录再抛（C1），同键后续调用不会永远停在 reserved */
+  #dispatchFailed(idempotencyKey: string, where: string, err: unknown): WorkbenchError {
+    const message = err instanceof Error ? err.message : String(err);
+    this.#dispatches.fail(idempotencyKey, where + "：" + message);
+    if (isWorkbenchError(err)) {
+      return err;
+    }
+    return new WorkbenchError("E_ADAPTER_DOWN", "dispatch 新建会话失败（" + where + "）：" + message, {
+      idempotencyKey,
+      cause: message,
+    });
+  }
+
+  /** I4：cancel / close 失败 → 写 error 事件 + 状态回 idle，再抛 E_ADAPTER_DOWN（带原因文本） */
+  #handoffAborted(ref: SessionRef, where: string, err: unknown): never {
+    const message = err instanceof Error ? err.message : String(err);
+    this.#appendError(ref, message, "handoff-" + where);
+    this.#registry.updateStatus(ref.key, "idle");
+    throw new WorkbenchError(
+      "E_ADAPTER_DOWN",
+      "handoff 无法停止/关闭会话（" + where + "）：" + ref.key + " — " + message,
+      { sessionKey: ref.key, nativeId: ref.nativeId, action: where, cause: message },
+    );
+  }
+
+  /** 失败留痕：error 事件（payload.message），避免「租约还在、状态 running、却没有任何事件」 */
+  #appendError(ref: SessionRef, message: string, action: string): void {
+    this.#eventSeq += 1;
+    this.#store.append({
+      sessionKey: ref.key,
+      type: "error",
+      payload: { message, action },
+      source: ref.agent,
+      idempotencyKey:
+        ref.agent + ":" + ref.nativeId + ":" + action + ":error:" + String(this.#now()) + ":" + String(this.#eventSeq),
+    });
   }
 
   #requireSession(key: string): SessionRef {
@@ -412,7 +531,7 @@ function defaultHandoffInput(to: "human" | "pi"): CheckpointInput {
   return { summary: "handoff to " + to, touchedFiles: [], nextStep: "" };
 }
 
-function hashOf(value: { agent: string; task: string; cwd: string }): string {
+function hashOf(value: { agent: string; task: string; cwd: string | null }): string {
   return createHash("sha256")
     .update(JSON.stringify({ agent: value.agent, task: value.task, cwd: value.cwd }))
     .digest("hex");
@@ -464,22 +583,16 @@ function buildDeltaSummary(messages: UnifiedMessage[]): string {
   return lines.join("\n");
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+/** dispatch 记录了失败原因时，后续同键调用按 E_ADAPTER_DOWN 报出来 */
+function dispatchFailedError(idempotencyKey: string, error: string | null): WorkbenchError {
+  return new WorkbenchError("E_ADAPTER_DOWN", "该幂等键上一次 dispatch 失败：" + (error ?? "未知原因"), {
+    idempotencyKey,
+    reason: error,
+  });
 }
 
-/** dispatch 事件里的 ref 经过 JSON 往返，这里只校验关键字段是否存在 */
-function isSessionRef(value: unknown): value is SessionRef {
-  if (!isRecord(value)) {
-    return false;
-  }
-  return (
-    typeof value["key"] === "string" &&
-    typeof value["agent"] === "string" &&
-    typeof value["nativeId"] === "string" &&
-    typeof value["cwd"] === "string" &&
-    typeof value["status"] === "string" &&
-    typeof value["driver"] === "string" &&
-    isRecord(value["capabilities"])
-  );
+function delay(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }

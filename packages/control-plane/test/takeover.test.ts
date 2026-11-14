@@ -8,7 +8,9 @@ import type { DatabaseSync } from "node:sqlite";
 import type { SessionRef } from "@pi-workbench/shared";
 
 import type { AdapterUpdate, AgentAdapter } from "../src/adapters/types.ts";
+import { CheckpointStore } from "../src/checkpoints.ts";
 import { migrate, openDb } from "../src/db.ts";
+import { DispatchStore } from "../src/dispatch-store.ts";
 import { isWorkbenchError } from "../src/errors.ts";
 import type { WorkbenchErrorCode } from "../src/errors.ts";
 import { EventStore } from "../src/events.ts";
@@ -51,7 +53,9 @@ type Fake = {
 };
 
 /** 假 adapter：只记录调用，不跑任何子进程 */
-function makeFake(opts: { resumeError?: Error } = {}): Fake {
+function makeFake(
+  opts: { resumeError?: Error; closeError?: Error; cancelError?: Error; newSessionError?: Error } = {},
+): Fake {
   const calls: Call[] = [];
   const record = (method: string, args: unknown[]): void => {
     calls.push({ method, args });
@@ -60,6 +64,9 @@ function makeFake(opts: { resumeError?: Error } = {}): Fake {
   const adapter: AgentAdapter = {
     newSession: async (cwd: string) => {
       record("newSession", [cwd]);
+      if (opts.newSessionError !== undefined) {
+        throw opts.newSessionError;
+      }
       return { sessionId: "sess-new" };
     },
     resume: async (sessionId: string, cwd: string) => {
@@ -74,10 +81,16 @@ function makeFake(opts: { resumeError?: Error } = {}): Fake {
     },
     cancel: async (sessionId: string) => {
       record("cancel", [sessionId]);
+      if (opts.cancelError !== undefined) {
+        throw opts.cancelError;
+      }
       return { stopReason: "cancelled" };
     },
     close: async (sessionId: string) => {
       record("close", [sessionId]);
+      if (opts.closeError !== undefined) {
+        throw opts.closeError;
+      }
     },
     waitForTurn: async (sessionId: string) => {
       record("waitForTurn", [sessionId]);
@@ -105,11 +118,21 @@ type Harness = {
   store: EventStore;
   leases: LeaseManager;
   registry: SessionRegistry;
+  checkpoints: CheckpointStore;
+  dispatches: DispatchStore;
   fake: Fake;
   engine: TakeoverEngine;
   handoffDir: string;
   clock: Clock;
   close: () => void;
+};
+
+type FakeOpts = {
+  readTranscript?: TranscriptReader;
+  resumeError?: Error;
+  closeError?: Error;
+  cancelError?: Error;
+  newSessionError?: Error;
 };
 
 const emptyReader: TranscriptReader = (_path, cursor) => ({
@@ -118,13 +141,15 @@ const emptyReader: TranscriptReader = (_path, cursor) => ({
   pending: true,
 });
 
-function fresh(opts: { readTranscript?: TranscriptReader; resumeError?: Error } = {}): Harness {
+function fresh(opts: FakeOpts = {}): Harness {
   const db = openDb(":memory:");
   migrate(db);
   const store = new EventStore(db);
   const clock = makeClock();
   const leases = new LeaseManager(db, { now: clock.now });
   const registry = new SessionRegistry(db);
+  const checkpoints = new CheckpointStore(db);
+  const dispatches = new DispatchStore(db);
   const fake = makeFake(opts);
   const handoffDir = mkdtempSync(join(tmpdir(), "pi-handoffs-"));
   const engine = new TakeoverEngine({
@@ -132,6 +157,8 @@ function fresh(opts: { readTranscript?: TranscriptReader; resumeError?: Error } 
     leases,
     registry,
     adapter: fake.adapter,
+    checkpoints,
+    dispatches,
     handoffDir,
     now: clock.now,
     readTranscript: opts.readTranscript ?? emptyReader,
@@ -141,6 +168,8 @@ function fresh(opts: { readTranscript?: TranscriptReader; resumeError?: Error } 
     store,
     leases,
     registry,
+    checkpoints,
+    dispatches,
     fake,
     engine,
     handoffDir,
@@ -150,6 +179,26 @@ function fresh(opts: { readTranscript?: TranscriptReader; resumeError?: Error } 
       rmSync(handoffDir, { recursive: true, force: true });
     },
   };
+}
+
+/** 模拟进程重启：新引擎、同一 db 句柄与同一批 store，引擎内部没有任何内存态 */
+function restartEngine(h: Harness, reader?: TranscriptReader): TakeoverEngine {
+  return new TakeoverEngine({
+    store: h.store,
+    leases: h.leases,
+    registry: h.registry,
+    adapter: h.fake.adapter,
+    checkpoints: h.checkpoints,
+    dispatches: h.dispatches,
+    handoffDir: h.handoffDir,
+    now: h.clock.now,
+    readTranscript: reader ?? emptyReader,
+  });
+}
+
+function countRows(db: DatabaseSync, table: "checkpoints" | "dispatches"): number {
+  const row = db.prepare("SELECT count(*) AS n FROM " + table).get() as { n?: number } | undefined;
+  return Number(row?.n ?? 0);
 }
 
 function makeRef(overrides: Partial<SessionRef> = {}): SessionRef {
@@ -644,6 +693,201 @@ test("dispatch: task / idempotencyKey 为空 → E_BAD_REQUEST", async () => {
       "E_BAD_REQUEST",
     );
     assert.equal(h.fake.count("newSession"), 0);
+  } finally {
+    h.close();
+  }
+});
+
+// ---------- 评审修复 round 1：C1 / C2 / C3 / I4 / M5 / M6 ----------
+
+test("dispatch: 并发两次同 key → 同一 key，newSession 只 1 次，dispatches 只 1 行（C2）", async () => {
+  const h = fresh();
+  try {
+    const input = { agent: "claude" as const, task: "并发派发一次", cwd: CWD, idempotencyKey: "idem-race" };
+    const [a, b] = await Promise.all([h.engine.dispatch(input), h.engine.dispatch(input)]);
+
+    assert.equal(a.key, "claude:sess-new");
+    assert.equal(b.key, a.key, "并发两次必须落到同一个会话");
+    assert.deepEqual(b, a);
+    assert.equal(h.fake.count("newSession"), 1, "原子占位保证只起一个会话");
+    assert.equal(h.fake.count("prompt"), 1, "任务只投递一次");
+    assert.equal(countRows(h.db, "dispatches"), 1);
+  } finally {
+    h.close();
+  }
+});
+
+test("dispatch: 重启后（新引擎、同一 db）同 key 同 task 复用库里的会话，newSession 仍为 1（C2）", async () => {
+  const h = fresh();
+  try {
+    const input = { agent: "claude" as const, task: "重启后幂等", cwd: CWD, idempotencyKey: "idem-restart" };
+    const first = await h.engine.dispatch(input);
+    const second = await restartEngine(h).dispatch(input);
+
+    assert.deepEqual(second, first, "重启后必须返回同一个 SessionRef");
+    assert.equal(h.fake.count("newSession"), 1, "库里已 done 的幂等键不得再起会话");
+    assert.equal(countRows(h.db, "dispatches"), 1);
+  } finally {
+    h.close();
+  }
+});
+
+test("dispatch: newSession 失败 → 落 failed 记录 + E_ADAPTER_DOWN，重试同键仍报 E_ADAPTER_DOWN（C1）", async () => {
+  const h = fresh({ newSessionError: new Error("spawn claude ENOENT") });
+  try {
+    const input = { agent: "claude" as const, task: "必然失败", cwd: CWD, idempotencyKey: "idem-fail" };
+    await expectRejectCode(() => h.engine.dispatch(input), "E_ADAPTER_DOWN");
+
+    const record = h.dispatches.get("idem-fail");
+    assert.equal(record?.status, "failed", "失败必须落库，不能停在 reserved");
+    assert.ok((record?.error ?? "").includes("ENOENT"), "失败原因要落库：" + String(record?.error));
+
+    await expectRejectCode(() => h.engine.dispatch(input), "E_ADAPTER_DOWN");
+    assert.equal(h.fake.count("newSession"), 1, "failed 记录不能让重试又起一个会话");
+  } finally {
+    h.close();
+  }
+});
+
+test("checkpoint: 落库（checkpoints 表 1 行，latest 与返回值一致）（C3）", () => {
+  const h = fresh();
+  try {
+    h.registry.upsert(makeRef({ status: "idle" }));
+    h.leases.acquire(KEY, "pi", "pi-1");
+
+    const checkpoint = h.engine.checkpoint(
+      KEY,
+      { summary: "落库检查", touchedFiles: ["src/a.ts"], nextStep: "补单测" },
+      "pi-1",
+    );
+
+    assert.equal(countRows(h.db, "checkpoints"), 1, "checkpoint 必须落库");
+    const latest = h.checkpoints.latest(KEY);
+    assert.ok(latest !== null, "latest 必须能读到");
+    assert.equal(latest.sessionKey, KEY);
+    assert.equal(latest.summary, "落库检查");
+    assert.deepEqual(latest.touchedFiles, ["src/a.ts"]);
+    assert.equal(latest.nextStep, "补单测");
+    assert.equal(latest.transcriptCursor, checkpoint.transcriptCursor);
+    assert.equal(latest.createdAt, checkpoint.createdAt);
+    assert.match(latest.path, /pi-handoffs-[^\\/]+[\\/]claude-sess-1-[^\\/]+\.md$/, "库里存的是 Markdown 绝对路径");
+  } finally {
+    h.close();
+  }
+});
+
+test("handback: 新引擎（同 db、无进程内存）仍用库里 checkpoint 的游标读增量（C3）", async () => {
+  let humanPhase = false;
+  const reader: TranscriptReader = (_path, cursor) => {
+    if ((cursor ?? "0") === "0") {
+      return { messages: [msg("m1", "assistant", "交人前的一轮")], nextCursor: "120", pending: false };
+    }
+    if (cursor === "120" && humanPhase) {
+      return { messages: [msg("m9", "user", "我把 auth 改成抛错了")], nextCursor: "400", pending: false };
+    }
+    return { messages: [], nextCursor: cursor ?? "0", pending: true };
+  };
+  const h = fresh({ readTranscript: reader });
+  try {
+    h.registry.upsert(makeRef({ status: "running" }));
+    h.leases.acquire(KEY, "pi", "pi-1");
+    const handoff = await h.engine.handoff(KEY, "human", "pi-1", {
+      summary: "交人",
+      touchedFiles: [],
+      nextStep: "人工改完交回",
+    });
+    assert.equal(handoff.checkpoint.transcriptCursor, "120");
+    assert.equal(countRows(h.db, "checkpoints"), 1, "handoff 的 checkpoint 必须落库");
+
+    humanPhase = true;
+    // 新引擎 = 重启后的进程：内存里没有 checkpoint，只能靠库
+    const result = await restartEngine(h, reader).handback(KEY, "handoff-pi-1");
+
+    assert.equal(result.resumed, true);
+    assert.equal(result.deltaSummary, "user: 我把 auth 改成抛错了", "必须从库里 checkpoint 的游标起读");
+    assert.equal(h.registry.get(KEY)?.driver, "pi");
+  } finally {
+    h.close();
+  }
+});
+
+test("handoff: close 失败 → 写 error 事件 + 状态回 idle + 抛 E_ADAPTER_DOWN（I4）", async () => {
+  const h = fresh({ closeError: new Error("close 时 IPC 已断开") });
+  try {
+    h.registry.upsert(makeRef({ status: "running" }));
+    h.leases.acquire(KEY, "pi", "pi-1");
+
+    await expectRejectCode(() => h.engine.handoff(KEY, "human", "pi-1"), "E_ADAPTER_DOWN");
+
+    const errors = h.store.list(KEY).filter((event) => event.type === "error");
+    assert.equal(errors.length, 1, "失败必须留一条 error 事件");
+    const payload = errors[0]?.payload as Record<string, unknown> | undefined;
+    assert.ok(String(payload?.["message"] ?? "").includes("IPC 已断开"), "error 事件要带原因：" + String(payload?.["message"]));
+
+    assert.equal(h.registry.get(KEY)?.status, "idle", "失败后状态必须回到 idle，不能停在 running");
+    assert.equal(h.registry.get(KEY)?.driver, "pi", "失败后 driver 不得改成 human");
+    const lease = h.leases.current(KEY);
+    assert.equal(lease?.driver, "pi", "租约仍在原客户端手里");
+    assert.equal(lease?.clientId, "pi-1");
+  } finally {
+    h.close();
+  }
+});
+
+test("handoff: cancel 失败 → error 事件 + idle + E_ADAPTER_DOWN，且不再调用 close（I4）", async () => {
+  const h = fresh({ cancelError: new Error("cancel 失败：session 已消失") });
+  try {
+    h.registry.upsert(makeRef({ status: "running" }));
+    h.leases.acquire(KEY, "pi", "pi-1");
+
+    await expectRejectCode(() => h.engine.handoff(KEY, "human", "pi-1"), "E_ADAPTER_DOWN");
+
+    const errors = h.store.list(KEY).filter((event) => event.type === "error");
+    assert.equal(errors.length, 1);
+    assert.equal(h.registry.get(KEY)?.status, "idle");
+    assert.equal(h.fake.count("close"), 0, "cancel 失败后不应继续 close");
+  } finally {
+    h.close();
+  }
+});
+
+test("see: reader 报 pending 且 0 条消息 → 游标保持 after，不回退成 0（M5）", () => {
+  const h = fresh({
+    readTranscript: (_path, _cursor) => ({ messages: [], nextCursor: "0", pending: true }),
+  });
+  try {
+    h.registry.upsert(makeRef());
+    const page = h.engine.see(KEY, "42");
+
+    assert.deepEqual(page.messages, []);
+    assert.equal(page.cursor, "42", "pending 且无消息时游标不得倒退");
+    assert.equal(page.pending, true);
+  } finally {
+    h.close();
+  }
+});
+
+test("dispatch: 会话进入 running 时除 notice 还写一条 state_update（M6）", async () => {
+  const h = fresh();
+  try {
+    const ref = await h.engine.dispatch({
+      agent: "claude",
+      task: "M6 事件口径",
+      cwd: CWD,
+      idempotencyKey: "idem-m6",
+    });
+
+    const events = h.store.list(ref.key);
+    const notices = events.filter((event) => {
+      const payload = event.payload as Record<string, unknown> | null;
+      return event.type === "notice" && payload?.["kind"] === "dispatch";
+    });
+    assert.equal(notices.length, 1, "notice + payload.kind=dispatch 保留");
+
+    const stateUpdates = events.filter((event) => event.type === "state_update");
+    assert.equal(stateUpdates.length, 1, "按状态分发的消费者需要 state_update");
+    const payload = stateUpdates[0]?.payload as Record<string, unknown> | undefined;
+    assert.equal(payload?.["state"], "running");
   } finally {
     h.close();
   }
