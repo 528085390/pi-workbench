@@ -7,7 +7,7 @@
  */
 import type { DatabaseSync, StatementSync } from "node:sqlite";
 
-import type { SessionRef } from "@pi-workbench/shared";
+import type { SessionRef, SessionStatus } from "@pi-workbench/shared";
 
 /** list 的过滤条件；两个字段可组合，值为精确匹配 */
 export type SessionFilter = {
@@ -39,6 +39,7 @@ export class SessionRegistry {
   readonly #db: DatabaseSync;
   readonly #memory = new Map<string, MemoryEntry>();
   #upsertStmt: StatementSync | null = null;
+  #updateStatusStmt: StatementSync | null = null;
 
   constructor(db: DatabaseSync) {
     this.#db = db;
@@ -62,6 +63,23 @@ export class SessionRegistry {
       updatedAt,
     );
     this.#memory.set(ref.key, { ref, updatedAt });
+  }
+
+  /**
+   * 只改状态（A06 管线对 `state_update` 的投影）：内存态与 `sessions` 表同步。
+   * - 未知 key 返回 `null`（不抛、不凭空建行）：状态只能投影到已登记的会话。
+   * - 返回更新后的 SessionRef；调用方拿到的旧引用不变（对象整体替换）。
+   */
+  updateStatus(sessionKey: string, status: SessionStatus): SessionRef | null {
+    const entry = this.#memory.get(sessionKey);
+    if (entry === undefined) {
+      return null;
+    }
+    const updatedAt = new Date().toISOString();
+    const ref: SessionRef = { ...entry.ref, status };
+    this.#updateStatus().run(status, updatedAt, sessionKey);
+    this.#memory.set(sessionKey, { ref, updatedAt });
+    return ref;
   }
 
   /** 内存态快照，按 updated_at 倒序；可过滤 agent / status */
@@ -88,5 +106,10 @@ export class SessionRegistry {
   #upsert(): StatementSync {
     this.#upsertStmt ??= this.#db.prepare(UPSERT_SQL);
     return this.#upsertStmt;
+  }
+
+  #updateStatus(): StatementSync {
+    this.#updateStatusStmt ??= this.#db.prepare("UPDATE sessions SET status = ?, updated_at = ? WHERE key = ?");
+    return this.#updateStatusStmt;
   }
 }
