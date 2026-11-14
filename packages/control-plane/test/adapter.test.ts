@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { ClaudeAdapter, FALLBACK_ADAPTER_CMD } from "../src/adapters/claude.ts";
+import { ClaudeAdapter, FALLBACK_ADAPTER_CMD, mapSessionUpdate } from "../src/adapters/claude.ts";
 import type { AdapterUpdate } from "../src/adapters/types.ts";
 import { resolveDefaultAdapterCmd } from "../src/adapters/claude.ts";
 import type { Config, PermissionMode } from "../src/config.ts";
@@ -82,6 +82,24 @@ function adapterDown(err: unknown): true {
   return true;
 }
 
+/** mapSessionUpdate 单测用的递增 id 生成器 */
+function seqIds(): () => string {
+  let seq = 0;
+  return () => {
+    seq += 1;
+    return "u" + String(seq);
+  };
+}
+
+/** assert.rejects 校验器：断言是某个 WorkbenchError 错误码 */
+function workbenchCode(code: string): (err: unknown) => true {
+  return (err: unknown) => {
+    assert.ok(isWorkbenchError(err), "应抛 WorkbenchError，实际：" + String(err));
+    assert.equal(err.code, code);
+    return true;
+  };
+}
+
 test("newSession 返回 ACP sessionId", async () => {
   const adapter = await spawnFakeAdapter();
   try {
@@ -104,6 +122,8 @@ test("prompt 立即返回 messageId，并把 session/update 映射成 text", asy
     const promptElapsed = Date.now() - startedAt;
     assert.equal(typeof messageId, "string");
     assert.ok(messageId.length > 0);
+    // M7：受理响应已经带回 messageId 时就用它（假 agent 立刻回 usr_<n>），不再自造 msg_<uuid>
+    assert.match(messageId, /^usr_/, "prompt 应复用 PromptResponse.messageId，实际：" + messageId);
     // prompt 不等回合结束：假 agent 要到 idle 才结束回合，返回必须远早于此
     assert.ok(promptElapsed < 2000, "prompt 不该阻塞到回合结束，实际耗时 " + String(promptElapsed) + "ms");
 
@@ -202,9 +222,17 @@ test("deny 权限模式：回 cancelled", async () => {
   }
 });
 
-test("initialize 握手失败（假 agent 立刻退出）→ E_ADAPTER_DOWN", async () => {
+test("initialize 握手失败（假 agent 立刻退出）→ E_ADAPTER_DOWN，文案带 stderr 而非占位 reason", async () => {
   const startedAt = Date.now();
-  await assert.rejects(spawnFakeAdapter("auto_allow", ["--fail-init"]), adapterDown);
+  await assert.rejects(spawnFakeAdapter("auto_allow", ["--fail-init"]), (err: unknown) => {
+    adapterDown(err);
+    const message = String((err as Error).message);
+    // I2：占位 reason「未启动」不该出现在文案里
+    assert.ok(!message.includes("未启动"), "握手失败文案不该带占位 reason，实际：" + message);
+    // I2：要带 stderr 尾部片段，否则定位不了
+    assert.match(message, /--fail-init/, "握手失败文案应带 stderr 尾部片段，实际：" + message);
+    return true;
+  });
   assert.ok(Date.now() - startedAt < 5000, "握手失败必须 5s 内报错");
 });
 
@@ -212,6 +240,154 @@ test("dispose 幂等", async () => {
   const adapter = await spawnFakeAdapter();
   await adapter.dispose();
   await adapter.dispose();
+});
+
+test("C1 回合失败：emit kind:error 且 waitForTurn reject（不当成功 resolve）", async () => {
+  const adapter = await spawnFakeAdapter();
+  try {
+    const updates = collectUpdates(adapter);
+    const { sessionId } = await adapter.newSession(WORKSPACE);
+    await adapter.prompt(sessionId, "ERROR");
+
+    // 先拿到 kind:"error" 更新（文案取 agent 报的 JSON-RPC 错误）
+    const errorUpdate = await waitForUpdate(updates, (u) => u.kind === "error");
+    assert.match(String(errorUpdate.text), /上游 500/, "error update 应带 agent 的错误文案");
+
+    // 回合必须 reject，不能 resolve
+    await assert.rejects(adapter.waitForTurn(sessionId), (err: unknown) => {
+      assert.ok(isWorkbenchError(err), "回合失败应抛 WorkbenchError，实际：" + String(err));
+      assert.equal(err.code, "E_BAD_REQUEST");
+      assert.match(String((err as Error).message), /上游 500/);
+      return true;
+    });
+  } finally {
+    await adapter.dispose();
+  }
+});
+
+test("I3 SLOW 模式：prompt 不等 session/prompt 响应，返回时回合仍 pending", async () => {
+  const adapter = await spawnFakeAdapter();
+  try {
+    const updates = collectUpdates(adapter);
+    const { sessionId } = await adapter.newSession(WORKSPACE);
+
+    const startedAt = Date.now();
+    const promptPromise = adapter.prompt(sessionId, "SLOW");
+    // 立刻挂上回合等待：prompt 返回的那一刻它必须还没结束
+    let turnSettled = false;
+    const turnPromise = adapter.waitForTurn(sessionId, 15_000).finally(() => {
+      turnSettled = true;
+    });
+
+    const { messageId } = await promptPromise;
+    const promptElapsed = Date.now() - startedAt;
+    assert.ok(
+      promptElapsed < 3500,
+      "prompt 不该等 4s 才回的 session/prompt 响应，实际 " + String(promptElapsed) + "ms",
+    );
+    // 受理响应还没回来 → 回落到 msg_<uuid>（R11 允许）
+    assert.match(messageId, /^msg_/, "拿不到受理 messageId 时应回落 msg_ 前缀，实际：" + messageId);
+
+    // update 已经到了，但回合没结束
+    await waitForUpdate(updates, (u) => u.kind === "text");
+    assert.equal(turnSettled, false, "prompt 返回时回合不该已经结束");
+
+    const turn = await turnPromise;
+    assert.equal(turn.stopReason, "end_turn");
+  } finally {
+    await adapter.dispose();
+  }
+});
+
+test("I4 子进程退出后六个调用都在 5 秒内抛 E_ADAPTER_DOWN", async () => {
+  const adapter = await spawnFakeAdapter();
+  try {
+    const { sessionId } = await adapter.newSession(WORKSPACE);
+    // KILL：假 agent 收到即退出，制造「子进程已死」的现场
+    await assert.rejects(adapter.prompt(sessionId, "KILL"), adapterDown);
+
+    const calls: Array<{ name: string; run: () => Promise<unknown> }> = [
+      { name: "prompt", run: () => adapter.prompt(sessionId, "hello") },
+      { name: "cancel", run: () => adapter.cancel(sessionId) },
+      { name: "close", run: () => adapter.close(sessionId) },
+      { name: "newSession", run: () => adapter.newSession(WORKSPACE) },
+      { name: "resume", run: () => adapter.resume(sessionId, WORKSPACE) },
+      { name: "waitForTurn", run: () => adapter.waitForTurn(sessionId, 60_000) },
+    ];
+    for (const call of calls) {
+      const startedAt = Date.now();
+      await assert.rejects(call.run(), (err: unknown) => {
+        adapterDown(err);
+        assert.equal((err as { code?: string }).code, "E_ADAPTER_DOWN", call.name + " 应抛 E_ADAPTER_DOWN");
+        return true;
+      });
+      const elapsed = Date.now() - startedAt;
+      assert.ok(elapsed < 5000, call.name + " 应在 5s 内失败，实际 " + String(elapsed) + "ms");
+    }
+  } finally {
+    await adapter.dispose();
+  }
+});
+
+test("M5 auto_allow 但选项里没有 allow*：回 cancelled，不拿 options[0]", async () => {
+  const adapter = await spawnFakeAdapter("auto_allow");
+  try {
+    const updates = collectUpdates(adapter);
+    const { sessionId } = await adapter.newSession(WORKSPACE);
+    await adapter.prompt(sessionId, "REJECTONLY");
+
+    await waitForUpdate(updates, (u) => u.kind === "permission_request");
+    const text = await waitForUpdate(updates, (u) => u.kind === "text");
+    assert.equal(text.text, "permission:cancelled");
+    await adapter.waitForTurn(sessionId);
+  } finally {
+    await adapter.dispose();
+  }
+});
+
+test("M9 resume 被 agent 拒绝 → E_RESUME_REJECTED", async () => {
+  const adapter = await spawnFakeAdapter("auto_allow", ["--fail-resume"]);
+  try {
+    await assert.rejects(adapter.resume("sess_missing", WORKSPACE), workbenchCode("E_RESUME_REJECTED"));
+  } finally {
+    await adapter.dispose();
+  }
+});
+
+test("M9 mapSessionUpdate：notice(error) → kind:error 且带文案", () => {
+  const update = mapSessionUpdate(
+    { sessionUpdate: "notice", severity: "error", title: "boom" },
+    seqIds(),
+  );
+  assert.equal(update?.kind, "error");
+  assert.equal(update?.text, "boom");
+});
+
+test("M9 mapSessionUpdate：notice(info) → 丢弃（null）", () => {
+  assert.equal(mapSessionUpdate({ sessionUpdate: "notice", level: "info", title: "hi" }, seqIds()), null);
+});
+
+test("M9 mapSessionUpdate：agent_message（非 chunk）→ kind:text，id 取 messageId", () => {
+  const update = mapSessionUpdate(
+    { sessionUpdate: "agent_message", messageId: "m1", content: { type: "text", text: "hello" } },
+    seqIds(),
+  );
+  assert.equal(update?.kind, "text");
+  assert.equal(update?.id, "m1");
+  assert.equal(update?.text, "hello");
+});
+
+test("M9 mapSessionUpdate：tool_call_content_chunk → kind:tool_call", () => {
+  const update = mapSessionUpdate(
+    { sessionUpdate: "tool_call_content_chunk", toolCallId: "tc_9", content: { type: "text", text: "out" } },
+    seqIds(),
+  );
+  assert.equal(update?.kind, "tool_call");
+  assert.equal(update?.id, "tc_9");
+});
+
+test("M9 mapSessionUpdate：未识别标签 → 丢弃（null）", () => {
+  assert.equal(mapSessionUpdate({ sessionUpdate: "usage_update", used: 1 }, seqIds()), null);
 });
 
 test("resolveDefaultAdapterCmd：本地包可解析 → node + 包入口", () => {

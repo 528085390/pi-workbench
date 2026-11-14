@@ -51,6 +51,10 @@ const CANCEL_SETTLE_MS = 5_000;
 const STDERR_MAX_LINES = 200;
 /** dispose 等子进程退出最多这么久 */
 const DISPOSE_WAIT_MS = 1_000;
+/** 会话级 RPC（newSession / resume / close）上限：agent 不回就按 adapter down 失败，不挂起（M8） */
+const SESSION_CALL_TIMEOUT_MS = 10_000;
+/** #downReason 的初始占位值：还是它说明真实原因得从底层 cause 取（I2） */
+const PLACEHOLDER_DOWN_REASON = "未启动";
 
 type Turn = {
   promise: Promise<AdapterTurnResult>;
@@ -74,9 +78,11 @@ export class ClaudeAdapter implements AgentAdapter {
   readonly #stderr: string[];
   readonly #listeners = new Set<(update: AdapterUpdate) => void>();
   readonly #turns = new Map<string, Turn>();
+  /** 「adapter 挂掉」的一次性订阅者：每个 RPC 挂一枚，结束就摘（M6：不许随回合累积） */
+  readonly #downWaiters = new Set<(error: WorkbenchError) => void>();
   #updateSeq = 0;
   #down = false;
-  #downReason = "未启动";
+  #downReason = PLACEHOLDER_DOWN_REASON;
   #disposed = false;
 
   private constructor(child: ChildProcess, permissionMode: PermissionMode) {
@@ -109,13 +115,15 @@ export class ClaudeAdapter implements AgentAdapter {
       .onRequest(methods.client.session.requestPermission, (ctx) => this.#onPermissionRequest(ctx.params));
     this.#conn = app.connect(stream);
 
+    // I2：先标 down 再放行 #exit。反过来的话，stdio 关闭引出的请求拒绝会先到 #adaptError，
+    // 那时 #down 还是 false，错误文案只剩占位 reason「未启动」。
     child.on("exit", (code, signal) => {
-      this.#exit.resolve();
       this.#markDown("子进程退出（code=" + String(code) + ", signal=" + String(signal) + "）");
+      this.#exit.resolve();
     });
     child.on("error", (error: Error) => {
-      this.#exit.resolve();
       this.#markDown("子进程不可用：" + error.message);
+      this.#exit.resolve();
     });
   }
 
@@ -158,16 +166,20 @@ export class ClaudeAdapter implements AgentAdapter {
   }
 
   async newSession(cwd: string): Promise<{ sessionId: string }> {
-    const response = await this.#await("newSession", () =>
-      this.#conn.agent.request(methods.agent.session.new, { cwd }),
+    const response = await this.#await(
+      "newSession",
+      () => this.#conn.agent.request(methods.agent.session.new, { cwd }),
+      SESSION_CALL_TIMEOUT_MS,
     );
     return { sessionId: response.sessionId };
   }
 
   async resume(sessionId: string, cwd: string): Promise<void> {
     try {
-      await this.#await("resume", () =>
-        this.#conn.agent.request(methods.agent.session.resume, { sessionId, cwd }),
+      await this.#await(
+        "resume",
+        () => this.#conn.agent.request(methods.agent.session.resume, { sessionId, cwd }),
+        SESSION_CALL_TIMEOUT_MS,
       );
     } catch (error) {
       const adapted = this.#adaptError(error, "resume");
@@ -188,7 +200,6 @@ export class ClaudeAdapter implements AgentAdapter {
   async prompt(sessionId: string, text: string): Promise<{ messageId: string }> {
     this.#assertAlive("prompt");
     const turn = this.#turnFor(sessionId);
-    const messageId = "msg_" + randomUUID();
     const request = this.#conn.agent.request(methods.agent.session.prompt, {
       sessionId,
       prompt: [{ type: "text", text }],
@@ -202,12 +213,22 @@ export class ClaudeAdapter implements AgentAdapter {
       },
     );
 
+    let accepted: unknown = null;
     try {
-      await this.#race("prompt", request, { timeoutMs: PROMPT_ACCEPT_TIMEOUT_MS, swallowTimeout: true });
+      accepted = await this.#race("prompt", request, {
+        timeoutMs: PROMPT_ACCEPT_TIMEOUT_MS,
+        swallowTimeout: true,
+      });
     } catch (error) {
       // 请求失败已在 then 里 reject 过回合；这里把同一错误抛给调用方
       throw this.#adaptError(error, "prompt");
     }
+    // M7：受理响应若已经给了 messageId 就以它为准；没拿到（受理超时）才自造 msg_<uuid>。
+    // R11 允许自造 id 后不回填：这里不会因为晚到的响应再改 messageId。
+    const responseRecord = asRecord(accepted);
+    const messageId =
+      (responseRecord === null ? undefined : optionalString(responseRecord["messageId"])) ??
+      "msg_" + randomUUID();
     return { messageId };
   }
 
@@ -231,7 +252,11 @@ export class ClaudeAdapter implements AgentAdapter {
   }
 
   async close(sessionId: string): Promise<void> {
-    await this.#await("close", () => this.#conn.agent.request(methods.agent.session.close, { sessionId }));
+    await this.#await(
+      "close",
+      () => this.#conn.agent.request(methods.agent.session.close, { sessionId }),
+      SESSION_CALL_TIMEOUT_MS,
+    );
   }
 
   /**
@@ -276,11 +301,8 @@ export class ClaudeAdapter implements AgentAdapter {
       // 连接已关闭，忽略
     }
     this.#killChild();
-    const exited = await this.#race("dispose", this.#exit.promise, {
-      timeoutMs: DISPOSE_WAIT_MS,
-      swallowTimeout: true,
-    });
-    void exited;
+    // 单次等子进程退出：不走 #race（#markDown 已把 down 订阅清空，走了会立刻返回）
+    await raceWithTimeout(this.#exit.promise, DISPOSE_WAIT_MS);
   }
 
   async #handshake(): Promise<void> {
@@ -298,38 +320,74 @@ export class ClaudeAdapter implements AgentAdapter {
   /**
    * 发请求并等待结果：同时和「子进程退出」「可选超时」赛跑。
    * 返回 `null` 表示超时且调用方允许忽略（swallowTimeout）。
+   *
+   * M6：退出订阅和定时器都在 finally 里摘掉 / clearTimeout。之前每回合挂一枚 120s 定时器
+   * 且 `#exit.promise.then` 永不摘除，长会话里会一直累积。
    */
   async #race<T>(
     label: string,
     promise: Promise<T>,
     options: { timeoutMs?: number; timeoutNote?: string; swallowTimeout?: boolean } = {},
   ): Promise<T | null> {
-    const racers: Array<Promise<T | null | RaceTimeout>> = [
-      promise,
-      this.#exit.promise.then((): never => {
-        throw this.#downError(label);
-      }),
-    ];
-    if (options.timeoutMs !== undefined) {
-      racers.push(delay(options.timeoutMs).then((): RaceTimeout => RACE_TIMEOUT));
-    }
-    const settled = await Promise.race(racers);
-    if (isRaceTimeout(settled)) {
-      if (options.swallowTimeout === true) {
-        return null;
+    const down = this.#downRace(label);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const racers: Array<Promise<T | never | RaceTimeout>> = [promise, down.promise];
+      const timeoutMs = options.timeoutMs;
+      if (timeoutMs !== undefined) {
+        racers.push(
+          new Promise<RaceTimeout>((resolve) => {
+            timer = setTimeout(() => {
+              resolve(RACE_TIMEOUT);
+            }, timeoutMs);
+            timer.unref();
+          }),
+        );
       }
-      throw new WorkbenchError(
-        "E_ADAPTER_DOWN",
-        label + " 超时：" + (options.timeoutNote ?? "adapter 无响应") + "（" + String(options.timeoutMs) + "ms）",
-        {
-          reason: options.timeoutNote === "turn timeout" ? "turn_timeout" : "timeout",
-          label,
-          timeoutMs: options.timeoutMs,
-          stderr: this.#stderrTail(),
-        },
-      );
+      const settled = await Promise.race(racers);
+      if (isRaceTimeout(settled)) {
+        if (options.swallowTimeout === true) {
+          return null;
+        }
+        throw new WorkbenchError(
+          "E_ADAPTER_DOWN",
+          label + " timeout：" + (options.timeoutNote ?? "adapter 无响应") + "（" + String(options.timeoutMs) + "ms）",
+          {
+            reason: options.timeoutNote === "turn timeout" ? "turn_timeout" : "timeout",
+            label,
+            timeoutMs: options.timeoutMs,
+            stderr: this.#stderrTail(),
+          },
+        );
+      }
+      return settled;
+    } finally {
+      down.detach();
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
     }
-    return settled;
+  }
+
+  /** 订阅「adapter 挂掉」；返回的 detach 必须调用，否则每回合都会留一枚订阅（M6） */
+  #downRace(label: string): { promise: Promise<never>; detach: () => void } {
+    let detach = (): void => {};
+    const promise = new Promise<never>((_resolve, reject) => {
+      if (this.#down || this.#disposed) {
+        reject(this.#downError(label));
+        return;
+      }
+      const waiter = (error: WorkbenchError): void => {
+        reject(error);
+      };
+      this.#downWaiters.add(waiter);
+      detach = () => {
+        this.#downWaiters.delete(waiter);
+      };
+    });
+    // 输掉 race 且之后才挂掉时不会有人 await 它，兜一层避免 unhandled rejection
+    promise.catch(() => {});
+    return { promise, detach };
   }
 
   /** 发请求：带退出赛跑，失败统一映射成 WorkbenchError */
@@ -350,11 +408,25 @@ export class ClaudeAdapter implements AgentAdapter {
     if (mapped !== null) {
       this.#emit(mapped);
     }
-    if (update.sessionUpdate === "state_update" && update.state === "idle") {
-      const stopReason =
-        typeof update.stopReason === "string" && update.stopReason.length > 0 ? update.stopReason : "unknown";
-      this.#settleTurn(params.sessionId, { stopReason });
+    const record = asRecord(update);
+    if (record === null || record["sessionUpdate"] !== "state_update" || record["state"] !== "idle") {
+      return;
     }
+    const stopReason = optionalString(record["stopReason"]) ?? "unknown";
+    if (stopReason === "error") {
+      // C1：回合失败绝不能被当成成功。先 emit kind:"error"（监听者先看到原因），再 reject 该回合。
+      const failure = turnFailureMessage(record);
+      this.#emit({ kind: "error", id: this.#nextId(), text: failure, raw: update });
+      this.#failTurn(
+        params.sessionId,
+        new WorkbenchError("E_BAD_REQUEST", "回合失败：" + failure, {
+          sessionId: params.sessionId,
+          stopReason,
+        }),
+      );
+      return;
+    }
+    this.#settleTurn(params.sessionId, { stopReason });
   }
 
   #onPermissionRequest(params: RequestPermissionRequest): RequestPermissionResponse {
@@ -432,6 +504,15 @@ export class ClaudeAdapter implements AgentAdapter {
     turn.resolve(result);
   }
 
+  /** C1：回合失败 → reject 该回合（失败路径绝不 resolve） */
+  #failTurn(sessionId: string, error: WorkbenchError): void {
+    const turn = this.#turns.get(sessionId);
+    if (turn === undefined) {
+      return;
+    }
+    turn.reject(error);
+  }
+
   #markDown(reason: string): void {
     if (this.#down) {
       return;
@@ -441,6 +522,12 @@ export class ClaudeAdapter implements AgentAdapter {
     const error = this.#downError("adapter 状态");
     for (const turn of this.#turns.values()) {
       turn.reject(error);
+    }
+    // 订阅者一次性兑现后清空：下一轮 RPC 会重新挂，不会累积（M6）
+    const waiters = [...this.#downWaiters];
+    this.#downWaiters.clear();
+    for (const waiter of waiters) {
+      waiter(error);
     }
     this.#emit({ kind: "error", id: this.#nextId(), text: reason, raw: { reason } });
   }
@@ -462,10 +549,20 @@ export class ClaudeAdapter implements AgentAdapter {
     }
   }
 
-  #downError(label: string): WorkbenchError {
-    return new WorkbenchError("E_ADAPTER_DOWN", label + " 失败：adapter 已退出（" + this.#downReason + "）", {
-      reason: this.#downReason,
-      stderr: this.#stderrTail(),
+  /**
+   * adapter down 的统一错误。
+   * I2：`#downReason` 还是占位值时（子进程正在退出、真实原因还没落进 #downReason），
+   * 改用底层 cause 的文案；错误信息一律带 stderr 尾部，握手失败才有可定位的线索。
+   */
+  #downError(label: string, cause?: unknown): WorkbenchError {
+    const placeholder = this.#downReason === PLACEHOLDER_DOWN_REASON;
+    const reason = placeholder && cause !== undefined ? describeError(cause) : this.#downReason;
+    const stderr = this.#stderrTail();
+    const suffix = stderr.length > 0 ? "\nstderr: " + stderr : "";
+    return new WorkbenchError("E_ADAPTER_DOWN", label + " 失败：adapter 已退出（" + reason + "）" + suffix, {
+      reason,
+      stderr,
+      ...(placeholder && cause !== undefined ? { underlying: describeError(cause) } : {}),
     });
   }
 
@@ -475,7 +572,7 @@ export class ClaudeAdapter implements AgentAdapter {
       return error;
     }
     if (this.#down) {
-      return this.#downError(label);
+      return this.#downError(label, error);
     }
     if (isJsonRpcFailure(error)) {
       return new WorkbenchError("E_BAD_REQUEST", label + " 被 agent 拒绝：" + error.message, {
@@ -484,7 +581,7 @@ export class ClaudeAdapter implements AgentAdapter {
         data: error.data,
       });
     }
-    return this.#downError(label);
+    return this.#downError(label, error);
   }
 
   #stderrTail(): string {
@@ -517,12 +614,25 @@ function createDeferred<T>(): Deferred<T> {
   return { promise, resolve: resolveFn, reject: rejectFn };
 }
 
-/** 定时器不 unref 会拖住进程退出（测试最容易踩） */
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms);
+/**
+ * 和超时赛跑：超时返回 `undefined`（哨兵由调用方判断）。
+ * M6：定时器必须 clearTimeout（否则每回合一枚会累积），还必须 unref（否则拖住进程退出）。
+ */
+async function raceWithTimeout<T>(promise: Promise<T>, ms: number): Promise<T | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<undefined>((resolve) => {
+    timer = setTimeout(() => {
+      resolve(undefined);
+    }, ms);
     timer.unref();
   });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
 }
 
 function appendStderr(lines: string[], chunk: Buffer): void {
@@ -612,14 +722,22 @@ function permissionOutcome(
   if (mode === "deny") {
     return { outcome: { outcome: "cancelled" } };
   }
+  // M5：只认 allow*。没有任何 allow 选项就回 cancelled——绝不拿 options[0]，
+  // 那可能是 reject_once / reject_always，等于把「不允许」当成了允许。
   const chosen =
     options.find((option) => option.kind === "allow_once") ??
-    options.find((option) => option.kind.startsWith("allow")) ??
-    options[0];
+    options.find((option) => option.kind.startsWith("allow"));
   if (chosen === undefined) {
     return { outcome: { outcome: "cancelled" } };
   }
   return { outcome: { outcome: "selected", optionId: chosen.optionId } };
+}
+
+/** C1：`state_update{stopReason:"error"}` 里的 JSON-RPC 错误对象取文案，缺失时给兜底说明 */
+function turnFailureMessage(record: Record<string, unknown>): string {
+  const failure = asRecord(record["error"]);
+  const detail = failure === null ? undefined : optionalString(failure["message"]);
+  return detail ?? "agent 报告回合失败（stopReason=error）";
 }
 
 function mapState(state: unknown): SessionStatus {
