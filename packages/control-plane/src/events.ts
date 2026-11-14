@@ -91,6 +91,24 @@ export class EventStore {
     return rows.map(toEvent);
   }
 
+  /**
+   * 跨会话全量事件流，按 seq 升序（WS 回放用，R33）。
+   * 与 `list` 的差别只有去掉 session_key 过滤；seq 仍全局单调，因此游标语义完全一致。
+   */
+  listAll(afterSeq = 0, limit?: number): SessionEvent[] {
+    if (limit !== undefined) {
+      const rows = this.#db
+        .prepare("SELECT " + EVENT_COLUMNS + " FROM events WHERE seq > ? ORDER BY seq ASC LIMIT ?")
+        .all(normalizeSeq(afterSeq), normalizeLimit(limit)) as EventRow[];
+      return rows.map(toEvent);
+    }
+
+    const rows = this.#db
+      .prepare("SELECT " + EVENT_COLUMNS + " FROM events WHERE seq > ? ORDER BY seq ASC")
+      .all(normalizeSeq(afterSeq)) as EventRow[];
+    return rows.map(toEvent);
+  }
+
   /** 注册监听器，返回只移除该监听器的退订函数（可重复调用）。 */
   subscribe(listener: EventListener): () => void {
     this.#listeners.add(listener);

@@ -18,8 +18,10 @@
   "dependencies": {
     "@agentclientprotocol/claude-agent-acp": "0.107.0",
     "@agentclientprotocol/sdk": "2.6.0",
+    "@fastify/websocket": "^11.3.7",
     "@pi-workbench/shared": "workspace:*",
     "execa": "^10.2.1",
+    "fastify": "^5.12.8",
     "yaml": "^2.9.1"
   }
 }
