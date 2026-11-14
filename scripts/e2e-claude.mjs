@@ -20,6 +20,7 @@
  * import 进脚本，让「跑不通」这件事只剩一种解释：daemon / adapter 真的不行）。
  * 也不进单测 —— 它需要真 claude 与已启动的 daemon（由 Task 10 手工跑）。
  */
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -40,6 +41,8 @@ const injectText = "回答 E2E_INJECT_" + nonce;
 const task = "E2E 基线任务（nonce " + nonce + "）：请用一句话答复 E2E_READY_" + nonce;
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+/** D3：会话 cwd 显式固定，可用 PI_WORKBENCH_E2E_CWD 覆盖 */
+const e2eCwd = process.env.PI_WORKBENCH_E2E_CWD ?? join(repoRoot, "spike", "a00-workspace");
 const startedIso = new Date().toISOString();
 /** Windows 文件名不允许冒号，ISO 时间戳里的 : 与 . 一律换成 - */
 const logPath = join(repoRoot, "tmp", "e2e-" + startedIso.replace(/[:.]/g, "-") + ".jsonl");
@@ -148,7 +151,7 @@ async function pollSee(sessionKey, startCursor, predicate) {
     // 「state idle」也算一个可推进的信号（模型可能只回了非文本消息）
     const detail = await request("GET", "/api/cp/sessions/" + encodeURIComponent(sessionKey));
     lastStatus = statusOf(detail !== null && typeof detail === "object" ? detail.session : undefined);
-    if (lastStatus === "idle" && messages.length > 0) {
+    if (lastStatus === "idle" && messages.some((m) => m.role === "assistant")) {
       return { hit: true, cursor, messages, status: lastStatus, waitedMs: POLL_TIMEOUT_MS - (deadline - Date.now()) };
     }
 
@@ -174,7 +177,9 @@ async function main() {
     const ref = await request("POST", "/api/cp/dispatch", {
       agent: "claude",
       task,
-      cwd: process.cwd(),
+      // D3：cwd 显式固定（可用 PI_WORKBENCH_E2E_CWD 覆盖），否则从仓库根跑会把会话
+      // cwd / 幂等哈希 / ~/.claude/projects slug 一起漂到运行目录
+      cwd: e2eCwd,
       idempotencyKey: "e2e:" + nonce,
     });
     sessionKey = ref !== null && typeof ref === "object" && typeof ref.key === "string" ? ref.key : null;
@@ -192,7 +197,13 @@ async function main() {
     record("lease", true, { clientId, expiresAt: lease !== null && typeof lease === "object" ? lease.expiresAt : null });
 
     // 4. 轮询 see，等第一条 assistant 消息 / state idle
-    const first = await pollSee(sessionKey, cursor, (messages) => messages.some((m) => textOf(m).trim().length > 0));
+    // D1：必须等 **assistant** 产出 —— dispatch 的 user prompt 516ms 就进 transcript，
+    // 只判「任意非空文本」会让 see-ready 被自己的 prompt 满足（假绿）。
+    const first = await pollSee(
+      sessionKey,
+      cursor,
+      (messages) => messages.some((m) => m.role === "assistant" && textOf(m).trim().length > 0),
+    );
     cursor = first.cursor;
     if (!first.hit) {
       throw new Error("60s 内没有等到任何 transcript 消息（status=" + first.status + "）");
@@ -253,6 +264,29 @@ async function main() {
     record("handoff", true, { mode: handoff.mode, command });
     process.stdout.write("\n>>> 接管命令：" + command + "\n\n");
 
+    // 9.5 人类回合（D2）：由脚本扮演接管人，在原生进程里写一轮，
+    //     这样 handback 的 deltaSummary 才有东西可证；Gate #7 从此能由脚本自证。
+    const humanNonce = "E2E_HUMAN_" + nonce;
+    if (process.env.PI_WORKBENCH_E2E_SKIP_HUMAN !== "1") {
+      const nativeId = ref !== null && typeof ref === "object" && typeof ref.nativeId === "string" ? ref.nativeId : null;
+      if (nativeId === null) throw new Error("dispatch 没返回 nativeId，无法模拟人类回合：" + JSON.stringify(ref));
+      // Windows 上 shell:true 会把 argv 直接拼成命令行，带空格的 prompt 会被拆散
+      // （实测 claude 只收到 "回答"）——因此这里显式拼一条命令，prompt 用 JSON 引号包住。
+      const humanPrompt = "回答" + humanNonce;
+      const humanCommand = "claude -p --resume " + nativeId + " " + JSON.stringify(humanPrompt);
+      const human = spawnSync(humanCommand, {
+        cwd: e2eCwd,
+        encoding: "utf8",
+        timeout: 180_000,
+        shell: true,
+      });
+      const humanOut = (human.stdout ?? "").replace(/\s+/g, " ").trim().slice(0, 200);
+      record("human-turn", human.status === 0, { status: human.status, sample: humanOut });
+      if (human.status !== 0) {
+        throw new Error("人类回合（claude -p --resume）失败：exit=" + String(human.status) + " " + (human.stderr ?? "").slice(0, 300));
+      }
+    }
+
     // 10. handback：先问服务端「现在谁持有租约」，不靠客户端猜命名。
     //     历史实现把租约换成了 handoff-<原 clientId>（engine 口径），但那是实现细节：
     //     脚本一旦抄这个前缀，engine 改口径就静默失效 —— 因此一律读 lease.clientId。
@@ -273,10 +307,21 @@ async function main() {
     const handback = await request("POST", "/api/cp/sessions/" + encodeURIComponent(sessionKey) + "/handback", {
       clientId: handbackClientId,
     });
+    const deltaSummary =
+      handback !== null && typeof handback === "object" && typeof handback.deltaSummary === "string"
+        ? handback.deltaSummary
+        : null;
     record("handback", true, {
       resumed: handback !== null && typeof handback === "object" ? handback.resumed : null,
-      deltaSummary: handback !== null && typeof handback === "object" ? handback.deltaSummary : null,
+      deltaSummary,
     });
+    // D2：deltaSummary 必须非空且真的包含 handoff 期间那一轮（Gate #7 的自证）
+    if (deltaSummary === null || deltaSummary.trim().length === 0) {
+      throw new Error("handback 的 deltaSummary 为空 —— handoff 期间的人类回合没有被读到");
+    }
+    if (process.env.PI_WORKBENCH_E2E_SKIP_HUMAN !== "1" && !deltaSummary.includes("E2E_HUMAN_" + nonce)) {
+      throw new Error("deltaSummary 未包含 handoff 期间的人类回合 nonce：E2E_HUMAN_" + nonce);
+    }
 
     results.push({ ok: true });
   } catch (error) {

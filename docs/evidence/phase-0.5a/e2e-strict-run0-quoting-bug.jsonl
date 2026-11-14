@@ -1,0 +1,15 @@
+{"ts":"2026-11-14T18:57:09.622Z","step":"start","ok":true,"detail":"{\"baseUrl\":\"http://127.0.0.1:7336\",\"clientId\":\"e2e-d4ac42af\",\"nonce\":\"d4ac42af\",\"logPath\":\"E:\\\\pi-workbench\\\\tmp\\\\e2e-2026-11-14T18-57-09-621Z.jsonl\"}"}
+{"ts":"2026-11-14T18:57:09.636Z","step":"health","ok":true,"detail":"{\"ok\":true,\"name\":\"pi-workbenchd\",\"version\":\"0.0.1\",\"pid\":59576,\"uptimeMs\":5127}"}
+{"ts":"2026-11-14T18:57:12.300Z","step":"dispatch","ok":true,"detail":"{\"key\":\"claude:89d85677-5ad9-4881-b73e-d640e1816c45\",\"status\":\"running\",\"nativeId\":\"89d85677-5ad9-4881-b73e-d640e1816c45\"}"}
+{"ts":"2026-11-14T18:57:12.307Z","step":"lease","ok":true,"detail":"{\"clientId\":\"e2e-d4ac42af\",\"expiresAt\":\"2026-11-14T19:27:12.303Z\"}"}
+{"ts":"2026-11-14T18:57:14.351Z","step":"see-ready","ok":true,"detail":"{\"waitedMs\":2043,\"status\":\"running\",\"messages\":3,\"preview\":[\"The user asks: reply in one sentence with E2E_READY_d4ac42af.\",\"E2E_READY_d4ac42af\"]}"}
+{"ts":"2026-11-14T18:57:14.374Z","step":"inject","ok":true,"detail":"{\"messageId\":\"ba50852a-e752-49f2-9b37-0787a5610758\",\"effective\":\"now\"}"}
+{"ts":"2026-11-14T18:57:14.881Z","step":"see-inject","ok":true,"detail":"{\"waitedMs\":507,\"messages\":1}"}
+{"ts":"2026-11-14T18:57:14.919Z","step":"interrupt","ok":true,"detail":"{\"stopReason\":\"cancelled\"}"}
+{"ts":"2026-11-14T18:57:14.926Z","step":"checkpoint","ok":true,"detail":"{\"sessionKey\":\"claude:89d85677-5ad9-4881-b73e-d640e1816c45\",\"summary\":\"E2E d4ac42af：已跑通 dispatch / see / inject / interrupt\",\"touchedFiles\":[],\"nextStep\":\"人工接管确认一轮，再 handback 回 Pi\",\"transcriptCursor\":\"195093\",\"createdAt\":\"2026-11-14T18:57:14.921Z\",\"path\":\"E:\\\\pi-workbench\\\\tmp\\\\t10-e2e\\\\handoffs\\\\claude-89d85677-5ad9-4881-b73e-d640e1816c45-2026-11-14T18-57-14.921Z.md\"}"}
+{"ts":"2026-11-14T18:57:14.948Z","step":"handoff","ok":true,"detail":"{\"mode\":\"resume-tui\",\"command\":\"claude --resume 89d85677-5ad9-4881-b73e-d640e1816c45\"}"}
+{"ts":"2026-11-14T18:57:22.670Z","step":"human-turn","ok":true,"detail":"{\"status\":0,\"sample\":\"E2E_INJECT_d4ac42af\"}"}
+{"ts":"2026-11-14T18:57:22.672Z","step":"lease-handback","ok":true,"detail":"{\"clientId\":\"handoff-e2e-d4ac42af\"}"}
+{"ts":"2026-11-14T18:57:23.518Z","step":"handback","ok":true,"detail":"{\"resumed\":true,\"deltaSummary\":\"assistant: No response requested.\\nuser: 回答\\nassistant: The user says \\\"回答\\\" (answer). The previous message asked \\\"回答 E2E_INJECT_d4ac42af\\\" which was interrupted. Now they just sa…\\nassistant: E2E_INJECT_d4ac42af\"}"}
+{"ts":"2026-11-14T18:57:23.519Z","step":"error","ok":false,"detail":"deltaSummary 未包含 handoff 期间的人类回合 nonce：E2E_HUMAN_d4ac42af"}
+{"ts":"2026-11-14T18:57:23.519Z","step":"summary","ok":false,"detail":"{\"result\":\"FAIL\",\"sessionKey\":\"claude:89d85677-5ad9-4881-b73e-d640e1816c45\",\"nonce\":\"d4ac42af\",\"logPath\":\"E:\\\\pi-workbench\\\\tmp\\\\e2e-2026-11-14T18-57-09-621Z.jsonl\",\"error\":\"deltaSummary 未包含 handoff 期间的人类回合 nonce：E2E_HUMAN_d4ac42af\"}"}
