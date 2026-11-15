@@ -451,3 +451,37 @@ test("cp_sessions 输出未读数与 awaiting 标记", async () => {
   const out = String(await sessions.def.handler({}));
   assert.match(out, /claude:abc needs-input driver=pi unread=2 awaiting/);
 });
+test("beforeCall：每次请求前先 await 钩子（插件用它等 daemon 自动拉起）", async () => {
+  const order: string[] = [];
+  const { fetchImpl } = recorder(() => ({ body: { ok: true } }));
+  const wrapped: typeof fetch = async (input, init) => {
+    order.push("fetch");
+    return fetchImpl(input, init);
+  };
+  const client = createWorkbenchClient({
+    baseUrl: "http://h:1",
+    fetch: wrapped,
+    beforeCall: async () => {
+      order.push("hook");
+    },
+  });
+
+  await client.agents();
+  await client.agents();
+
+  assert.deepEqual(order, ["hook", "fetch", "hook", "fetch"]);
+});
+
+test("beforeCall 抛错 → 不发请求", async () => {
+  const { calls, fetchImpl } = recorder(() => ({ body: {} }));
+  const client = createWorkbenchClient({
+    baseUrl: "http://h:1",
+    fetch: fetchImpl,
+    beforeCall: () => {
+      throw new Error("E_DAEMON_DOWN: 起不来");
+    },
+  });
+
+  await assert.rejects(() => client.agents(), /E_DAEMON_DOWN/);
+  assert.equal(calls.length, 0);
+});

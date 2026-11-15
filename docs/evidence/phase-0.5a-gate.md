@@ -350,3 +350,12 @@ $ git check-ignore -v spike/acp-probe/evidence/claude-full.jsonl          → .g
 - `cp_see` 默认走未读 + 标记已读，`peek:true` 只看不标记，`after=` 仍走 transcript 分页。
 - 证据（含真机数字、CLI 与 Pi 插件实录）：`docs/evidence/phase-0.5a/read-semantics-v2.md`。
 - 测试：control-plane 226（225 pass / 1 skip）、extension 19 全绿。
+
+## 20. daemon 自动拉起（2026-11-16 增量）
+
+- Pi 插件加载时探活 `http://127.0.0.1:7331/health`，没在跑就以 detached 方式
+  `node <repo>/packages/control-plane/dist/cli.js start` 拉起，端口从 baseUrl 推导（`PI_WORKBENCH_HOST/PORT`），轮询到就绪为止。
+- 非回环地址不代管；`PI_WORKBENCH_AUTOSTART=0` 关闭；入口不存在/超时抛 `E_DAEMON_DOWN` 并给手工命令。
+- 不阻塞 Pi 启动：工厂函数 fire-and-forget，第一个 `cp_*` 调用前经 `beforeCall` 钩子等待就绪。
+- 证据（含冷启动真机实录、schema 校验）：`docs/evidence/phase-0.5a/daemon-autostart.md`。
+- 测试：extension 27 全绿（新增 daemon 6 + beforeCall 2）。

@@ -54,6 +54,11 @@ export type WorkbenchClientOptions = {
   authToken?: string;
   /** T1 旧字段名，等价 `authToken`（R43 兼容，勿在新代码里用） */
   token?: string;
+  /**
+   * 每次 HTTP 调用前的钩子（插件用它等 daemon 自动拉起）。返回的 Promise 会被 await；
+   * 抛错则本次调用直接失败（不会发请求）。
+   */
+  beforeCall?: () => Promise<void> | void;
 };
 
 /**
@@ -272,6 +277,9 @@ export function createWorkbenchClient(options: WorkbenchClientOptions = {}): Wor
   const doFetch: typeof fetch = options.fetch ?? fetch;
 
   async function call(method: "GET" | "POST", path: string, body?: unknown): Promise<unknown> {
+    if (options.beforeCall !== undefined) {
+      await options.beforeCall();
+    }
     const url = new URL(path, baseUrl + "/");
     const headers: Record<string, string> = {};
     if (authToken !== null && authToken.length > 0) {
@@ -692,3 +700,5 @@ export function registerWorkbenchTools(
 
   return client;
 }
+// daemon 自动拉起（Pi 插件加载时用）
+export * from "./daemon.ts";
