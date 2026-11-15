@@ -341,3 +341,12 @@ $ git check-ignore -v spike/acp-probe/evidence/claude-full.jsonl          → .g
 ```
 
 当前 `.gitignore` 第 3–4 行已是 `spike/acp-probe/evidence/*` + `!spike/acp-probe/evidence/a00*.jsonl`，否定规则**已生效**、两个 A00 JSONL 都已在库中，因此本次无需改 `.gitignore`（仅做校验）。
+## 19. Gate 后追加：读语义 v2（未读 + 每读者游标，2026-11-16）
+
+用户提出的读模型改造（"别让 Pi 靠轮询盯会话，登记未读即可"）已落地，属 Gate 0.5-A 之后的增量，不影响上表九条结论。
+
+- 表 `read_cursors`（schema v3），游标 = transcript 字节偏移，`unread` = 游标后剩余消息条数。
+- 路由：`GET /sessions?clientId=`、`GET /sessions/:key?clientId=`、`GET /sessions/:key/unread?clientId=&limit=&ack=`、`POST /sessions/:key/read`。
+- `cp_see` 默认走未读 + 标记已读，`peek:true` 只看不标记，`after=` 仍走 transcript 分页。
+- 证据（含真机数字、CLI 与 Pi 插件实录）：`docs/evidence/phase-0.5a/read-semantics-v2.md`。
+- 测试：control-plane 226（225 pass / 1 skip）、extension 19 全绿。

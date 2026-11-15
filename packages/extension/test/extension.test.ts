@@ -86,15 +86,25 @@ test("没有 token 时不发 authorization 头", async () => {
 
 test("sessions 过滤器拼进查询串；agents 打到 /api/cp/agents", async () => {
   const { calls, fetchImpl } = recorder(() => ({ body: [] }));
-  const client = createWorkbenchClient({ baseUrl: "http://127.0.0.1:7331", fetch: fetchImpl });
+  const client = createWorkbenchClient({ baseUrl: "http://127.0.0.1:7331", clientId: "pi:7", fetch: fetchImpl });
 
   await client.agents();
   await client.sessions();
   await client.sessions({ agent: "claude", status: "idle" });
+  await client.sessions({ clientId: "human:1" });
 
   assert.equal(calls[0]?.url, "http://127.0.0.1:7331/api/cp/agents");
-  assert.equal(calls[1]?.url, "http://127.0.0.1:7331/api/cp/sessions");
-  assert.equal(calls[2]?.url, "http://127.0.0.1:7331/api/cp/sessions?agent=claude&status=idle");
+  // 列表默认带本 client 的 clientId，服务端才会算未读（spec §6.5）
+  assert.equal(calls[1]?.url, "http://127.0.0.1:7331/api/cp/sessions?clientId=pi%3A7");
+  assert.equal(
+    calls[2]?.url,
+    "http://127.0.0.1:7331/api/cp/sessions?agent=claude&status=idle&clientId=pi%3A7",
+  );
+  assert.equal(
+    calls[3]?.url,
+    "http://127.0.0.1:7331/api/cp/sessions?clientId=human%3A1",
+    "可显式指定别的读者身份",
+  );
 });
 
 test("每个方法打到正确的 path + method", async () => {
@@ -331,7 +341,7 @@ test("handler 缺必填参数时返回 E_BAD_REQUEST 文本，且不发请求", 
 test("registerWorkbenchTools 接受已建好的 client（复用，不重建）", async () => {
   const { api, tools } = fakeApi();
   const { calls, fetchImpl } = recorder(() => ({ body: [] }));
-  const client = createWorkbenchClient({ baseUrl: "http://h:1", authToken: "t", fetch: fetchImpl });
+  const client = createWorkbenchClient({ baseUrl: "http://h:1", authToken: "t", clientId: "pi:7", fetch: fetchImpl });
 
   const returned = registerWorkbenchTools(api, client);
   assert.equal(returned, client);
@@ -339,6 +349,105 @@ test("registerWorkbenchTools 接受已建好的 client（复用，不重建）",
   const sessions = tools.find((tool) => tool.name === "cp_sessions");
   assert.ok(sessions !== undefined);
   assert.equal(await sessions.def.handler({}), "no sessions");
-  assert.equal(calls[0]?.url, "http://h:1/api/cp/sessions");
+  assert.equal(calls[0]?.url, "http://h:1/api/cp/sessions?clientId=pi%3A7");
   assert.equal(calls[0]?.headers["authorization"], "Bearer t");
+});
+// ---------------------------------------------------------------- 读语义 v2（spec §6.5）
+
+test("unread：默认 ack=1 读未读，ack:false 是 peek；markRead 打到 /read", async () => {
+  const { calls, fetchImpl } = recorder(() => ({
+    body: { messages: [], nextCursor: "7", lastReadCursor: "7", unread: 0, awaiting: false, acked: true },
+  }));
+  const client = createWorkbenchClient({ baseUrl: "http://h:1", clientId: "pi:7", fetch: fetchImpl });
+
+  await client.unread("claude:abc");
+  await client.unread("claude:abc", { limit: 3, ack: false });
+  await client.markRead("claude:abc");
+  await client.markRead("claude:abc", "9");
+
+  assert.equal(calls[0]?.url, "http://h:1/api/cp/sessions/claude%3Aabc/unread?clientId=pi%3A7&ack=1");
+  assert.equal(
+    calls[1]?.url,
+    "http://h:1/api/cp/sessions/claude%3Aabc/unread?clientId=pi%3A7&limit=3&ack=0",
+    "peek 传 ack=0",
+  );
+  assert.equal(calls[2]?.url, "http://h:1/api/cp/sessions/claude%3Aabc/read");
+  assert.deepEqual(calls[2]?.body, { clientId: "pi:7" });
+  assert.deepEqual(calls[3]?.body, { clientId: "pi:7", cursor: "9" });
+});
+
+test("cp_see 默认走未读并标记已读；peek=true 只读；after 走 transcript", async () => {
+  const { api, tools } = (() => {
+    const registered: { name: string; def: PiToolDefinition }[] = [];
+    const toolApi: PiToolApi = {
+      registerTool(name, def) {
+        registered.push({ name, def });
+      },
+    };
+    return { api: { api: toolApi, tools: registered }, tools: registered };
+  })();
+  const { calls, fetchImpl } = recorder((call) =>
+    call.url.includes("/transcript")
+      ? { body: { messages: [{ id: "m1", role: "user", kind: "text", text: "历史" }], nextCursor: "42" } }
+      : {
+          body: {
+            messages: [{ id: "m2", role: "assistant", kind: "text", text: "新消息" }],
+            nextCursor: "50",
+            lastReadCursor: "50",
+            unread: 1,
+            awaiting: false,
+            acked: true,
+          },
+        },
+  );
+  const client = createWorkbenchClient({ baseUrl: "http://h:1", clientId: "pi:7", fetch: fetchImpl });
+  registerWorkbenchTools(api.api, client);
+
+  const see = tools.find((tool) => tool.name === "cp_see");
+  assert.ok(see !== undefined);
+  const plain = String(await see.def.handler({ key: "claude:abc" }));
+  assert.match(plain, /1 unread message\(s\)/);
+  assert.match(plain, /新消息/);
+  assert.match(calls[0]?.url ?? "", /\/unread\?clientId=pi%3A7&ack=1$/);
+
+  const peeked = String(await see.def.handler({ key: "claude:abc", peek: true }));
+  assert.match(peeked, /新消息/);
+  assert.match(calls[1]?.url ?? "", /ack=0$/);
+
+  const byCursor = String(await see.def.handler({ key: "claude:abc", after: "12" }));
+  assert.match(byCursor, /历史/);
+  assert.match(calls[2]?.url ?? "", /\/transcript\?after=12$/);
+  assert.equal(calls.length, 3);
+});
+
+test("cp_sessions 输出未读数与 awaiting 标记", async () => {
+  const registered: { name: string; def: PiToolDefinition }[] = [];
+  const toolApi: PiToolApi = {
+    registerTool(name, def) {
+      registered.push({ name, def });
+    },
+  };
+  const { fetchImpl } = recorder(() => ({
+    body: [
+      {
+        key: "claude:abc",
+        agent: "claude",
+        nativeId: "abc",
+        cwd: "E:\\w",
+        status: "needs-input",
+        driver: "pi",
+        capabilities: { stream: true },
+        lastReadCursor: "3",
+        unread: 2,
+        awaiting: true,
+      },
+    ],
+  }));
+  const client = createWorkbenchClient({ baseUrl: "http://h:1", clientId: "pi:7", fetch: fetchImpl });
+  registerWorkbenchTools(toolApi, client);
+
+  const sessions = registered.find((tool) => tool.name === "cp_sessions");
+  assert.ok(sessions !== undefined);
+  const out = String(await sessions.def.handler({}));
+  assert.match(out, /claude:abc needs-input driver=pi unread=2 awaiting/);
 });

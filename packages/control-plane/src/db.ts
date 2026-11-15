@@ -7,9 +7,11 @@ import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-/** 当前 schema 版本，写入 `PRAGMA user_version`。 */
-/** 当前 schema 版本，写入 `PRAGMA user_version`。v2：新增 dispatches（dispatch 幂等预留表）。 */
-export const SCHEMA_VERSION = 2;
+/**
+ * 当前 schema 版本，写入 `PRAGMA user_version`。
+ * v2：dispatches（dispatch 幂等预留表）；v3：read_cursors（每读者未读游标，spec §6.5）。
+ */
+export const SCHEMA_VERSION = 3;
 
 const MEMORY_PATH = ":memory:";
 
@@ -103,6 +105,19 @@ CREATE TABLE IF NOT EXISTS dispatches (
   error TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
+);
+`);
+    }
+
+    if (current < 3) {
+      // v3：每读者游标（spec §6.5）。unread = 会话最新 seq - last_read_seq。
+      db.exec(`
+CREATE TABLE IF NOT EXISTS read_cursors (
+  session_key TEXT NOT NULL,
+  client_id TEXT NOT NULL,
+  last_read_cursor TEXT NOT NULL,    -- 该读者读到的 transcript 游标（字节偏移字符串）
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (session_key, client_id)
 );
 `);
     }

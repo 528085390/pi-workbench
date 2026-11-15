@@ -7,7 +7,7 @@ import type { DatabaseSync } from "node:sqlite";
 
 import { SCHEMA_VERSION, migrate, openDb } from "../src/db.ts";
 
-const TABLES = ["sessions", "events", "leases", "checkpoints", "dispatches"];
+const TABLES = ["sessions", "events", "leases", "checkpoints", "dispatches", "read_cursors"];
 
 function readUserVersion(db: DatabaseSync): number {
   const row = db.prepare("PRAGMA user_version").get() as { user_version?: unknown } | undefined;
@@ -58,12 +58,12 @@ test("openDb: :memory: 启用 foreign_keys", () => {
   }
 });
 
-test("migrate: user_version 0→2 并建立五表与索引", () => {
+test("migrate: user_version 0→3 并建立六表与索引", () => {
   const db = openDb(":memory:");
   try {
     migrate(db);
-    assert.equal(readUserVersion(db), 2);
-    assert.equal(SCHEMA_VERSION, 2);
+    assert.equal(readUserVersion(db), 3);
+    assert.equal(SCHEMA_VERSION, 3);
     assert.deepEqual(listTables(db), [...TABLES].sort());
     const indexes = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
@@ -122,6 +122,13 @@ test("migrate: 四表列名与规格一致", () => {
       "cursor",
       "created_at",
     ]);
+    // v3：每读者未读游标（spec §6.5）
+    assert.deepEqual(columns("read_cursors"), [
+      "session_key",
+      "client_id",
+      "last_read_cursor",
+      "updated_at",
+    ]);
   } finally {
     db.close();
   }
@@ -133,10 +140,10 @@ test("migrate: 幂等（连跑两次不报错、结果不变）", () => {
     migrate(db);
     const before = listTables(db);
     migrate(db);
-    assert.equal(readUserVersion(db), 2);
+    assert.equal(readUserVersion(db), 3);
     assert.deepEqual(listTables(db), before);
     migrate(db);
-    assert.equal(readUserVersion(db), 2);
+    assert.equal(readUserVersion(db), 3);
   } finally {
     db.close();
   }
@@ -151,7 +158,7 @@ test("openDb: 文件库自动创建父目录并启用 WAL", () => {
     assert.equal(readJournalMode(db), "wal");
     assert.equal(readIntPragma(db, "foreign_keys"), 1);
     migrate(db);
-    assert.equal(readUserVersion(db), 2);
+    assert.equal(readUserVersion(db), 3);
     assert.deepEqual(listTables(db), [...TABLES].sort());
   } finally {
     db.close();

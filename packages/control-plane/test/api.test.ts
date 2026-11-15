@@ -18,6 +18,7 @@ import type { FastifyInstance } from "fastify";
 import type { AgentAdapter } from "../src/adapters/types.ts";
 import { CLAUDE_CAPABILITIES } from "../src/capabilities.ts";
 import { CheckpointStore } from "../src/checkpoints.ts";
+import { ReadCursorStore } from "../src/cursors.ts";
 import type { Config } from "../src/config.ts";
 import { migrate, openDb } from "../src/db.ts";
 import { DispatchStore } from "../src/dispatch-store.ts";
@@ -113,6 +114,7 @@ type Bundle = {
   leases: LeaseManager;
   registry: SessionRegistry;
   checkpoints: CheckpointStore;
+  cursors: ReadCursorStore;
   calls: string[];
   dir: string;
   dispose(): void;
@@ -138,6 +140,7 @@ function makeBundle(opts: BundleOptions = {}): Bundle {
   const registry = new SessionRegistry(db);
   const checkpoints = new CheckpointStore(db);
   const dispatches = new DispatchStore(db);
+  const cursors = new ReadCursorStore(db);
   const fake = makeFake(opts.fakeOptions);
   const config = makeConfig(dir, opts.config);
 
@@ -160,6 +163,7 @@ function makeBundle(opts: BundleOptions = {}): Bundle {
     engine,
     adapter: fake.adapter,
     checkpoints,
+    cursors,
     readTranscript: opts.readTranscript,
     logError: opts.logError,
   };
@@ -171,6 +175,7 @@ function makeBundle(opts: BundleOptions = {}): Bundle {
     leases,
     registry,
     checkpoints,
+    cursors,
     calls: fake.calls,
     dir,
     dispose: () => {
@@ -1334,6 +1339,174 @@ test("WS 鉴权只认 Authorization header：无 header → 401、?token= → 40
     assert.equal(wire["type"], "token");
   } finally {
     socket?.destroy();
+    await h.close();
+  }
+});
+// ---------------------------------------------------------------- 读语义 v2（spec §6.5）
+
+/** 固定 5 条消息的假 transcript：游标是"已读条数"，nextCursor = 已读条数 + 本页条数 */
+const READ_MESSAGES = [1, 2, 3, 4, 5].map((n) => ({
+  id: "m" + String(n),
+  role: n % 2 === 1 ? ("user" as const) : ("assistant" as const),
+  kind: "text" as const,
+  text: "消息 " + String(n),
+  ts: "2026-11-16T00:00:0" + String(n) + ".000Z",
+}));
+
+const readFixed: ServerTranscriptReader = (_path, cursor, limit) => {
+  const from = Number(cursor ?? "0");
+  const rest = READ_MESSAGES.slice(from);
+  const page = limit === undefined ? rest : rest.slice(0, limit);
+  return { messages: page, nextCursor: String(from + page.length), pending: false };
+};
+
+test("读语义：GET /sessions?clientId= 附未读数，不带 clientId 保持旧形状", async () => {
+  const h = await makeHarness({ readTranscript: readFixed });
+  try {
+    const plain = await h.app.inject({ method: "GET", url: SESSIONS.replace("/" + SESSION_KEY, "") });
+    assert.equal(plain.statusCode, 200);
+    const plainList = plain.json<Record<string, unknown>[]>();
+    assert.equal(plainList.length, 1);
+    assert.equal(plainList[0]?.["unread"], undefined, "旧调用方不该突然多出字段");
+
+    const withClient = await h.app.inject({ method: "GET", url: API + "/sessions?clientId=pi:1" });
+    assert.equal(withClient.statusCode, 200);
+    const list = withClient.json<{ key: string; unread: number; lastReadCursor: string; awaiting: boolean }[]>();
+    assert.equal(list[0]?.key, SESSION_KEY);
+    assert.equal(list[0]?.unread, 5, "从没读过 → 全部未读");
+    assert.equal(list[0]?.lastReadCursor, "0");
+    assert.equal(list[0]?.awaiting, false);
+  } finally {
+    await h.close();
+  }
+});
+
+test("读语义：awaiting 跟随 needs-input 状态；详情带 clientId 才有读状态", async () => {
+  const h = await makeHarness({ readTranscript: readFixed, seed: [sessionRef({ status: "needs-input" })] });
+  try {
+    const detail = await h.app.inject({ method: "GET", url: SESSIONS });
+    const plain = detail.json<{ session: Record<string, unknown> }>();
+    assert.equal(plain.session["unread"], undefined);
+
+    const withClient = await h.app.inject({ method: "GET", url: SESSIONS + "?clientId=pi:1" });
+    const view = withClient.json<{ session: { awaiting: boolean; unread: number } }>();
+    assert.equal(view.session.awaiting, true);
+    assert.equal(view.session.unread, 5);
+  } finally {
+    await h.close();
+  }
+});
+
+test("读语义：GET /unread 默认只读不推进（peek），ack=1 才推进游标", async () => {
+  const h = await makeHarness({ readTranscript: readFixed });
+  try {
+    const peek = await h.app.inject({ method: "GET", url: SESSIONS + "/unread?clientId=pi:1&limit=2" });
+    assert.equal(peek.statusCode, 200);
+    const peeked = peek.json<{ messages: unknown[]; nextCursor: string; lastReadCursor: string; unread: number; acked: boolean }>();
+    assert.equal(peeked.messages.length, 2);
+    assert.equal(peeked.nextCursor, "2");
+    assert.equal(peeked.lastReadCursor, "0", "peek 不推进");
+    assert.equal(peeked.unread, 2);
+    assert.equal(peeked.acked, false);
+
+    const stillUnread = await h.app.inject({ method: "GET", url: API + "/sessions?clientId=pi:1" });
+    assert.equal(stillUnread.json<{ unread: number }[]>()[0]?.unread, 5, "peek 之后仍未读");
+
+    const acked = await h.app.inject({ method: "GET", url: SESSIONS + "/unread?clientId=pi:1&limit=2&ack=1" });
+    assert.equal(acked.statusCode, 200);
+    const ackBody = acked.json<{ lastReadCursor: string; acked: boolean }>();
+    assert.equal(ackBody.acked, true);
+    assert.equal(ackBody.lastReadCursor, "2");
+
+    const after = await h.app.inject({ method: "GET", url: API + "/sessions?clientId=pi:1" });
+    assert.equal(after.json<{ unread: number }[]>()[0]?.unread, 3, "已读 2 条 → 剩 3 条");
+    assert.equal(after.json<{ lastReadCursor: string }[]>()[0]?.lastReadCursor, "2");
+  } finally {
+    await h.close();
+  }
+});
+
+test("读语义：不同读者互不影响（clientId 隔离）", async () => {
+  const h = await makeHarness({ readTranscript: readFixed });
+  try {
+    await h.app.inject({ method: "GET", url: SESSIONS + "/unread?clientId=pi:1&ack=1" });
+    const other = await h.app.inject({ method: "GET", url: API + "/sessions?clientId=pi:2" });
+    assert.equal(other.json<{ unread: number }[]>()[0]?.unread, 5, "另一个读者仍全部未读");
+
+    const mine = await h.app.inject({ method: "GET", url: API + "/sessions?clientId=pi:1" });
+    assert.equal(mine.json<{ unread: number }[]>()[0]?.unread, 0, "ack 无 limit → 读到底");
+  } finally {
+    await h.close();
+  }
+});
+
+test("读语义：POST /read 不给 cursor 即读到底；显式 cursor 只进不退", async () => {
+  const h = await makeHarness({ readTranscript: readFixed });
+  try {
+    const advanced = await h.app.inject({
+      method: "POST",
+      url: SESSIONS + "/read",
+      payload: { clientId: "pi:1", cursor: "3" },
+    });
+    assert.equal(advanced.statusCode, 200);
+    assert.equal(advanced.json<{ lastReadCursor: string }>().lastReadCursor, "3");
+
+    const back = await h.app.inject({
+      method: "POST",
+      url: SESSIONS + "/read",
+      payload: { clientId: "pi:1", cursor: "1" },
+    });
+    assert.equal(back.statusCode, 200);
+    assert.equal(back.json<{ lastReadCursor: string }>().lastReadCursor, "3", "游标不允许回退");
+
+    const all = await h.app.inject({ method: "POST", url: SESSIONS + "/read", payload: { clientId: "pi:1" } });
+    assert.equal(all.statusCode, 200);
+    assert.equal(all.json<{ lastReadCursor: string }>().lastReadCursor, "5");
+
+    const list = await h.app.inject({ method: "GET", url: API + "/sessions?clientId=pi:1" });
+    assert.equal(list.json<{ unread: number }[]>()[0]?.unread, 0);
+  } finally {
+    await h.close();
+  }
+});
+
+test("读语义：缺 clientId / 非法 ack → 400 E_BAD_REQUEST", async () => {
+  const h = await makeHarness({ readTranscript: readFixed });
+  try {
+    const noClient = await h.app.inject({ method: "GET", url: SESSIONS + "/unread" });
+    assert.equal(noClient.statusCode, 400);
+    assert.equal(noClient.json<ErrorEnvelope>().error.code, "E_BAD_REQUEST");
+
+    const badAck = await h.app.inject({ method: "GET", url: SESSIONS + "/unread?clientId=pi:1&ack=maybe" });
+    assert.equal(badAck.statusCode, 400);
+    assert.equal(badAck.json<ErrorEnvelope>().error.code, "E_BAD_REQUEST");
+
+    const noBody = await h.app.inject({ method: "POST", url: SESSIONS + "/read", payload: {} });
+    assert.equal(noBody.statusCode, 400);
+
+    const unknown = await h.app.inject({ method: "GET", url: API + "/sessions/claude:nope/unread?clientId=pi:1" });
+    assert.equal(unknown.statusCode, 404);
+    assert.equal(unknown.json<ErrorEnvelope>().error.code, "E_SESSION_NOT_FOUND");
+  } finally {
+    await h.close();
+  }
+});
+
+test("读语义：没有 transcriptPath 的会话 unread=0 且 /unread 返回空页", async () => {
+  const h = await makeHarness({
+    readTranscript: readFixed,
+    seed: [sessionRef({ transcriptPath: undefined })],
+  });
+  try {
+    const list = await h.app.inject({ method: "GET", url: API + "/sessions?clientId=pi:1" });
+    assert.equal(list.json<{ unread: number }[]>()[0]?.unread, 0);
+
+    const page = await h.app.inject({ method: "GET", url: SESSIONS + "/unread?clientId=pi:1&ack=1" });
+    assert.equal(page.statusCode, 200);
+    const body = page.json<{ messages: unknown[]; unread: number }>();
+    assert.deepEqual(body.messages, []);
+    assert.equal(body.unread, 0);
+  } finally {
     await h.close();
   }
 });

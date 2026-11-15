@@ -200,13 +200,13 @@ function output() {
   return { logs, errors, options };
 }
 
-test("--help 列出全部 11 个子命令", async () => {
+test("--help 列出全部 13 个子命令", async () => {
   const out = output();
   const code = await main(["node", "pi-workbench", "--help"], out.options);
   const text = out.logs.join("\n");
 
   assert.equal(code, 0);
-  assert.equal(SUBCOMMANDS.length, 11);
+  assert.equal(SUBCOMMANDS.length, 13);
   for (const name of SUBCOMMANDS) {
     assert.ok(text.includes(name), "用法里缺少子命令 " + name);
     assert.ok(USAGE.includes(name), "USAGE 常量里缺少子命令 " + name);
@@ -619,4 +619,99 @@ test("连不上 daemon ⇒ 退出 1 并提示启动命令", async () => {
   const stderr = out.errors.join("\n");
   assert.ok(stderr.includes("E_DAEMON_DOWN"), stderr);
   assert.ok(stderr.includes("pi-workbench start"), stderr);
+});
+// ---------------------------------------------------------------------------
+// 读语义 v2：unread / read / sessions --client-id
+// ---------------------------------------------------------------------------
+
+test("unread 默认 ack=1，--peek 传 ack=0", async () => {
+  const daemon = await fakeDaemon(() => ({
+    body: {
+      messages: [{ id: "m1", role: "assistant", kind: "text", text: "干完了" }],
+      nextCursor: "42",
+      lastReadCursor: "42",
+      unread: 1,
+      awaiting: false,
+      acked: true,
+    },
+  }));
+  try {
+    const out = output();
+    const code = await main(
+      ["node", "pi-workbench", "unread", "claude:abc", "--client-id", "pi:7", "--url", daemon.url],
+      out.options,
+    );
+    assert.equal(code, 0);
+    assert.equal(daemon.requests[0]?.method, "GET");
+    assert.equal(
+      daemon.requests[0]?.url,
+      "/api/cp/sessions/claude%3Aabc/unread?clientId=pi%3A7&ack=1",
+    );
+    assert.ok(out.logs.join("\n").includes("干完了"), out.logs.join("\n"));
+
+    const peekOut = output();
+    const peekCode = await main(
+      ["node", "pi-workbench", "unread", "claude:abc", "--client-id", "pi:7", "--peek", "--url", daemon.url],
+      peekOut.options,
+    );
+    assert.equal(peekCode, 0);
+    assert.equal(daemon.requests[1]?.url, "/api/cp/sessions/claude%3Aabc/unread?clientId=pi%3A7&ack=0");
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("read 默认 body 只有 clientId；--cursor 才带游标", async () => {
+  const daemon = await fakeDaemon(() => ({
+    body: { sessionKey: "claude:abc", clientId: "pi:7", lastReadCursor: "42" },
+  }));
+  try {
+    const out = output();
+    const code = await main(
+      ["node", "pi-workbench", "read", "claude:abc", "--client-id", "pi:7", "--url", daemon.url],
+      out.options,
+    );
+    assert.equal(code, 0);
+    assert.equal(daemon.requests[0]?.method, "POST");
+    assert.equal(daemon.requests[0]?.url, "/api/cp/sessions/claude%3Aabc/read");
+    assert.deepEqual(daemon.requests[0]?.body, { clientId: "pi:7" });
+    assert.ok(out.logs.join("\n").includes("42"), out.logs.join("\n"));
+
+    const withCursor = output();
+    const code2 = await main(
+      ["node", "pi-workbench", "read", "claude:abc", "--client-id", "pi:7", "--cursor", "9", "--url", daemon.url],
+      withCursor.options,
+    );
+    assert.equal(code2, 0);
+    assert.deepEqual(daemon.requests[1]?.body, { clientId: "pi:7", cursor: "9" });
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("sessions --client-id 带 reader 并显示未读", async () => {
+  const daemon = await fakeDaemon(() => ({
+    body: [
+      {
+        key: "claude:abc",
+        status: "idle",
+        driver: "pi",
+        cwd: "E:\\w",
+        unread: 3,
+        awaiting: false,
+      },
+    ],
+  }));
+  try {
+    const out = output();
+    const code = await main(
+      ["node", "pi-workbench", "sessions", "--client-id", "pi:7", "--url", daemon.url],
+      out.options,
+    );
+    assert.equal(code, 0);
+    assert.equal(daemon.requests[0]?.url, "/api/cp/sessions?clientId=pi%3A7");
+    assert.ok(out.logs.join("\n").includes("unread=3"), out.logs.join("\n"));
+  } finally {
+    await daemon.close();
+  }
 });

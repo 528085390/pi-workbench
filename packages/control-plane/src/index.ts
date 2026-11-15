@@ -7,6 +7,7 @@ import { ClaudeAdapter } from "./adapters/claude.ts";
 import { CheckpointStore } from "./checkpoints.ts";
 import type { Config } from "./config.ts";
 import { loadConfig } from "./config.ts";
+import { ReadCursorStore } from "./cursors.ts";
 import { migrate, openDb } from "./db.ts";
 import { DispatchStore } from "./dispatch-store.ts";
 import { isWorkbenchError } from "./errors.ts";
@@ -56,7 +57,7 @@ export async function main(): Promise<void> {
     process.exitCode = 1;
     return;
   }
-  const { db, store, leases, registry, restored, checkpoints, dispatches } = boot;
+  const { db, store, leases, registry, restored, checkpoints, dispatches, cursors } = boot;
 
   let adapter: ClaudeAdapter;
   try {
@@ -84,7 +85,17 @@ export async function main(): Promise<void> {
 
   let handle: ServerHandle;
   try {
-    handle = await startServer({ config, store, leases, registry, engine, adapter, checkpoints, pipeline });
+    handle = await startServer({
+      config,
+      store,
+      leases,
+      registry,
+      engine,
+      adapter,
+      checkpoints,
+      cursors,
+      pipeline,
+    });
   } catch (err) {
     reportStartupFailure(err, config);
     await disposeQuietly(adapter);
@@ -136,6 +147,7 @@ type Boot = {
   restored: number;
   checkpoints: CheckpointStore;
   dispatches: DispatchStore;
+  cursors: ReadCursorStore;
 };
 
 /**
@@ -155,7 +167,8 @@ function bootStores(config: Config, paths: WorkbenchPaths, lock: InstanceLock): 
     const restored = registry.loadFromDb();
     const checkpoints = new CheckpointStore(db);
     const dispatches = new DispatchStore(db);
-    return { db, store, leases, registry, restored, checkpoints, dispatches };
+    const cursors = new ReadCursorStore(db);
+    return { db, store, leases, registry, restored, checkpoints, dispatches, cursors };
   } catch (err) {
     if (db !== null) {
       try {

@@ -27,6 +27,8 @@ export const SUBCOMMANDS = [
   "status",
   "sessions",
   "see",
+  "unread",
+  "read",
   "inject",
   "interrupt",
   "handoff",
@@ -46,8 +48,13 @@ export const USAGE = [
   "  status                                       查看运行状态与 /health 响应",
   "",
   "接管原语（HTTP /api/cp/*）：",
-  "  sessions [--agent A] [--status S] [--json]   列出会话",
-  "  see <key> [--after 游标] [--limit N] [--json] 读 transcript 增量（只读）",
+  "  sessions [--agent A] [--status S] [--client-id ID] [--json]",
+  "                                               列出会话；带 --client-id 时显示该读者的未读数",
+  "  see <key> [--after 游标] [--limit N] [--json] 读 transcript 增量（只读，不动未读状态）",
+  "  unread <key> [--client-id ID] [--limit N] [--peek] [--json]",
+  "                                               读我还没读过的消息（默认读后标记已读；--peek 只看不标记）",
+  "  read <key> [--client-id ID] [--cursor C] [--json]",
+  "                                               标记已读（缺省读到最新；给 --cursor 则推进到该游标，只进不退）",
   "  lease <key> --action acquire|release|heartbeat --driver pi|human [--client-id ID] [--ttl-ms N]（恒输出 JSON，方便脚本取 expiresAt）",
   "                                               取 / 续 / 放租约（写操作的前置条件），打印租约 JSON",
   "  inject <key> <文本...> [--client-id ID] [--json]",
@@ -361,10 +368,11 @@ const VALUE_FLAGS = new Set([
   "action",
   "driver",
   "ttl-ms",
+  "cursor",
 ]);
 
 /** 布尔开关 */
-const BOOLEAN_FLAGS = new Set(["json", "help"]);
+const BOOLEAN_FLAGS = new Set(["json", "help", "peek"]);
 
 function parseArgs(args: string[]): ParsedArgs {
   const parsed: ParsedArgs = { positionals: [], flags: new Map(), lists: new Map() };
@@ -561,8 +569,11 @@ async function cmdSessions(parsed: ParsedArgs, options: CliOptions, deps: Deps):
   const query = new URLSearchParams();
   const agent = stringFlag(parsed, "agent");
   const state = stringFlag(parsed, "status");
+  const reader = stringFlag(parsed, "client-id");
   if (agent !== undefined) query.set("agent", agent);
   if (state !== undefined) query.set("status", state);
+  // 带读者身份才会算未读（spec §6.5）；不带就保持旧形状
+  if (reader !== undefined) query.set("clientId", reader);
   const suffix = query.toString().length === 0 ? "" : "?" + query.toString();
 
   const payload = await requestJson(endpoint, "GET", "/api/cp/sessions" + suffix, undefined, fetchOf(options));
@@ -577,8 +588,19 @@ async function cmdSessions(parsed: ParsedArgs, options: CliOptions, deps: Deps):
     return 0;
   }
   for (const row of rows) {
+    const unread = row["unread"];
+    const badge = typeof unread === "number" ? "  unread=" + String(unread) : "";
+    const awaiting = row["awaiting"] === true ? "  awaiting" : "";
     deps.log(
-      str(row, "key") + "  " + str(row, "status") + "  driver=" + str(row, "driver") + "  " + str(row, "cwd"),
+      str(row, "key") +
+        "  " +
+        str(row, "status") +
+        "  driver=" +
+        str(row, "driver") +
+        badge +
+        awaiting +
+        "  " +
+        str(row, "cwd"),
     );
   }
   return 0;
@@ -612,6 +634,62 @@ async function cmdSee(parsed: ParsedArgs, options: CliOptions, deps: Deps): Prom
   for (const message of messages) {
     deps.log("[" + str(message, "role") + "/" + str(message, "kind") + "] " + preview(str(message, "text")));
   }
+  return 0;
+}
+
+async function cmdUnread(parsed: ParsedArgs, options: CliOptions, deps: Deps): Promise<number> {
+  const key = requireKey(parsed, "unread");
+  const endpoint = endpointOf(parsed, options);
+  const query = new URLSearchParams();
+  query.set("clientId", clientIdOf(parsed));
+  const limit = positiveIntFlag(parsed, "limit", "unread");
+  if (limit !== undefined) query.set("limit", String(limit));
+  // 默认读后标记已读；--peek 只看不标记（spec §6.5）
+  query.set("ack", hasFlag(parsed, "peek") ? "0" : "1");
+
+  const payload = await requestJson(
+    endpoint,
+    "GET",
+    "/api/cp/sessions/" + encodeURIComponent(key) + "/unread?" + query.toString(),
+    undefined,
+    fetchOf(options),
+  );
+  if (hasFlag(parsed, "json")) {
+    deps.log(JSON.stringify(payload, null, 2));
+    return 0;
+  }
+
+  const page = recordOf(payload);
+  const messages = listOf(page["messages"]).map(recordOf);
+  const awaiting = page["awaiting"] === true ? "（等你的回话）" : "";
+  deps.log(
+    String(messages.length) + " 条未读消息，游标 " + str(page, "nextCursor") + awaiting,
+  );
+  for (const message of messages) {
+    deps.log("[" + str(message, "role") + "/" + str(message, "kind") + "] " + preview(str(message, "text")));
+  }
+  return 0;
+}
+
+async function cmdRead(parsed: ParsedArgs, options: CliOptions, deps: Deps): Promise<number> {
+  const key = requireKey(parsed, "read");
+  const endpoint = endpointOf(parsed, options);
+  const body: Record<string, unknown> = { clientId: clientIdOf(parsed) };
+  const cursor = stringFlag(parsed, "cursor");
+  if (cursor !== undefined) body["cursor"] = cursor;
+
+  const payload = await requestJson(
+    endpoint,
+    "POST",
+    "/api/cp/sessions/" + encodeURIComponent(key) + "/read",
+    body,
+    fetchOf(options),
+  );
+  if (hasFlag(parsed, "json")) {
+    deps.log(JSON.stringify(payload, null, 2));
+    return 0;
+  }
+  deps.log("已读游标：" + str(recordOf(payload), "lastReadCursor"));
   return 0;
 }
 
@@ -820,6 +898,8 @@ function isRemoteCommand(command: string): command is Subcommand {
   return (
     command === "sessions" ||
     command === "see" ||
+    command === "unread" ||
+    command === "read" ||
     command === "inject" ||
     command === "interrupt" ||
     command === "handoff" ||
@@ -840,6 +920,10 @@ async function runRemote(command: Subcommand, args: string[], options: CliOption
       return await cmdSessions(parsed, options, deps);
     case "see":
       return await cmdSee(parsed, options, deps);
+    case "unread":
+      return await cmdUnread(parsed, options, deps);
+    case "read":
+      return await cmdRead(parsed, options, deps);
     case "inject":
       return await cmdInject(parsed, options, deps);
     case "interrupt":

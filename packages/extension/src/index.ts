@@ -108,9 +108,26 @@ export type TranscriptPage = {
   nextCursor: string;
 };
 
+/** spec §6.5：SessionRef + 该读者的读状态（列表/详情带 clientId 时服务端才附） */
+export type SessionView = SessionRef & {
+  lastReadCursor: string;
+  unread: number;
+  awaiting: boolean;
+};
+
+/** `GET /sessions/:key/unread` 的一页：游标之后还有几条 + 是否已推进游标 */
+export type UnreadPage = TranscriptPage & {
+  lastReadCursor: string;
+  unread: number;
+  awaiting: boolean;
+  acked: boolean;
+};
+
 export type SessionFilter = {
   agent?: string;
   status?: string;
+  /** 带上它才会算未读（服务端按读者分别记游标） */
+  clientId?: string;
 };
 
 export type DispatchInput = {
@@ -159,10 +176,18 @@ export type WorkbenchClient = {
   readonly clientId: string;
   health(): Promise<HealthBody>;
   agents(): Promise<AgentDescriptor[]>;
-  sessions(filter?: SessionFilter): Promise<SessionRef[]>;
+  /** 列表；默认带本 client 的 clientId，因此返回带 unread/awaiting 的视图 */
+  sessions(filter?: SessionFilter): Promise<SessionView[]>;
   dispatch(input: DispatchInput): Promise<SessionRef>;
-  /** see = 读 transcript 增量；`after` 是上一次返回的 nextCursor */
+  /** see = 按游标读 transcript 增量（纯只读，不碰未读状态）；`after` 是上一次的 nextCursor */
   see(key: string, after?: string, limit?: number): Promise<TranscriptPage>;
+  /**
+   * 读"我还没读过的消息"（spec §6.5）。默认 ack=true：读到哪就把我的游标推进到哪；
+   * ack=false 是 peek，只看不推进。没有游标参数——读多少由这里的 limit 决定。
+   */
+  unread(key: string, options?: { limit?: number; ack?: boolean }): Promise<UnreadPage>;
+  /** 显式标记已读：给 cursor 就推进到该处，不给就读到 EOF */
+  markRead(key: string, cursor?: string): Promise<{ sessionKey: string; clientId: string; lastReadCursor: string }>;
   inject(key: string, text: string): Promise<InjectResult>;
   interrupt(key: string): Promise<InterruptResult>;
   checkpoint(key: string, input: CheckpointInput): Promise<Checkpoint>;
@@ -238,7 +263,9 @@ export function createWorkbenchClient(options: WorkbenchClientOptions = {}): Wor
   const baseUrl = trimTrailingSlash(
     options.baseUrl ?? process.env["PI_WORKBENCH_URL"] ?? DEFAULT_BASE_URL,
   );
-  const clientId = options.clientId ?? `pi:${process.pid}`;
+  // 身份优先级：显式入参 > PI_WORKBENCH_CLIENT_ID > pi:<pid>。
+  // 想跨进程保持同一"读者/租约持有人"（例如 Pi 常驻但每次重启都换 pid）就设环境变量。
+  const clientId = options.clientId ?? process.env["PI_WORKBENCH_CLIENT_ID"] ?? `pi:${process.pid}`;
   const explicitToken = options.authToken ?? options.token;
   const envToken = process.env["PI_WORKBENCH_TOKEN"];
   const authToken = explicitToken ?? envToken ?? null;
@@ -274,8 +301,24 @@ export function createWorkbenchClient(options: WorkbenchClientOptions = {}): Wor
     sessions: async (filter) =>
       (await call(
         "GET",
-        "/api/cp/sessions" + queryOf({ agent: filter?.agent, status: filter?.status }),
-      )) as SessionRef[],
+        "/api/cp/sessions" +
+          queryOf({
+            agent: filter?.agent,
+            status: filter?.status,
+            clientId: filter?.clientId ?? clientId,
+          }),
+      )) as SessionView[],
+    unread: async (key, options) =>
+      (await call(
+        "GET",
+        sessionPath(key, "/unread") +
+          queryOf({ clientId, limit: options?.limit, ack: options?.ack === false ? 0 : 1 }),
+      )) as UnreadPage,
+    markRead: async (key, cursor) =>
+      (await call("POST", sessionPath(key, "/read"), {
+        clientId,
+        ...(cursor === undefined ? {} : { cursor }),
+      })) as { sessionKey: string; clientId: string; lastReadCursor: string },
     dispatch: async (input) => {
       const body: Record<string, unknown> = {
         agent: input.agent ?? "claude",
@@ -423,7 +466,8 @@ export function registerWorkbenchTools(
   });
 
   api.registerTool("cp_sessions", {
-    description: "列出控制面里的会话（可按 agent / status 过滤），每行一个 key + 状态 + driver + cwd。",
+    description:
+      "列出控制面里的会话（可按 agent / status 过滤），每行一个 key + 状态 + driver + 未读数 + cwd。unread>0 表示有你没读过的消息。",
     inputSchema: {
       type: "object",
       properties: {
@@ -438,7 +482,19 @@ export function registerWorkbenchTools(
           return "no sessions";
         }
         return list
-          .map((ref) => ref.key + " " + ref.status + " driver=" + ref.driver + " " + ref.cwd)
+          .map(
+            (ref) =>
+              ref.key +
+              " " +
+              ref.status +
+              " driver=" +
+              ref.driver +
+              " unread=" +
+              String(ref.unread) +
+              (ref.awaiting ? " awaiting" : "") +
+              " " +
+              ref.cwd,
+          )
           .join("\n");
       } catch (error) {
         return formatToolError(error);
@@ -447,25 +503,38 @@ export function registerWorkbenchTools(
   });
 
   api.registerTool("cp_see", {
-    description: "读某个会话的 transcript 增量（只读），返回新消息摘要与下一次要用的游标。",
+    description:
+      "读这个会话里你还没读过的消息（像聊天软件打开会话）。默认读后即标记已读；peek=true 只看不标记。" +
+      "想按自己的游标重读某段历史时传 after（走 transcript，纯只读，不动未读状态）。",
     inputSchema: {
       type: "object",
       properties: {
         key: { type: "string", description: "会话 key，形如 claude:<nativeId>（必填）" },
-        after: { type: "string", description: "上次返回的 nextCursor；缺省从头读" },
-        limit: { type: "number", description: "最多读多少条（可选）" },
+        peek: { type: "boolean", description: "只看不标记已读（缺省 false）" },
+        limit: { type: "number", description: "最多读多少条（可选，缺省服务端上限）" },
+        after: { type: "string", description: "按游标读 transcript（可选；给了就不走未读逻辑）" },
       },
       required: ["key"],
     },
     handler: async (input: unknown): Promise<string> => {
       try {
+        const key = requireField(input, "key");
         const limitRaw = isRecord(input) ? input["limit"] : undefined;
         const limit = typeof limitRaw === "number" && Number.isInteger(limitRaw) ? limitRaw : undefined;
-        const page = await client.see(requireField(input, "key"), fieldOf(input, "after"), limit);
+        const after = fieldOf(input, "after");
+        if (after !== undefined) {
+          const page = await client.see(key, after, limit);
+          const head =
+            page.messages.length === 0 ? "no new messages" : page.messages.length + " message(s)";
+          const lines = page.messages.slice(-10).map(messageLine);
+          return [head + "; cursor=" + page.nextCursor, ...lines].join("\n");
+        }
+        const peek = isRecord(input) && input["peek"] === true;
+        const page = await client.unread(key, { limit, ack: !peek });
         const head =
           page.messages.length === 0
-            ? "no new messages"
-            : page.messages.length + " message(s)";
+            ? "no unread messages" + (page.awaiting ? " (session is waiting for your input)" : "")
+            : String(page.messages.length) + " unread message(s)";
         const lines = page.messages.slice(-10).map(messageLine);
         return [head + "; cursor=" + page.nextCursor, ...lines].join("\n");
       } catch (error) {

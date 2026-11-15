@@ -26,6 +26,7 @@ import type { AgentAdapter } from "./adapters/types.ts";
 import { CLAUDE_CAPABILITIES } from "./capabilities.ts";
 import type { CheckpointStore } from "./checkpoints.ts";
 import type { Config } from "./config.ts";
+import type { ReadCursorStore } from "./cursors.ts";
 import { isWorkbenchError, WorkbenchError } from "./errors.ts";
 import type { WorkbenchErrorCode } from "./errors.ts";
 import type { EventStore } from "./events.ts";
@@ -72,6 +73,8 @@ export type ServerDeps = {
   adapter: AgentAdapter;
   /** GET /sessions/:key/checkpoint 直接读它（R46，不经 engine） */
   checkpoints: CheckpointStore;
+  /** 每读者未读游标（spec §6.5） */
+  cursors: ReadCursorStore;
   readTranscript?: ServerTranscriptReader;
   pipeline?: PipelineLike;
   /**
@@ -106,6 +109,16 @@ type AgentDescriptor = {
 
 type ErrorBody = { error: { code: string; message: string; details?: unknown } };
 
+/**
+ * 会话视图（spec §6.5）：`SessionRef` + 某读者的读状态。
+ * `unread` 是游标之后还有几条 transcript 消息；`awaiting` 表示会话在等人回话。
+ */
+export type SessionView = SessionRef & {
+  lastReadCursor: string;
+  unread: number;
+  awaiting: boolean;
+};
+
 type JsonRecord = Record<string, unknown>;
 
 /**
@@ -133,6 +146,7 @@ export const INTERNAL_ERROR_CODE = "E_INTERNAL";
 export const INTERNAL_ERROR_MESSAGE = "internal error";
 
 const ROUTE_LIST = "GET /sessions";
+const ROUTE_DETAIL = "GET /sessions/:key";
 const ROUTE_TRANSCRIPT = "GET /sessions/:key/transcript";
 const ROUTE_LEASE = "POST /sessions/:key/lease";
 const ROUTE_INJECT = "POST /sessions/:key/inject";
@@ -141,6 +155,8 @@ const ROUTE_CHECKPOINT = "POST /sessions/:key/checkpoint";
 const ROUTE_HANDOFF = "POST /sessions/:key/handoff";
 const ROUTE_HANDBACK = "POST /sessions/:key/handback";
 const ROUTE_DISPATCH = "POST /dispatch";
+const ROUTE_UNREAD = "GET /sessions/:key/unread";
+const ROUTE_READ = "POST /sessions/:key/read";
 
 const defaultReader: ServerTranscriptReader = (path, cursor, limit) =>
   readClaudeTranscript(path, cursor ?? "0", limit);
@@ -159,6 +175,25 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
 
   const app = Fastify({ logger: false });
   const logError = deps.logError ?? ((error: unknown): void => { console.error("[pi-workbenchd] 未处理异常", error); });
+
+  /**
+   * spec §6.5：SessionRef + 该读者的读状态。
+   * unread 直接数「游标之后还剩几条消息」——与 cp_see 读的是同一条 transcript 流，
+   * 不会出现「事件数对了但没消息」那种错位。transcript 未落盘/读不到时按 0 算，不把列表接口拖成 500。
+   */
+  const viewOf = (session: SessionRef, clientId: string): SessionView => {
+    const lastReadCursor = deps.cursors.cursorOf(session.key, clientId);
+    const path = session.transcriptPath;
+    let unread = 0;
+    if (path !== undefined && path.length > 0) {
+      try {
+        unread = readTranscript(path, lastReadCursor).messages.length;
+      } catch {
+        unread = 0;
+      }
+    }
+    return { ...session, lastReadCursor, unread, awaiting: session.status === "needs-input" };
+  };
   await app.register(fastifyWebsocket);
 
   const health = async (): Promise<HealthBody> => ({
@@ -232,12 +267,20 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         if (status !== undefined) {
           filter.status = status;
         }
-        return deps.registry.list(filter);
+        const sessions = deps.registry.list(filter);
+        // 不带 clientId 时保持 v1 的形状（纯 SessionRef 数组），带则每项附读状态（spec §6.5）
+        const clientId = optionalString(query, "clientId", ROUTE_LIST);
+        return clientId === undefined ? sessions : sessions.map((session) => viewOf(session, clientId));
       });
 
       api.get("/sessions/:key", async (request) => {
         const key = paramOf(request, "key");
-        return { session: requireSession(deps.registry, key), lease: deps.leases.current(key) };
+        const session = requireSession(deps.registry, key);
+        const clientId = optionalString(queryOf(request), "clientId", ROUTE_DETAIL);
+        return {
+          session: clientId === undefined ? session : viewOf(session, clientId),
+          lease: deps.leases.current(key),
+        };
       });
 
       api.get("/sessions/:key/transcript", async (request) => {
@@ -253,6 +296,52 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         }
         const page = readTranscript(path, after, limit);
         return { messages: page.messages, nextCursor: page.nextCursor };
+      });
+
+      // spec §6.5：只返回该读者没读过的消息。ack=1 才推进游标，ack=0 是 peek（默认不推进）。
+      api.get("/sessions/:key/unread", async (request) => {
+        const key = paramOf(request, "key");
+        const session = requireSession(deps.registry, key);
+        const query = queryOf(request);
+        const clientId = requireString(query, "clientId", ROUTE_UNREAD);
+        const limit = optionalPositiveInt(query, "limit", ROUTE_UNREAD);
+        const ack = optionalBoolean(query, "ack", ROUTE_UNREAD) ?? false;
+        const lastReadCursor = deps.cursors.cursorOf(key, clientId);
+        const path = session.transcriptPath;
+        const page =
+          path === undefined || path.length === 0
+            ? { messages: [] as UnifiedMessage[], nextCursor: lastReadCursor, pending: true }
+            : readTranscript(path, lastReadCursor, limit);
+        if (ack) {
+          deps.cursors.set(key, clientId, page.nextCursor);
+        }
+        return {
+          messages: page.messages,
+          nextCursor: page.nextCursor,
+          lastReadCursor: ack ? page.nextCursor : lastReadCursor,
+          unread: page.messages.length,
+          awaiting: session.status === "needs-input",
+          acked: ack,
+        };
+      });
+
+      // 显式"标记已读"：给 cursor 就推进到该游标；不给就读到 EOF（= 全部已读）。
+      api.post("/sessions/:key/read", async (request) => {
+        const key = paramOf(request, "key");
+        const session = requireSession(deps.registry, key);
+        const body = bodyOf(request.body, ROUTE_READ);
+        const clientId = requireString(body, "clientId", ROUTE_READ);
+        const explicit = optionalString(body, "cursor", ROUTE_READ);
+        let target = explicit;
+        if (target === undefined) {
+          const path = session.transcriptPath;
+          target =
+            path === undefined || path.length === 0
+              ? deps.cursors.cursorOf(key, clientId)
+              : readTranscript(path, deps.cursors.cursorOf(key, clientId)).nextCursor;
+        }
+        const cursor = deps.cursors.set(key, clientId, target);
+        return { sessionKey: key, clientId: cursor.clientId, lastReadCursor: cursor.lastReadCursor, updatedAt: cursor.updatedAt };
       });
 
       api.post("/sessions/:key/lease", async (request) => {
@@ -547,6 +636,24 @@ function optionalString(source: JsonRecord, field: string, route: string): strin
     throw new WorkbenchError("E_BAD_REQUEST", route + " 的 " + field + " 必须是字符串", { route, field });
   }
   return value;
+}
+
+function optionalBoolean(source: JsonRecord, field: string, route: string): boolean | undefined {
+  const raw = source[field];
+  if (raw === undefined || raw === null) {
+    return undefined;
+  }
+  if (typeof raw === "boolean") {
+    return raw;
+  }
+  // 查询参数天然是字符串：接受 1/0 与 true/false 两种写法
+  if (raw === "1" || raw === "true") {
+    return true;
+  }
+  if (raw === "0" || raw === "false") {
+    return false;
+  }
+  throw new WorkbenchError("E_BAD_REQUEST", route + " 的 " + field + " 必须是布尔值", { route, field });
 }
 
 function optionalPositiveInt(source: JsonRecord, field: string, route: string): number | undefined {
