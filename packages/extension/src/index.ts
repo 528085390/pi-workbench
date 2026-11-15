@@ -490,7 +490,8 @@ export function registerWorkbenchTools(
               " driver=" +
               ref.driver +
               " unread=" +
-              String(ref.unread) +
+              // 老 daemon（schema v2）不返回 unread：按 0 显示，别打印 undefined
+              String(typeof ref.unread === "number" ? ref.unread : 0) +
               (ref.awaiting ? " awaiting" : "") +
               " " +
               ref.cwd,
