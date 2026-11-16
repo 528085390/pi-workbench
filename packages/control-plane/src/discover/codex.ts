@@ -37,6 +37,23 @@ const DAY_MS = 86_400_000;
 type CachedDirEntry = { name: string; directory: boolean; file: boolean };
 const DIR_CACHE = new Map<string, { mtimeMs: number; entries: CachedDirEntry[] }>();
 const META_CACHE = new Map<string, { mtimeMs: number; size: number; meta: RolloutMeta | null }>();
+/** 缓存上限（P2-2）：防止 daemon 长期运行、历史 rollout 无限增长时内存无界。 */
+const MAX_DIR_CACHE_ENTRIES = 512;
+const MAX_META_CACHE_ENTRIES = 4096;
+
+function remember<T>(cache: Map<string, T>, key: string, value: T, max: number): void {
+  if (cache.has(key)) {
+    cache.delete(key);
+  }
+  cache.set(key, value);
+  while (cache.size > max) {
+    const oldest = cache.keys().next().value;
+    if (oldest === undefined) {
+      break;
+    }
+    cache.delete(oldest);
+  }
+}
 
 /** 测试用：清空发现缓存 */
 export function clearCodexDiscoveryCache(): void {
@@ -171,7 +188,7 @@ function collectRolloutFiles(root: string): string[] {
         return;
       }
       entries = dirents.map((entry) => ({ name: entry.name, directory: entry.isDirectory(), file: entry.isFile() }));
-      DIR_CACHE.set(dir, { mtimeMs, entries });
+      remember(DIR_CACHE, dir, { mtimeMs, entries }, MAX_DIR_CACHE_ENTRIES);
     }
     for (const entry of entries) {
       const path = join(dir, entry.name);
@@ -200,7 +217,7 @@ function readRolloutMeta(path: string): RolloutMeta | null {
     return cached.meta;
   }
   const meta = parseRolloutMeta(path);
-  META_CACHE.set(path, { mtimeMs: stat.mtimeMs, size: stat.size, meta });
+  remember(META_CACHE, path, { mtimeMs: stat.mtimeMs, size: stat.size, meta }, MAX_META_CACHE_ENTRIES);
   return meta;
 }
 

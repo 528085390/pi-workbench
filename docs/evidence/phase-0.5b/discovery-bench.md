@@ -12,8 +12,8 @@
 ## 结果
 
 ```json
-{"count":1000,"firstMs":116,"cachedMs":16}
+{"count":1000,"cachedCount":1000,"firstMs":114,"cachedMs":18}
 ```
 
-- 首扫 116ms、缓存扫描 16ms，均远低于 1.5s 门槛。
-- 复现命令见 `review-fixes-2026-11-16.md` §S2。
+- 首扫 114ms、缓存扫描 18ms，均远低于 1.5s 门槛。
+- 复现命令：`node --experimental-strip-types scripts/bench-codex-discovery.mjs`（临时目录生成 1000 个 rollout，结束自动清理）。

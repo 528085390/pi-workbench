@@ -31,6 +31,8 @@ function makeConfig(permissionMode: PermissionMode = "auto_allow"): Config {
       adapterCmd: [process.execPath, FIXTURE],
       permissionMode,
     },
+    codex: { adapterCmd: [process.execPath, FIXTURE], permissionMode },
+    pi: { rpcCmd: ["pi", "--mode", "rpc"] },
   };
 }
 

@@ -239,6 +239,20 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
     }
   };
 
+  /** 任意已登记会话接入事件流（B08 M2/P2-3）：dispatch、发现、登记、handback 共用。 */
+  const attachPipeline = (session: SessionRef): void => {
+    try {
+      const driver = deps.router?.get(session.agent) ?? null;
+      if (driver !== null) {
+        deps.pipeline?.attach(driver, session.key);
+      } else if (session.agent === "claude") {
+        deps.pipeline?.attach(deps.adapter, session.key);
+      }
+    } catch (err) {
+      process.stderr.write("[pi-workbench] 挂事件管线失败（不影响请求返回）：" + String(err) + "\n");
+    }
+  };
+
   const app = Fastify({ logger: false });
   const logError = deps.logError ?? ((error: unknown): void => { console.error("[pi-workbenchd] 未处理异常", error); });
 
@@ -350,10 +364,12 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
           ...(cwd === undefined || cwd.length === 0 ? {} : { cwd }),
           ...(limit === undefined ? {} : { limit }),
         });
-        for (const ref of refs) {
-          deps.registry.upsert(ref.status === "idle" ? ref : { ...ref, status: "idle" });
+        // P1-1：发现结果只做「缺失时插入 / 补 transcriptPath」，绝不把活跃会话打回 idle。
+        const registered = refs.map((ref) => deps.registry.registerDiscovered(ref).session);
+        for (const session of registered) {
+          attachPipeline(session);
         }
-        return { sessions: refs, count: refs.length };
+        return { sessions: registered, count: registered.length };
       });
 
       api.get("/sessions", async (request) => {
@@ -397,8 +413,9 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
           capabilities: driver === null ? capsOf(agent) : driver.caps,
           kind: "interactive",
         };
-        deps.registry.upsert(ref);
-        return ref;
+        const registered = deps.registry.registerDiscovered(ref);
+        attachPipeline(registered.session);
+        return { session: registered.session, created: registered.created };
       });
 
       api.get("/sessions/:key", async (request) => {
@@ -604,7 +621,12 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         requireSession(deps.registry, key);
         const body = bodyOf(request.body, ROUTE_HANDBACK);
         const clientId = requireString(body, "clientId", ROUTE_HANDBACK);
-        return await deps.engine.handback(key, clientId);
+        const result = await deps.engine.handback(key, clientId);
+        const session = deps.registry.get(key);
+        if (session !== null) {
+          attachPipeline(session);
+        }
+        return result;
       });
 
       api.post("/dispatch", async (request) => {
@@ -624,18 +646,7 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         const cwd = optionalString(body, "cwd", ROUTE_DISPATCH);
         const ref = await deps.engine.dispatch({ agent, task, cwd, idempotencyKey });
         // 新会话挂事件管线，后续 ACP update 才会被归一化成事件（R39 的 pipeline 接线落点）
-        try {
-          // B08 M2：Claude / Codex / Pi 统一挂各自 driver 的 update 流。
-          // 没注册 driver 时保留 0.5-A 的 claude-only adapter 回落。
-          const driver = deps.router?.get(ref.agent) ?? null;
-          if (driver !== null) {
-            deps.pipeline?.attach(driver, ref.key);
-          } else if (ref.agent === "claude") {
-            deps.pipeline?.attach(deps.adapter, ref.key);
-          }
-        } catch (err) {
-          process.stderr.write("[pi-workbench] 挂事件管线失败（不影响 dispatch 返回）：" + String(err) + "\n");
-        }
+        attachPipeline(ref);
         return ref;
       });
 

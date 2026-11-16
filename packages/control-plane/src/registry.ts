@@ -96,6 +96,30 @@ export class SessionRegistry {
   }
 
   /**
+   * 发现/登记入口（B08 P1-1）：同 key 已存在时绝不覆盖 status/driver/kind/caps，
+   * 只允许补缺失的 transcriptPath；控制面自己的状态迁移仍走 upsert。
+   */
+  registerDiscovered(ref: SessionRef): {
+    session: SessionRef;
+    created: boolean;
+    transcriptPathUpdated: boolean;
+  } {
+    const existing = this.#memory.get(ref.key)?.ref;
+    if (existing === undefined) {
+      this.upsert(ref);
+      return { session: ref, created: true, transcriptPathUpdated: false };
+    }
+    const missingPath = existing.transcriptPath === undefined || existing.transcriptPath.length === 0;
+    const incomingPath = ref.transcriptPath;
+    if (missingPath && incomingPath !== undefined && incomingPath.length > 0) {
+      const merged: SessionRef = { ...existing, transcriptPath: incomingPath };
+      this.upsert(merged);
+      return { session: merged, created: false, transcriptPathUpdated: true };
+    }
+    return { session: existing, created: false, transcriptPathUpdated: false };
+  }
+
+  /**
    * 只改状态（A06 管线对 `state_update` 的投影）：内存态与 `sessions` 表同步。
    * - 未知 key 返回 `null`（不抛、不凭空建行）：状态只能投影到已登记的会话。
    * - 返回更新后的 SessionRef；调用方拿到的旧引用不变（对象整体替换）。

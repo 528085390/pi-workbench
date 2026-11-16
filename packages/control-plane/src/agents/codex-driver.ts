@@ -345,10 +345,12 @@ export class CodexDriver implements AgentDriver {
           return adapter;
         },
         (error: unknown) => {
-          this.#spawnPromise = null;
           throw agentUnavailable(error);
         },
-      );
+      ).finally(() => {
+        // 失败或成功后都释放 in-flight 句柄；否则 S5 重建分支会永远拿到已死的旧 promise。
+        this.#spawnPromise = null;
+      });
     }
     return await this.#spawnPromise;
   }

@@ -104,6 +104,8 @@ function makeConfig(home: string, overrides: Partial<Config> = {}): Config {
     leaseTtlMs: 30_000,
     claude: { adapterCmd: [process.execPath], permissionMode: "auto_allow" },
     ...overrides,
+    codex: overrides.codex ?? { adapterCmd: [process.execPath], permissionMode: "auto_allow" },
+    pi: overrides.pi ?? { rpcCmd: ["pi", "--mode", "rpc"] },
   };
 }
 

@@ -14,6 +14,7 @@ import type { FastifyInstance } from "fastify";
 
 import type { AgentAdapter } from "../src/adapters/types.ts";
 import { AgentRouter } from "../src/agents/router.ts";
+import { CodexDriver } from "../src/agents/codex-driver.ts";
 import type { AgentDriver, AgentStatus } from "../src/agents/types.ts";
 import {
   CLAUDE_BACKGROUND_CAPABILITIES,
@@ -27,7 +28,7 @@ import { ReadCursorStore } from "../src/cursors.ts";
 import { migrate, openDb } from "../src/db.ts";
 import { DispatchStore } from "../src/dispatch-store.ts";
 import { EventStore } from "../src/events.ts";
-import { PROBE_TIMEOUT_MS, probeAgents } from "../src/index.ts";
+import { makeCodexWriteGuard, PROBE_TIMEOUT_MS, probeAgents } from "../src/index.ts";
 import { LeaseManager } from "../src/lease.ts";
 import type { ProbeCommandRunner } from "../src/index.ts";
 import { SessionRegistry } from "../src/registry.ts";
@@ -135,6 +136,8 @@ function makeConfig(home: string): Config {
     authToken: null,
     leaseTtlMs: 30_000,
     claude: { adapterCmd: [process.execPath], permissionMode: "auto_allow" },
+    codex: { adapterCmd: [process.execPath], permissionMode: "auto_allow" },
+    pi: { rpcCmd: [process.execPath, "--mode", "rpc"] },
   };
 }
 
@@ -143,7 +146,7 @@ type HarnessOptions = {
   agentStatuses?: () => Promise<AgentStatus[]>;
   now?: () => number;
   seed?: SessionRef[];
-  pipelineAttach?: (source: unknown) => void;
+  pipelineAttach?: (source: unknown, sessionKey: string) => void;
 };
 
 type Harness = {
@@ -198,8 +201,8 @@ async function makeHarness(options: HarnessOptions = {}): Promise<Harness> {
     ...(options.now === undefined ? {} : { now: options.now }),
     ...(options.pipelineAttach === undefined
       ? {}
-      : { pipeline: { attach: (source: unknown) => {
-          options.pipelineAttach?.(source);
+      : { pipeline: { attach: (source: unknown, sessionKey: string) => {
+          options.pipelineAttach?.(source, sessionKey);
           return () => {};
         } } }),
   };
@@ -438,7 +441,7 @@ test("handoff 若实际返回 attach 语义而 agent caps.attach=false，返回 
   }
 });
 
-test("Pi 写操作在共享 LeaseManager 上临时切换到 driver clientId，handoff 不报 E_LEASE_CONFLICT", async () => {
+test("Pi 的 inject/interrupt/handoff/handback 在共享 LeaseManager 上临时切换到 driver clientId", async () => {
   const key = "pi:sess-pi";
   const holders: string[] = [];
   const order: string[] = [];
@@ -447,6 +450,13 @@ test("Pi 写操作在共享 LeaseManager 上临时切换到 driver clientId，ha
     inject: async () => {
       holders.push(h?.leases.current(key)?.clientId ?? "none");
       return { messageId: "pi-m1", effective: "now" };
+    },
+    interrupt: async () => {
+      holders.push(h?.leases.current(key)?.clientId ?? "none");
+      return { stopReason: "cancelled" };
+    },
+    resume: async () => {
+      holders.push(h?.leases.current(key)?.clientId ?? "none");
     },
     close: async () => {
       order.push("close");
@@ -468,14 +478,30 @@ test("Pi 写操作在共享 LeaseManager 上临时切换到 driver clientId，ha
     assert.equal(injected.statusCode, 200, injected.body);
     assert.equal(h.leases.current(key)?.clientId, "pi:7", "写操作结束后租约必须还给扩展身份");
 
+    const interrupted = await h.app.inject({
+      method: "POST",
+      url: API + "/sessions/" + encodeURIComponent(key) + "/interrupt",
+      payload: { clientId: "pi:7" },
+    });
+    assert.equal(interrupted.statusCode, 200, interrupted.body);
+    assert.equal(h.leases.current(key)?.clientId, "pi:7");
+
     const handed = await h.app.inject({
       method: "POST",
       url: API + "/sessions/" + encodeURIComponent(key) + "/handoff",
       payload: { to: "human", clientId: "pi:7", summary: "交给人类" },
     });
     assert.equal(handed.statusCode, 200, handed.body);
-    assert.deepEqual(holders, ["pi", "pi"], "driver 内部看到的租约持有人必须与其 clientId 一致");
     assert.deepEqual(order, ["close", "handoff"], "handoff 必须先 close 控制通道，再返回原生命令（避免双写）");
+
+    const returned = await h.app.inject({
+      method: "POST",
+      url: API + "/sessions/" + encodeURIComponent(key) + "/handback",
+      payload: { clientId: "pi:7" },
+    });
+    assert.equal(returned.statusCode, 200, returned.body);
+    assert.equal(h.leases.current(key)?.clientId, "pi:7", "handback 后租约回到扩展身份");
+    assert.deepEqual(holders, ["pi", "pi", "pi", "pi"], "每次写操作 driver 内部看到的租约持有人都必须是 pi");
   } finally {
     await h.close();
   }
@@ -697,6 +723,148 @@ test("dispatch 复用 /agents 的 30s 探测缓存：两次 dispatch 只探测�
       assert.equal(res.statusCode, 200, res.body);
     }
     assert.equal(probes, 1, "30s 缓存内第二次 dispatch 不得重新探测");
+  } finally {
+    await h.close();
+  }
+});
+
+
+test("P0-1 codex 的 inject/interrupt/handoff/handback 在 pi:<pid> 租约下全部 200", async () => {
+  const key = "codex:sess-codex-write";
+  const fake = makeFake();
+  let h: Harness | null = null;
+  const codex = new CodexDriver(makeConfig("C:\\unused"), {
+    spawnAdapter: async () => fake.adapter,
+    resolveRolloutPath: async () => undefined,
+    discoverSessions: async () => [],
+    authorizeWrite: (ref, action) => makeCodexWriteGuard(h!.leases)(ref, action),
+  });
+  h = await makeHarness({
+    drivers: [{ driver: codex }],
+    seed: [sessionRef("codex", "sess-codex-write")],
+  });
+  try {
+    await acquire(h.app, key);
+
+    const injected = await h.app.inject({
+      method: "POST",
+      url: API + "/sessions/" + encodeURIComponent(key) + "/inject",
+      payload: { text: "你好", clientId: "pi:7" },
+    });
+    assert.equal(injected.statusCode, 200, injected.body);
+    assert.equal(h.leases.current(key)?.clientId, "pi:7");
+
+    const interrupted = await h.app.inject({
+      method: "POST",
+      url: API + "/sessions/" + encodeURIComponent(key) + "/interrupt",
+      payload: { clientId: "pi:7" },
+    });
+    assert.equal(interrupted.statusCode, 200, interrupted.body);
+    assert.equal(h.leases.current(key)?.clientId, "pi:7");
+
+    const handed = await h.app.inject({
+      method: "POST",
+      url: API + "/sessions/" + encodeURIComponent(key) + "/handoff",
+      payload: { to: "human", clientId: "pi:7", summary: "交给人类" },
+    });
+    assert.equal(handed.statusCode, 200, handed.body);
+    assert.equal(handed.json<{ mode: string }>().mode, "resume-tui");
+    assert.equal(h.leases.current(key)?.clientId, "handoff-pi:7");
+
+    const returned = await h.app.inject({
+      method: "POST",
+      url: API + "/sessions/" + encodeURIComponent(key) + "/handback",
+      payload: { clientId: "pi:7" },
+    });
+    assert.equal(returned.statusCode, 200, returned.body);
+    assert.equal(h.leases.current(key)?.clientId, "pi:7");
+    assert.ok(fake.calls.includes("prompt:" + "sess-codex-write:你好"));
+    assert.ok(fake.calls.includes("cancel:" + "sess-codex-write"));
+    assert.ok(fake.calls.includes("close:" + "sess-codex-write"));
+    assert.equal(fake.calls.filter((call) => call.startsWith("resume:")).length, 2, "首轮 resume + handback resume");
+  } finally {
+    await h.close();
+    await codex.dispose();
+  }
+});
+
+test("P1-1 discover 不覆盖已存在会话的 status/driver，只补 transcriptPath", async () => {
+  const found = sessionRef("codex", "sess-active", {
+    status: "idle",
+    driver: "none",
+    transcriptPath: "C:\\rollout\\active.jsonl",
+  });
+  const codex = makeDriver("codex", CODEX_CAPABILITIES, { discover: async () => [found] });
+  const h = await makeHarness({
+    drivers: [{ driver: codex.driver }],
+    seed: [sessionRef("codex", "sess-active", { status: "running", driver: "pi" })],
+  });
+  try {
+    const discovered = await h.app.inject({
+      method: "GET",
+      url: API + "/sessions/discover?agent=codex&cwd=" + encodeURIComponent("E:\\work"),
+    });
+    assert.equal(discovered.statusCode, 200, discovered.body);
+    const row = discovered.json<{ sessions: SessionRef[] }>().sessions[0];
+    assert.equal(row?.status, "running", "发现结果不得把活跃会话打回 idle");
+    assert.equal(row?.driver, "pi", "发现结果不得覆盖 driver");
+    assert.equal(row?.transcriptPath, "C:\\rollout\\active.jsonl", "缺失的 transcriptPath 应补上");
+
+    const registered = await h.app.inject({
+      method: "POST",
+      url: API + "/sessions",
+      payload: {
+        agent: "codex",
+        nativeId: "sess-active",
+        cwd: "E:\\work",
+        transcriptPath: "C:\\other.jsonl",
+      },
+    });
+    assert.equal(registered.statusCode, 200, registered.body);
+    const body = registered.json<{ created: boolean; session: SessionRef }>();
+    assert.equal(body.created, false);
+    assert.equal(body.session.status, "running");
+    assert.equal(body.session.driver, "pi");
+    assert.equal(body.session.transcriptPath, "C:\\rollout\\active.jsonl", "已有 transcriptPath 不被覆盖");
+  } finally {
+    await h.close();
+  }
+});
+
+test("P2-3 discover / register / handback 都会把会话挂到事件管线", async () => {
+  const attached: Array<{ source: unknown; key: string }> = [];
+  const found = sessionRef("codex", "sess-pipe", { transcriptPath: "C:\\rollout\\pipe.jsonl" });
+  const codex = makeDriver("codex", CODEX_CAPABILITIES, { discover: async () => [found] });
+  const hbKey = "codex:sess-handback";
+  const h = await makeHarness({
+    drivers: [{ driver: codex.driver }],
+    seed: [sessionRef("codex", "sess-handback", { status: "handoff", driver: "human" })],
+    pipelineAttach: (source, key) => attached.push({ source, key }),
+  });
+  try {
+    const discovered = await h.app.inject({
+      method: "GET",
+      url: API + "/sessions/discover?agent=codex&cwd=" + encodeURIComponent("E:\\work"),
+    });
+    assert.equal(discovered.statusCode, 200, discovered.body);
+
+    const registered = await h.app.inject({
+      method: "POST",
+      url: API + "/sessions",
+      payload: { agent: "codex", nativeId: "sess-register", cwd: "E:\\work" },
+    });
+    assert.equal(registered.statusCode, 200, registered.body);
+
+    h.leases.acquire(hbKey, "human", "handoff-pi:7");
+    const returned = await h.app.inject({
+      method: "POST",
+      url: API + "/sessions/" + encodeURIComponent(hbKey) + "/handback",
+      payload: { clientId: "pi:7" },
+    });
+    assert.equal(returned.statusCode, 200, returned.body);
+
+    assert.deepEqual(attached.map((item) => item.key), ["codex:sess-pipe", "codex:sess-register", hbKey]);
+    assert.ok(attached.every((item) => item.source === codex.driver), "每条会话都必须挂到对应 driver 的 update 流");
   } finally {
     await h.close();
   }

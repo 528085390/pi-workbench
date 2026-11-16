@@ -5,11 +5,12 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import type { AgentName } from "@pi-workbench/shared";
+import type { AgentName, SessionRef } from "@pi-workbench/shared";
 
 import { ClaudeAdapter } from "./adapters/claude.ts";
 import { ClaudeDriver } from "./agents/claude-driver.ts";
 import { CodexDriver } from "./agents/codex-driver.ts";
+import type { CodexWriteAction } from "./agents/codex-driver.ts";
 import { PiDriver, resolvePiPackageDir } from "./agents/pi-driver.ts";
 import { AgentRouter } from "./agents/router.ts";
 import type { AgentDriver } from "./agents/types.ts";
@@ -32,6 +33,28 @@ import { TakeoverEngine } from "./takeover.ts";
 
 /** 与 index 装配的 PiDriver 保持一致的写者身份（takeover.ts 的 piClientId 必须同值） */
 export const PI_AGENT_CLIENT_ID = "pi";
+
+/**
+ * Codex 写守卫（B08 S6/P0-1）：TakeoverEngine 在 driver 写操作期间把租约临时换到
+ * PI_AGENT_CLIENT_ID，因此这里比较的是引擎身份，而不是 HTTP 调用方的 pi:<pid>。
+ * handoff/close 发生在租约转交给 human 之后，不能按 writer 身份拦截。
+ */
+export function makeCodexWriteGuard(
+  leases: LeaseManager,
+): (ref: SessionRef, action: CodexWriteAction) => void {
+  return (ref, action) => {
+    if (action === "handoff" || action === "close") {
+      return;
+    }
+    const lease = leases.current(ref.key);
+    if (lease !== null && lease.clientId !== PI_AGENT_CLIENT_ID) {
+      throw new WorkbenchError("E_LEASE_CONFLICT", "租约被其他客户端持有：" + lease.clientId, {
+        sessionKey: ref.key,
+        heldBy: lease.clientId,
+      });
+    }
+  };
+}
 
 /** spec §11.1：单个探测子进程 / 动态 import 的硬超时 */
 export const PROBE_TIMEOUT_MS = 3000;
@@ -297,22 +320,10 @@ export async function main(): Promise<void> {
   // 并用固定 clientId "pi"（引擎在写操作期间临时换租约，见 takeover.ts #driverWrite）。
   const router = new AgentRouter();
   const claudeDriver = new ClaudeDriver(adapter);
-  // B08 S6：driver 级再兜一层租约检查。dispatch 首轮 inject 没有 lease（0.5-A 口径），放行；
+  // B08 S6/P0-1：driver 级再兜一层租约检查。dispatch 首轮 inject 没有 lease（0.5-A 口径），放行；
   // 若已有别的 writer，则在碰 ACP 之前直接 E_LEASE_CONFLICT，不依赖调用方一定走 TakeoverEngine。
   const codexDriver = new CodexDriver(config, {
-    authorizeWrite: (ref, action) => {
-      // handoff/close 发生在 TakeoverEngine 把租约转给 human 之后，不能按 writer 身份拦。
-      if (action === "handoff" || action === "close") {
-        return;
-      }
-      const lease = leases.current(ref.key);
-      if (lease !== null && lease.clientId !== PI_AGENT_CLIENT_ID) {
-        throw new WorkbenchError("E_LEASE_CONFLICT", "租约被其他客户端持有：" + lease.clientId, {
-          sessionKey: ref.key,
-          heldBy: lease.clientId,
-        });
-      }
-    },
+    authorizeWrite: makeCodexWriteGuard(leases),
   });
   const piDriver = new PiDriver({
     lease: leases,

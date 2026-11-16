@@ -4,12 +4,16 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { capsOf } from "../src/capabilities.ts";
-import { discoverCodexSessions } from "../src/discover/codex.ts";
+import { clearCodexDiscoveryCache, discoverCodexSessions } from "../src/discover/codex.ts";
 
 const FIXTURES = fileURLToPath(new URL("./fixtures/codex", import.meta.url));
 const SESSIONS = join(FIXTURES, "sessions");
 const CWD = "E:\\pi-workbench\\fixture-cwd";
 const NOW = (): number => Date.parse("2026-11-16T12:00:00.000Z");
+
+test.beforeEach(() => {
+  clearCodexDiscoveryCache();
+});
 
 function ids(refs: Array<{ nativeId: string }>): string[] {
   return refs.map((ref) => ref.nativeId);

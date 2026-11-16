@@ -532,14 +532,14 @@ export class TakeoverEngine {
   }
 
   /**
-   * PiDriver 写操作的租约身份适配：扩展的 clientId 是 pi:<pid>，而 PiDriver 内部固定用
-   * 构造时的 clientId（index.ts 传 "pi"）。写操作期间把租约临时换成 driver 身份，
-   * 完成后原样还给调用方 —— 同一个 LeaseManager，不会出现 E_LEASE_CONFLICT。
-   * 非 Pi / 无租约 / 租约本来就在 driver 名下时直接执行。
+   * Driver 写操作的租约身份适配：扩展的 clientId 是 pi:<pid>，而 Codex/Pi driver 的
+   * 写守卫使用引擎固定身份 "pi"（index.ts 的 PI_AGENT_CLIENT_ID）。写操作期间把租约
+   * 临时换成 driver 身份，完成后原样还给调用方 —— 同一个 LeaseManager，不会出现
+   * E_LEASE_CONFLICT。Claude / 无 driver / 无租约 / 租约本来就在 driver 名下时直接执行。
    */
   async #driverWrite<T>(ref: SessionRef, clientId: string, fn: () => Promise<T> | T): Promise<T> {
     const driver = this.#driverOf(ref);
-    if (driver === null || driver.agent !== "pi") {
+    if (driver === null || driver.agent === "claude") {
       return await fn();
     }
     const holder = this.#leases.current(ref.key);

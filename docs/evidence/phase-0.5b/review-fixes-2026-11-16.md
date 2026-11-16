@@ -58,4 +58,4 @@ pnpm --filter @pi-workbench/extension test
 node scripts/e2e-three-agents.mjs
 ```
 
-S2 基准：临时生成 1000 个 rollout，连续调用发现两次；脚本见本次会话记录，结果写入 `discovery-bench.md`。
+S2 基准：临时生成 1000 个 rollout，连续调用发现两次；可复现脚本为 `scripts/bench-codex-discovery.mjs`（复审 P3-1 补），结果写入 `discovery-bench.md`。

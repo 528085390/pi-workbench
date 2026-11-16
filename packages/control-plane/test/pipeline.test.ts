@@ -277,6 +277,21 @@ test("R19 transcript 映射: text→token、thinking→thought、tool_call/tool_
   }
 });
 
+test("R19 transcript 映射: notice→notice（P2-1）", () => {
+  const h = makeHarness();
+  try {
+    const added = h.pipeline.ingestTranscript("claude:sess-1", [
+      transcriptMessage({ id: "t-notice", kind: "notice", role: "system", text: "游标归零" }),
+    ]);
+    assert.equal(added, 1);
+    const events = h.store.list("claude:sess-1");
+    assert.equal(events[0]?.type, "notice");
+    assert.deepEqual(events[0]?.payload, { text: "游标归零" });
+  } finally {
+    h.close();
+  }
+});
+
 test("R18 未知会话: state_update 不抛异常，且不写事件（只记一次日志）", () => {
   const h = makeHarness({ seed: [] });
   try {

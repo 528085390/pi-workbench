@@ -555,3 +555,28 @@ test("dispose 幂等，只释放一次 adapter", async () => {
   await driver.dispose();
   assert.equal(harness.calls.filter((call) => call === "dispose").length, 1);
 });
+
+
+test("S5：ACP adapter 退出后下一次写操作会重建新 adapter", async () => {
+  let spawns = 0;
+  const first = makeFakeAdapter({ isAlive: () => false });
+  const second = makeFakeAdapter();
+  const driver = new CodexDriver(makeConfig([process.execPath, FIXTURE]), {
+    spawnAdapter: async () => {
+      spawns += 1;
+      return spawns === 1 ? first.adapter : second.adapter;
+    },
+    resolveRolloutPath: async () => undefined,
+    discoverSessions: async () => [],
+  });
+  try {
+    const ref = makeRef({ transcriptPath: "C:\\rollout.jsonl" });
+    await driver.inject(ref, "one");
+    await driver.inject(ref, "two");
+    assert.equal(spawns, 2, "死掉的 adapter 必须被替换，而不是永久复用");
+    assert.ok(first.calls.includes("dispose"), "旧 adapter 必须释放");
+    assert.deepEqual(second.args["prompt"], [NATIVE_ID, "two"], "第二次写操作应落到新 adapter");
+  } finally {
+    await driver.dispose();
+  }
+});

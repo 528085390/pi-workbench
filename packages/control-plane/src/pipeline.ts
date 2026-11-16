@@ -60,6 +60,7 @@ const TRANSCRIPT_KIND_TO_TYPE: ReadonlyMap<string, SessionEventType> = new Map<s
   ["thinking", "thought"],
   ["tool_call", "tool_call"],
   ["tool_result", "tool_result"],
+  ["notice", "notice"],
 ]);
 
 type Attachment = {
