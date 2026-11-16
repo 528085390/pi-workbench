@@ -7,7 +7,7 @@ import { join } from "node:path";
 
 import { loadConfig } from "../src/config.ts";
 import { resolvePaths } from "../src/paths.ts";
-import { main, stop, SUBCOMMANDS, USAGE, type CliOptions } from "../src/cli.ts";
+import { main, start, stop, SUBCOMMANDS, USAGE, type CliOptions } from "../src/cli.ts";
 
 function freshHome(): string {
   return mkdtempSync(join(tmpdir(), "pi-wb-cli-"));
@@ -588,6 +588,33 @@ test("I5：start/stop/status 收到 --url/--json/--client-id ⇒ 退出 2 并指
     assert.ok(stderr.includes("只操作本机 daemon"), JSON.stringify(item) + " → " + stderr);
     assert.ok(stderr.includes("sessions/see/inject"), stderr);
     assert.equal(out.logs.length, 0, "用法错误不写 stdout");
+  }
+});
+
+test("start：daemon 以隐藏窗口后台运行（windowsHide=true）", async () => {
+  const home = freshHome();
+  try {
+    const cfg = loadConfig({ PI_WORKBENCH_HOME: home });
+    const calls: Array<{ command: string; args: string[]; options: Record<string, unknown> }> = [];
+    const fakeSpawn = ((command: string, args: string[], options: Record<string, unknown>) => {
+      calls.push({ command, args, options });
+      return { pid: 4242, unref: () => {} };
+    }) as unknown as typeof import("node:child_process").spawn;
+
+    const code = await start({
+      config: cfg,
+      spawnImpl: fakeSpawn,
+      probeHealth: async () => ({ ok: true, body: { ok: true, pid: 4242 } }),
+      log: () => {},
+      error: () => {},
+    });
+
+    assert.equal(code, 0);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]?.options["detached"], true);
+    assert.equal(calls[0]?.options["windowsHide"], true, "后台 daemon 不能弹控制台窗口");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
   }
 });
 
