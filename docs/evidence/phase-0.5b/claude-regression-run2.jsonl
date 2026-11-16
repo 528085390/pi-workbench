@@ -1,0 +1,14 @@
+{"ts":"2026-11-16T07:41:35.486Z","step":"start","ok":true,"detail":"{\"baseUrl\":\"http://127.0.0.1:8407\",\"clientId\":\"e2e-9c84065f\",\"nonce\":\"9c84065f\",\"logPath\":\"E:\\\\pi-workbench\\\\tmp\\\\e2e-2026-11-16T07-41-35-485Z.jsonl\"}"}
+{"ts":"2026-11-16T07:41:35.500Z","step":"health","ok":true,"detail":"{\"ok\":true,\"name\":\"pi-workbenchd\",\"version\":\"0.0.1\",\"pid\":14136,\"uptimeMs\":9727,\"schemaVersion\":3}"}
+{"ts":"2026-11-16T07:41:37.447Z","step":"dispatch","ok":true,"detail":"{\"key\":\"claude:e1828943-0d96-40b6-ba5d-8b9b2b974484\",\"status\":\"running\",\"nativeId\":\"e1828943-0d96-40b6-ba5d-8b9b2b974484\"}"}
+{"ts":"2026-11-16T07:41:37.453Z","step":"lease","ok":true,"detail":"{\"clientId\":\"e2e-9c84065f\",\"expiresAt\":\"2026-11-16T08:11:37.450Z\"}"}
+{"ts":"2026-11-16T07:41:39.562Z","step":"see-ready","ok":true,"detail":"{\"waitedMs\":2109,\"status\":\"running\",\"messages\":2,\"preview\":[\"E2E 基线任务（nonce 9c84065f）：请用一句话答复 E2E_READY_9c84065f\",\"The user wants a one-sentence reply: \\\"E2E_READY_9c84065f\\\". Simple.\\n\\nThis looks l\"]}"}
+{"ts":"2026-11-16T07:41:39.747Z","step":"inject","ok":true,"detail":"{\"messageId\":\"a45b7fb2-3ac7-4f5f-b0f2-7d62dea6c9fc\",\"effective\":\"next_turn\"}"}
+{"ts":"2026-11-16T07:41:40.259Z","step":"see-inject","ok":true,"detail":"{\"waitedMs\":511,\"messages\":2}"}
+{"ts":"2026-11-16T07:41:40.286Z","step":"interrupt","ok":true,"detail":"{\"stopReason\":\"cancelled\"}"}
+{"ts":"2026-11-16T07:41:40.292Z","step":"checkpoint","ok":true,"detail":"{\"sessionKey\":\"claude:e1828943-0d96-40b6-ba5d-8b9b2b974484\",\"summary\":\"E2E 9c84065f：已跑通 dispatch / see / inject / interrupt\",\"touchedFiles\":[],\"nextStep\":\"人工接管确认一轮，再 handback 回 Pi\",\"transcriptCursor\":\"196974\",\"createdAt\":\"2026-11-16T07:41:40.288Z\",\"path\":\"E:\\\\pi-workbench\\\\tmp\\\\t9-claude-home\\\\handoffs\\\\claude-e1828943-0d96-40b6-ba5d-8b9b2b974484-2026-11-16T07-41-40.288Z.md\"}"}
+{"ts":"2026-11-16T07:41:40.309Z","step":"handoff","ok":true,"detail":"{\"mode\":\"resume-tui\",\"command\":\"claude --resume e1828943-0d96-40b6-ba5d-8b9b2b974484\"}"}
+{"ts":"2026-11-16T07:41:46.676Z","step":"human-turn","ok":true,"detail":"{\"status\":0,\"sample\":\"E2E_HUMAN_9c84065f\"}"}
+{"ts":"2026-11-16T07:41:46.677Z","step":"lease-handback","ok":true,"detail":"{\"clientId\":\"handoff-e2e-9c84065f\"}"}
+{"ts":"2026-11-16T07:41:47.420Z","step":"handback","ok":true,"detail":"{\"resumed\":true,\"deltaSummary\":\"assistant: No response requested.\\nuser: 回答E2E_HUMAN_9c84065f\\nassistant: The user asks to reply E2E_HUMAN_9c84065f. Just answer directly. This appears to be a test injection task. Just reply wi…\\nassistant: E2E_HUMAN_9c84065f\"}"}
+{"ts":"2026-11-16T07:41:47.420Z","step":"summary","ok":true,"detail":"{\"result\":\"PASS\",\"sessionKey\":\"claude:e1828943-0d96-40b6-ba5d-8b9b2b974484\",\"nonce\":\"9c84065f\",\"logPath\":\"E:\\\\pi-workbench\\\\tmp\\\\e2e-2026-11-16T07-41-35-485Z.jsonl\",\"error\":null}"}
