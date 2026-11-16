@@ -38,7 +38,7 @@
 | 1 | Claude 0.5-A Gate 无回归 | ✅ | `claude-regression-run1.jsonl` 1–14；`claude-regression-run2.jsonl` 1–14；`tmp/final-verify.log` | 两轮各 14 步全 ok、exit 0、PASS；control-plane 347 tests / 346 pass / 1 skip / 0 fail；extension 53 pass |
 | 2 | Codex rollout 发现 + 原生 id resume | ✅ | `e2e-three-agents.jsonl` L3、L8、L49–L53 | discover 27 条（`codex:01a1e3be-e78f-7731-a675-402a26a8a3f8`）；resume-by-native-id 1224ms；inject → end_turn；see 6 条含 `T9_CODEX_RESUME_8b0084aa` |
 | 3 | Pi 经 RPC 打开；lease 拦第二写者 | ✅（provider 可用性条件已满足） | `e2e-three-agents.jsonl` L55–L59、L46；`pi-rpc.md` §4 | RPC attach 3187ms；inject/see 5 条；第二客户端 409 `E_LEASE_CONFLICT`，`newProcesses=0`、`before=after=2`；`POST /dispatch agent=pi` 实测成功（L46） |
-| 4 | 三 Agent caps 正确；不支持能力不暴露 | ✅ | `e2e-three-agents.jsonl` L12–L14、L33、L38–L39、L43–L44 | `/agents` 三行 caps；`/attach` 对 codex/pi/claude(interactive) 均 422 `E_CAP_UNSUPPORTED`；handoff 对 codex/pi 200 返回 resume-tui；codex HTTP inject/interrupt/handoff/handback 在 pi:<pid> 租约下全 200（P0-1 回归，修复前 409） |
+| 4 | 三 Agent caps 正确；不支持能力不暴露 | ✅ | `e2e-three-agents.jsonl` L12–L14、L33、L38–L39、L43–L44；`packages/control-plane/test/api-agents.test.ts` L732（P0-1 写路径） | `/agents` 三行 caps；`/attach` 对 codex/pi/claude(interactive) 均 422 `E_CAP_UNSUPPORTED`；handoff 对 codex/pi 200 返回 resume-tui；codex HTTP inject/interrupt/handoff/handback 在 pi:<pid> 租约下全 200（P0-1 单测，修复前 409） |
 | 5 | 每 Agent 至少一条 handoff 或 resume 实测 | ✅（Pi 条件同上） | `e2e-three-agents.jsonl` L28、L49、L53、L59 | Claude handoff → `claude --resume <id>`；Codex resume-by-native-id + handoff；Pi handoff → `pi --session <abs file>`（handoff 前关闭 RPC，进程 2→1） |
 | 6 | 事件统一渲染；未知事件不崩 | ✅（transcript 与事件流分别取证） | transcript：L15–L17、L32；事件流：L31（Claude）、L37（Codex）、L47（Pi） | 三 Agent shape 均为 `id,kind,role,text,ts`；未知 type fixture 正常返回 2 条；WS 事件流 codex `token` 28 条、pi `thought/token` 420 条、claude 12 条 |
 | 7 | 四类结构化错误 | ✅ | `e2e-three-agents.jsonl` L42、L61–L63 | E_AGENT_UNAVAILABLE 422 / E_SESSION_NOT_FOUND 404 / E_LEASE_CONFLICT 409 / E_RESUME_REJECTED（cause: Internal error） |
@@ -78,7 +78,7 @@ node scripts/e2e-claude.mjs   # 连续执行两次
 ### Gate #2 · Codex 发现 + 原生 id resume
 
 1. 造会话：`codex exec` 种子（`e2e-three-agents.jsonl` L3，status 0）。
-2. 发现：L8 `{"count":25,"key":"codex:01a1e3a8-316d-7ec1-a03c-d0f2a6df75af"}`——**经 HTTP `GET /api/cp/sessions/discover?agent=codex` 发现并登记**，不直接写库；只读 rollout 首行 `session_meta`，cwd 取 `payload.cwd`，默认只列 `thread_source=user`（缺失字段保留）。
+2. 发现：L8 `{"count":27,"key":"codex:01a1e3be-e78f-7731-a675-402a26a8a3f8"}`——**经 HTTP `GET /api/cp/sessions/discover?agent=codex` 发现并登记**，不直接写库；只读 rollout 首行 `session_meta`，cwd 取 `payload.cwd`，默认只列 `thread_source=user`（缺失字段保留）。
 3. 原生 id resume（driver 级）：L49 `{"nativeId":"01a1e3be-e78f-7731-a675-402a26a8a3f8","ms":1224}`；L50 inject `effective:"now"`；L51 `stopReason:"end_turn"`；L52 see 6 条且最后一条为 `T9_CODEX_RESUME_8b0084aa`。
 4. 协议层细节（含 `session/resume` 请求/响应原始帧、`session/load` 在 ACP v2 返回 `-32601 Method not found` 的裁定）见 `codex-acp.md` §2–§3；`probe-findings.md` §5 证明 ACP `session/new` 会落 rollout，故新建会话的 `transcriptPath` 允许为空、由 `see` 懒解析。
 
@@ -103,8 +103,9 @@ node scripts/e2e-claude.mjs   # 连续执行两次
 
 能力门实测：
 
-- `POST /api/cp/sessions/:key/attach`：codex 422（L13，`details:{agent:"codex",cap:"attach"}`，4ms）、pi 422（L14，3ms）、claude 交互式 422（L33）——**未调用 driver**。
-- `POST /api/cp/sessions/:key/handoff`：codex 200 `["codex","resume","01a1e3a8-b619-70d0-b5bd-a99f1f880381","--no-alt-screen"]`（L38）；pi 200 `["pi","--session",<abs jsonl>]`（L43）。
+- `POST /api/cp/sessions/:key/attach`：codex 422（L13，`details:{agent:"codex",cap:"attach"}`，4ms）、pi 422（L14，2ms）、claude 交互式 422（L33）——**未调用 driver**。
+- `POST /api/cp/sessions/:key/handoff`：codex 200 `["codex","resume","01a1e3bf-6d71-7af0-9154-f089538b63ef","--no-alt-screen"]`（L38）；pi 200 `["pi","--session",<abs jsonl>]`（L43）。
+- P0-1 写路径回归：`packages/control-plane/test/api-agents.test.ts` L732 用真实 CodexDriver + `pi:7` 租约，inject / interrupt / handoff / handback 全 200；修复前均在 ACP 请求前 409。
 
 > 说明：spec §14 Gate #4 原措辞「对 attach 调 handoff 期望 422」与 §13「handoff 是分流」冲突，已按 §13 修正为**独立的 /attach 能力门**，并同步改了 spec 原文；handoff 对 codex/pi 是正常出口，不返回 422。
 
@@ -112,7 +113,7 @@ node scripts/e2e-claude.mjs   # 连续执行两次
 
 | Agent | 实测 | 证据 |
 |---|---|---|
-| Claude | handoff → `["claude","--resume","95f6aba9-8568-4598-865a-79efeae041c8"]` mode=resume-tui；随后 human-turn 与 handback 成功 | L28–L30；`claude-regression-run1/2.jsonl` 第 10–13 行 |
+| Claude | handoff → `["claude","--resume","ccd840b8-7c11-4202-8bca-f155e87ac07d"]` mode=resume-tui；随后 human-turn 与 handback 成功 | L28–L30；`claude-regression-run1/2.jsonl` 第 10–13 行 |
 | Codex | driver 级 resume-by-native-id（L49，1224ms）→ inject → end_turn → see nonce（L50–L52）；handoff 命令（L53） | `e2e-three-agents.jsonl` L49–L53；HTTP handoff L38 |
 | Pi | handoff → `["pi","--session",<abs jsonl>]`（L59）；此前 RPC attach 已实测（L55）、HTTP dispatch 已实测（L46） | `e2e-three-agents.jsonl` L55–L59、L46；HTTP handoff L43 |
 
