@@ -142,7 +142,7 @@ export class TurnNotifier {
     this.#startedAt = this.#now();
   }
 
-  /** 连击计数（测试/诊断用；过期窗口自动归零） */
+  /** 连击计数（测试/诊断用；读取会触发过期窗口归零，符合时间窗语义） */
   get consecutiveWakes(): number {
     this.#resetWakeBudgetIfStale();
     return this.#wakes;

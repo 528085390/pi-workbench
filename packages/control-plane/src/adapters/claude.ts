@@ -194,7 +194,7 @@ export class ClaudeAdapter implements AgentAdapter {
         () => this.#conn.agent.request(methods.agent.session.resume, { sessionId, cwd }),
         SESSION_CALL_TIMEOUT_MS,
       );
-      await this.#applyInitialPermissionMode(sessionId);
+      // 不在 resume 时重置权限模式：handback 必须保留人类在原生 TUI 里改过的模式。
     } catch (error) {
       const adapted = this.#adaptError(error, "resume");
       if (adapted.code === "E_ADAPTER_DOWN") {
@@ -207,7 +207,7 @@ export class ClaudeAdapter implements AgentAdapter {
     }
   }
 
-  /** 新会话/恢复会话后显式设置权限模式；不依赖 settings.defaultMode（可能被信任过滤器降级）。 */
+  /** 新会话后显式设置权限模式；不依赖 settings.defaultMode（可能被信任过滤器降级）。 */
   async #applyInitialPermissionMode(sessionId: string): Promise<void> {
     const mode = this.#initialPermissionMode;
     if (mode === undefined) {

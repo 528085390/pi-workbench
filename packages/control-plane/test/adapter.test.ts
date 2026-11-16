@@ -138,6 +138,26 @@ test("newSession 显式 initialPermissionMode 会调用 session/set_config_optio
   }
 });
 
+test("resume 不重置 initialPermissionMode（保留 handoff 期间的人类设置）", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-workbench-resume-mode-"));
+  const record = join(dir, "set-config.jsonl");
+  const adapter = await ClaudeAdapter.spawn(makeConfig(), {
+    adapterCmd: [process.execPath, FIXTURE, "--record-config", record],
+    cwd: WORKSPACE,
+    initialPermissionMode: "bypassPermissions",
+  });
+  try {
+    const { sessionId } = await adapter.newSession(WORKSPACE);
+    const count = (): number => readFileSync(record, "utf8").trim().split(/\r?\n/).filter((line) => line.length > 0).length;
+    const beforeResume = count();
+    await adapter.resume(sessionId, WORKSPACE);
+    assert.equal(count(), beforeResume, "resume 不应再次发送 session/set_config_option");
+  } finally {
+    await adapter.dispose();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("prompt 立即返回 messageId，并把 session/update 映射成 text", async () => {
   const adapter = await spawnFakeAdapter();
   try {

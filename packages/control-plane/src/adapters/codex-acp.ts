@@ -38,6 +38,8 @@ export async function spawnCodexAcpAdapter(
     claude: {
       adapterCmd,
       permissionMode: config.codex.permissionMode,
+      // Codex 的 ACP mode 不是用户级权限开关；沙箱/审批由 INITIAL_AGENT_MODE 控制。
+      // 这里仅填满 ClaudeAdapter 的配置类型，避免误把 Claude 的 mode 传给 Codex RPC。
       initialPermissionMode: "auto",
     },
   };

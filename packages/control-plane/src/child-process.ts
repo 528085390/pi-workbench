@@ -11,6 +11,10 @@ let installed = false;
  * 新建一个控制台窗口。pi 包的 RpcClient 在 start() 里写死了 spawn("node", ...) 且没有
  * windowsHide 选项，于是每次 Pi RPC 会话都会弹一个黑窗。这里统一给所有 spawn 默认补上
  * windowsHide；调用方显式传 false 时仍尊重显式值（方便测试/特殊场景）。
+ *
+ * 分工：静态 import 的 claude.ts 显式传 windowsHide；Pi 包是动态 import，必须在
+ * 它解析之前调用本文件的全局 patch。不要删掉 claude.ts 的显式参数，也不要把 Pi 包
+ * 改成静态 import，否则会静默退回控制台弹窗。
  */
 export function wrapSpawnWithHiddenWindow(spawnImpl: typeof import("node:child_process").spawn): typeof import("node:child_process").spawn {
   return ((...args: unknown[]) => {

@@ -55,6 +55,9 @@ const DELTA_MAX_CHARS = 120;
 /** checkpoint 游标推进的最大页数（防止异常 reader 造成死循环） */
 const MAX_CURSOR_PAGES = 200;
 
+/** 解析不到 transcript 路径时的负缓存（列表/通知周期内避免反复扫描） */
+const TRANSCRIPT_PATH_MISS_TTL_MS = 30_000;
+
 /** 归一化后的 transcript 读物（路径语义；测试可注入，生产由统一 readTranscript 按 agent 分派） */
 export type TranscriptReader = (
   path: string,
@@ -161,6 +164,10 @@ export class TakeoverEngine {
    * 跨进程唯一（真实行为与代价见类注释）。
    */
   #eventSeq = 0;
+  /** transcriptPath 解析失败的时间窗缓存；只缓存非运行中的会话，避免新 rollout 刚落盘时误伤 */
+  readonly #transcriptPathMisses = new Map<string, number>();
+  /** 同一会话的并发解析去重（列表与通知器可能同时触发） */
+  readonly #transcriptPathResolving = new Map<string, Promise<string | undefined>>();
 
   constructor(deps: TakeoverDeps) {
     this.#store = deps.store;
@@ -208,6 +215,24 @@ export class TakeoverEngine {
     if (existing !== undefined && existing.length > 0) {
       return existing;
     }
+    const missUntil = this.#transcriptPathMisses.get(key);
+    if (missUntil !== undefined && missUntil > this.#now()) {
+      return undefined;
+    }
+    const resolving = this.#transcriptPathResolving.get(key);
+    if (resolving !== undefined) {
+      return await resolving;
+    }
+    const promise = this.#resolveTranscriptPath(ref);
+    this.#transcriptPathResolving.set(key, promise);
+    try {
+      return await promise;
+    } finally {
+      this.#transcriptPathResolving.delete(key);
+    }
+  }
+
+  async #resolveTranscriptPath(ref: SessionRef): Promise<string | undefined> {
     const driver = this.#driverOf(ref);
     if (driver === null) {
       return undefined;
@@ -219,16 +244,26 @@ export class TakeoverEngine {
     try {
       const path = await resolve.call(driver, ref);
       if (path === undefined || path.trim().length === 0) {
+        this.#rememberTranscriptPathMiss(ref);
         return undefined;
       }
       const normalized = path.trim();
-      const current = this.#registry.get(key);
+      this.#transcriptPathMisses.delete(ref.key);
+      const current = this.#registry.get(ref.key);
       if (current !== null && (current.transcriptPath === undefined || current.transcriptPath.length === 0)) {
         this.#registry.upsert({ ...current, transcriptPath: normalized });
       }
       return normalized;
     } catch {
+      this.#rememberTranscriptPathMiss(ref);
       return undefined;
+    }
+  }
+
+  /** 运行中的新会话不缓存 miss：rollout 可能几十毫秒后才落盘。 */
+  #rememberTranscriptPathMiss(ref: SessionRef): void {
+    if (ref.status !== "running" && ref.status !== "starting") {
+      this.#transcriptPathMisses.set(ref.key, this.#now() + TRANSCRIPT_PATH_MISS_TTL_MS);
     }
   }
 
