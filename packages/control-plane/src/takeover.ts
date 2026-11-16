@@ -23,6 +23,7 @@ import type { AgentRouter } from "./agents/router.ts";
 import type { AdapterCapability, AgentDriver } from "./agents/types.ts";
 import { CLAUDE_CAPABILITIES } from "./capabilities.ts";
 import type { CheckpointStore, StoredCheckpoint } from "./checkpoints.ts";
+import { DEFAULT_DISPATCH_RESERVED_TTL_MS } from "./config.ts";
 import type { DispatchRecord, DispatchStore } from "./dispatch-store.ts";
 import { isWorkbenchError, WorkbenchError } from "./errors.ts";
 import type { EventStore } from "./events.ts";
@@ -102,6 +103,8 @@ export type TakeoverDeps = {
   checkpoints: CheckpointStore;
   /** dispatches 表（C1/C2：原子占位保证并发与跨进程幂等） */
   dispatches: DispatchStore;
+  /** reserved 预留窗口 TTL（毫秒）；缺省 DEFAULT_DISPATCH_RESERVED_TTL_MS（120s） */
+  dispatchReservedTtlMs?: number;
   /** checkpoint 文件目录，通常是 <home>/handoffs */
   handoffDir: string;
   /** 注入时钟（测试用），默认 Date.now */
@@ -151,6 +154,7 @@ export class TakeoverEngine {
   readonly #router: AgentRouter | undefined;
   readonly #checkpoints: CheckpointStore;
   readonly #dispatches: DispatchStore;
+  readonly #dispatchTtlMs: number;
   readonly #handoffDir: string;
   readonly #now: () => number;
   readonly #readTranscript: TranscriptReader | undefined;
@@ -177,6 +181,7 @@ export class TakeoverEngine {
     this.#router = deps.router;
     this.#checkpoints = deps.checkpoints;
     this.#dispatches = deps.dispatches;
+    this.#dispatchTtlMs = deps.dispatchReservedTtlMs ?? DEFAULT_DISPATCH_RESERVED_TTL_MS;
     this.#handoffDir = deps.handoffDir;
     this.#now = deps.now ?? Date.now;
     this.#readTranscript = deps.readTranscript;
@@ -489,7 +494,11 @@ export class TakeoverEngine {
     // C1 / C2：INSERT OR IGNORE 原子占位，同 key 并发只有一个赢家
     const { record, created } = this.#dispatches.reserve(idempotencyKey, hash, new Date(this.#now()));
     if (!created) {
-      return await this.#resolveReserved(record, hash, idempotencyKey);
+      const outcome = await this.#resolveReserved(record, hash, idempotencyKey);
+      if (outcome.kind === "ref") {
+        return outcome.ref;
+      }
+      // kind === "retry"：本调用赢下超时回收，继续走下面的 newSession 路径
     }
 
     let sessionId: string;
@@ -550,7 +559,9 @@ export class TakeoverEngine {
     // 再把幂等键标成 failed —— 否则会话泄漏在 adapter 里，且这个 key 永远停在 reserved。
     try {
       this.#registry.upsert(ref);
-      // 会话已落库：先把幂等记录标成 done，等待方（并发 / 重启）才能按 key 复用它
+      // C02：先写 dispatch_key（唯一索引兜底防双会话），再把幂等记录标成 done；
+      // 等待方（并发 / 重启 / 回收）才能按 key 复用或补记。
+      this.#registry.setDispatchKey(ref.key, idempotencyKey);
       this.#dispatches.complete(idempotencyKey, ref.key, new Date(this.#now()));
 
       this.#store.append({
@@ -790,7 +801,11 @@ export class TakeoverEngine {
    * 幂等键已被占用（created=false，C1）：按记录状态复用 / 等待 / 报错。
    * 顺序固定为 hash 比对 → failed → done → reserved 轮询。
    */
-  async #resolveReserved(record: DispatchRecord, hash: string, idempotencyKey: string): Promise<SessionRef> {
+  async #resolveReserved(
+    record: DispatchRecord,
+    hash: string,
+    idempotencyKey: string,
+  ): Promise<{ kind: "ref"; ref: SessionRef } | { kind: "retry" }> {
     if (record.payloadHash !== hash) {
       throw new WorkbenchError("E_IDEMPOTENCY_CONFLICT", "幂等键已用于另一个任务：" + idempotencyKey, {
         idempotencyKey,
@@ -801,10 +816,21 @@ export class TakeoverEngine {
       throw dispatchFailedError(idempotencyKey, record.error);
     }
     if (record.status === "done") {
-      return this.#refOf(record, idempotencyKey);
+      return { kind: "ref", ref: this.#refOf(record, idempotencyKey) };
     }
 
-    // reserved：另一个调用方正在跑 newSession，轮询到它落定（C1）
+    // C02 回收前必查：上次可能已经建好会话（registry.upsert + dispatch_key 成功，但 complete 没落），
+    // 命中就直接补记 done 并返回，绝不重复 newSession。
+    const linked = this.#registry.findByDispatchKey(idempotencyKey);
+    if (linked !== null) {
+      this.#dispatches.complete(idempotencyKey, linked.key, new Date(this.#now()));
+      return { kind: "ref", ref: linked };
+    }
+
+    // reserved：另一个调用方正在跑 newSession；只有超 TTL 的预留才允许回收（C02）。
+    if (this.#dispatches.reclaim(idempotencyKey, this.#dispatchTtlMs, new Date(this.#now()))) {
+      return { kind: "retry" };
+    }
     // Minor（round 2）：不再用墙钟 Date.now 算截止时间 —— 改成「次数 × 间隔」封顶，
     // 时间源就只剩 deps.now，注入固定时钟时这个循环也不会永远退不出去。
     const maxPolls = Math.ceil(DISPATCH_POLL_TIMEOUT_MS / DISPATCH_POLL_INTERVAL_MS);
@@ -826,10 +852,14 @@ export class TakeoverEngine {
         throw dispatchFailedError(idempotencyKey, current.error);
       }
       if (current.status === "done") {
-        return this.#refOf(current, idempotencyKey);
+        return { kind: "ref", ref: this.#refOf(current, idempotencyKey) };
+      }
+      // 等待期间预留可能刚好过期：再抢一次，赢家继续 newSession
+      if (this.#dispatches.reclaim(idempotencyKey, this.#dispatchTtlMs, new Date(this.#now()))) {
+        return { kind: "retry" };
       }
     }
-    throw new WorkbenchError("E_ADAPTER_DOWN", "dispatch 仍在进行中：" + idempotencyKey, { idempotencyKey });
+    throw new WorkbenchError("E_DISPATCH_IN_PROGRESS", "dispatch 仍在进行中：" + idempotencyKey, { idempotencyKey });
   }
 
   /** 幂等命中：会话必须仍在注册表里，否则是库与注册表不一致（C1） */

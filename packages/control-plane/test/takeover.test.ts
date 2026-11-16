@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -239,6 +240,10 @@ function makeRef(overrides: Partial<SessionRef> = {}): SessionRef {
     kind: "interactive",
     ...overrides,
   };
+}
+
+function dispatchHash(agent: string, task: string, cwd: string): string {
+  return createHash("sha256").update(JSON.stringify({ agent, task, cwd })).digest("hex");
 }
 
 async function expectRejectCode(fn: () => Promise<unknown>, code: WorkbenchErrorCode): Promise<void> {
@@ -816,6 +821,47 @@ test("dispatch: newSession 失败 → 落 failed 记录 + E_ADAPTER_DOWN，重�
 
     await expectRejectCode(() => h.engine.dispatch(input), "E_ADAPTER_DOWN");
     assert.equal(h.fake.count("newSession"), 1, "failed 记录不能让重试又起一个会话");
+  } finally {
+    h.close();
+  }
+});
+
+test("dispatch: 同一 key 并发 3 次只有 1 个会话（C02）", async () => {
+  const h = fresh();
+  try {
+    const input = { agent: "claude" as const, task: "并发派发三次", cwd: CWD, idempotencyKey: "idem-race-3" };
+    const refs = await Promise.all([h.engine.dispatch(input), h.engine.dispatch(input), h.engine.dispatch(input)]);
+
+    assert.equal(new Set(refs.map((ref) => ref.key)).size, 1, "3 个响应必须是同一个会话");
+    assert.deepEqual(refs[1], refs[0]);
+    assert.deepEqual(refs[2], refs[0]);
+    assert.equal(h.fake.count("newSession"), 1, "原子占位保证只起一个会话");
+    assert.equal(h.registry.list().length, 1, "注册表里只应有一条会话");
+    assert.equal(countRows(h.db, "dispatches"), 1);
+  } finally {
+    h.close();
+  }
+});
+
+test("dispatch: reserved 超 TTL 后回收并重建会话，sessions.dispatch_key = key（C02）", async () => {
+  const h = fresh();
+  try {
+    const input = { agent: "claude" as const, task: "回收超时预留", cwd: CWD, idempotencyKey: "idem-reclaim" };
+    h.dispatches.reserve(
+      input.idempotencyKey,
+      dispatchHash(input.agent, input.task, input.cwd),
+      new Date(h.clock.now() - 120_000),
+    );
+
+    const ref = await h.engine.dispatch(input);
+
+    assert.equal(ref.key, "claude:sess-new");
+    assert.equal(h.fake.count("newSession"), 1, "回收后由本调用重新建会话");
+    const row = h.db.prepare("SELECT dispatch_key FROM sessions WHERE key = ?").get(ref.key) as
+      | { dispatch_key?: string | null }
+      | undefined;
+    assert.equal(row?.dispatch_key, input.idempotencyKey, "新会话必须写入 dispatch_key");
+    assert.equal(h.dispatches.get(input.idempotencyKey)?.status, "done");
   } finally {
     h.close();
   }

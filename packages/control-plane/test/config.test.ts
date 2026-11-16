@@ -37,6 +37,7 @@ test("loadConfig: 空目录时写入默认值", () => {
     assert.equal(cfg.host, "127.0.0.1");
     assert.equal(cfg.port, DEFAULT_PORT);
     assert.equal(cfg.leaseTtlMs, 30000);
+    assert.equal(cfg.dispatchReservedTtlMs, 120000);
     assert.equal(cfg.authToken, null);
     assert.equal(cfg.home, home);
     assert.equal(cfg.claude.permissionMode, "auto_allow");
@@ -63,6 +64,7 @@ test("loadConfig: 缺省时在 home 下生成 config.yaml", () => {
     assert.equal(obj["host"], "127.0.0.1");
     assert.equal(obj["port"], DEFAULT_PORT);
     assert.equal(obj["leaseTtlMs"], 30000);
+    assert.equal(obj["dispatchReservedTtlMs"], 120000);
     const claude = obj["claude"] as Record<string, unknown>;
     assert.equal(claude["initialPermissionMode"], "auto");
   } finally {

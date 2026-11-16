@@ -312,6 +312,14 @@ export async function main(): Promise<void> {
   }
   const { db, store, leases, registry, restored, recovery, checkpoints, dispatches, cursors, instances } = boot;
 
+  // C02：dispatch 幂等记录保留 24h，启动时清一次过期的 done/failed。
+  try {
+    const pruned = dispatches.pruneRetained(24 * 3600_000);
+    console.log("[pi-workbenchd] dispatch 幂等记录清理完成：删除 " + String(pruned) + " 条（保留 24h）");
+  } catch (err) {
+    console.error("[pi-workbenchd] dispatch 幂等记录清理失败（启动继续）：" + errorMessage(err));
+  }
+
   // spec §7.1：15s 心跳刷新 instances.heartbeat_at，让「这个 daemon 还活着」可被外部观测。
   // 心跳失败只告警：DB 偶发错误不该打崩 daemon，下个周期重试。
   const heartbeat = setInterval(() => {
@@ -423,6 +431,7 @@ export async function main(): Promise<void> {
     router,
     checkpoints,
     dispatches,
+    dispatchReservedTtlMs: config.dispatchReservedTtlMs,
     handoffDir: paths.handoffs,
     piClientId: PI_AGENT_CLIENT_ID,
   });

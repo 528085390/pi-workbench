@@ -66,3 +66,51 @@ test("跨连接可见（另一个 db 句柄读到同一行，模拟重启）", (
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("reclaim 只回收超 TTL 的 reserved", () => {
+  const { db, dir } = fresh();
+  try {
+    const store = new DispatchStore(db);
+    store.reserve("k1", "h", new Date("2026-11-17T00:00:00.000Z"));
+    assert.equal(store.reclaim("k1", 120_000, new Date("2026-11-17T00:01:00.000Z")), false);
+    assert.equal(store.reclaim("k1", 120_000, new Date("2026-11-17T00:02:01.000Z")), true);
+    assert.equal(store.get("k1")?.status, "reserved");
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("touch 只续约 reserved，不碰 done", () => {
+  const { db, dir } = fresh();
+  try {
+    const store = new DispatchStore(db);
+    store.reserve("k-touch", "h", new Date("2026-11-17T00:00:00.000Z"));
+    store.touch("k-touch", new Date("2026-11-17T00:01:00.000Z"));
+    assert.equal(store.get("k-touch")?.updatedAt, "2026-11-17T00:01:00.000Z");
+
+    store.complete("k-touch", "claude:s1", new Date("2026-11-17T00:02:00.000Z"));
+    store.touch("k-touch", new Date("2026-11-17T00:03:00.000Z"));
+    assert.equal(store.get("k-touch")?.updatedAt, "2026-11-17T00:02:00.000Z");
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("pruneRetained 只删过期 done/failed", () => {
+  const { db, dir } = fresh();
+  try {
+    const store = new DispatchStore(db);
+    store.reserve("old", "h", new Date("2026-11-15T00:00:00.000Z"));
+    store.complete("old", "claude:a", new Date("2026-11-15T00:00:01.000Z"));
+    store.reserve("new", "h", new Date("2026-11-17T00:00:00.000Z"));
+    store.complete("new", "claude:b", new Date("2026-11-17T00:00:01.000Z"));
+    assert.equal(store.pruneRetained(24 * 3600_000, new Date("2026-11-17T01:00:00.000Z")), 1);
+    assert.equal(store.get("old"), null);
+    assert.equal(store.get("new")?.status, "done");
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

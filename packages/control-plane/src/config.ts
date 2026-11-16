@@ -28,6 +28,8 @@ export type Config = {
   home: string;
   authToken: string | null;
   leaseTtlMs: number;
+  /** dispatch reserved 预留窗口 TTL（毫秒）；超时才允许回收，与幂等记录 24h 保留期无关 */
+  dispatchReservedTtlMs: number;
   claude: {
     adapterCmd: string[];
     permissionMode: PermissionMode;
@@ -48,6 +50,8 @@ export type Config = {
 export const DEFAULT_HOST = "127.0.0.1";
 /** 默认租约 TTL（毫秒）：唯一来源，`lease.ts` 直接 import 复用，勿另起同名常量。 */
 export const DEFAULT_LEASE_TTL_MS = 30_000;
+/** dispatch 预留窗口默认 TTL（spec §7.2：120s，按 updated_at 续约）。 */
+export const DEFAULT_DISPATCH_RESERVED_TTL_MS = 120_000;
 export const DEFAULT_PERMISSION_MODE: PermissionMode = "auto_allow";
 /** Claude 默认 auto（保持现有行为）；需要完全权限时显式改为 bypassPermissions。 */
 export const DEFAULT_CLAUDE_INITIAL_PERMISSION_MODE: ClaudeInitialPermissionMode = "auto";
@@ -269,6 +273,13 @@ function assertLeaseTtl(ttl: number, configPath: string): number {
   return ttl;
 }
 
+function assertDispatchReservedTtl(ttl: number, configPath: string): number {
+  if (!Number.isInteger(ttl) || ttl <= 0) {
+    throw new Error(`配置错误：${configPath} 中 dispatchReservedTtlMs 必须是正整数，实际为 ${String(ttl)}`);
+  }
+  return ttl;
+}
+
 function readConfigFile(configPath: string): Record<string, unknown> | null {
   if (!existsSync(configPath)) return null;
   const text = readFileSync(configPath, "utf8");
@@ -294,6 +305,7 @@ function toFileShape(cfg: Config): Record<string, unknown> {
     host: cfg.host,
     port: cfg.port,
     leaseTtlMs: cfg.leaseTtlMs,
+    dispatchReservedTtlMs: cfg.dispatchReservedTtlMs,
     authToken: cfg.authToken,
     claude: {
       adapterCmd: cfg.claude.adapterCmd,
@@ -328,6 +340,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const fileHost = readString(values, "host");
   const filePort = readInt(values, "port");
   const fileTtl = readInt(values, "leaseTtlMs");
+  const fileDispatchTtl = readInt(values, "dispatchReservedTtlMs");
   const fileToken = readToken(values["authToken"]);
   const fileAdapter = readAdapterCmd(claude["adapterCmd"], configPath);
   const fileMode = readPermissionMode(claude["permissionMode"], configPath, "claude.permissionMode");
@@ -352,6 +365,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     home,
     authToken: fileToken ?? null,
     leaseTtlMs: assertLeaseTtl(fileTtl ?? DEFAULT_LEASE_TTL_MS, configPath),
+    dispatchReservedTtlMs: assertDispatchReservedTtl(
+      fileDispatchTtl ?? DEFAULT_DISPATCH_RESERVED_TTL_MS,
+      configPath,
+    ),
     claude: {
       adapterCmd: chosenAdapter.command,
       permissionMode: fileMode ?? DEFAULT_PERMISSION_MODE,
@@ -413,6 +430,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     fileHost === undefined ||
     filePort === undefined ||
     fileTtl === undefined ||
+    fileDispatchTtl === undefined ||
     fileToken === undefined ||
     fileAdapter === undefined ||
     fileMode === undefined ||

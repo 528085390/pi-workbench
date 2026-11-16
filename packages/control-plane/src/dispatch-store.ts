@@ -50,6 +50,9 @@ export class DispatchStore {
   #insertStmt: StatementSync | null = null;
   #getStmt: StatementSync | null = null;
   #completesStmt: StatementSync | null = null;
+  #reclaimStmt: StatementSync | null = null;
+  #touchStmt: StatementSync | null = null;
+  #pruneStmt: StatementSync | null = null;
 
   constructor(db: DatabaseSync) {
     this.#db = db;
@@ -82,6 +85,28 @@ export class DispatchStore {
     this.#completes().run("failed", null, reason, now.toISOString(), idempotencyKey);
   }
 
+  /**
+   * 回收超 TTL 的 reserved：只有一条原子 UPDATE 抢到才算赢家（changes === 1）。
+   * 赢家负责重新 newSession；输家继续轮询。
+   */
+  reclaim(idempotencyKey: string, ttlMs: number, now = new Date()): boolean {
+    const cutoff = new Date(now.getTime() - ttlMs).toISOString();
+    const result = this.#reclaim().run(now.toISOString(), idempotencyKey, cutoff);
+    return Number(result.changes) === 1;
+  }
+
+  /** 续约 reserved 预留窗口（长 newSession 心跳）。 */
+  touch(idempotencyKey: string, now = new Date()): void {
+    this.#touch().run(now.toISOString(), idempotencyKey);
+  }
+
+  /** 删除超过保留期的 done/failed 记录，返回删除行数。 */
+  pruneRetained(retentionMs: number, now = new Date()): number {
+    const cutoff = new Date(now.getTime() - retentionMs).toISOString();
+    const result = this.#prune().run(cutoff);
+    return Number(result.changes);
+  }
+
   #insert(): StatementSync {
     this.#insertStmt ??= this.#db.prepare(
       `INSERT OR IGNORE INTO dispatches (idempotency_key, payload_hash, status, created_at, updated_at)
@@ -100,5 +125,26 @@ export class DispatchStore {
       "UPDATE dispatches SET status = ?, session_key = ?, error = ?, updated_at = ? WHERE idempotency_key = ?",
     );
     return this.#completesStmt;
+  }
+
+  #reclaim(): StatementSync {
+    this.#reclaimStmt ??= this.#db.prepare(
+      "UPDATE dispatches SET updated_at = ? WHERE idempotency_key = ? AND status = 'reserved' AND updated_at <= ?",
+    );
+    return this.#reclaimStmt;
+  }
+
+  #touch(): StatementSync {
+    this.#touchStmt ??= this.#db.prepare(
+      "UPDATE dispatches SET updated_at = ? WHERE idempotency_key = ? AND status = 'reserved'",
+    );
+    return this.#touchStmt;
+  }
+
+  #prune(): StatementSync {
+    this.#pruneStmt ??= this.#db.prepare(
+      "DELETE FROM dispatches WHERE status IN ('done','failed') AND updated_at < ?",
+    );
+    return this.#pruneStmt;
   }
 }
