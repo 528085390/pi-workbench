@@ -93,6 +93,8 @@ export interface Lease {
   sessionKey: string;
   driver: Driver;
   clientId: string;
+  /** 租约归属的 daemon 实例 id（schema v4 `leases.instance_id`；空串 = 历史 / 未归属）。 */
+  instanceId: string;
   expiresAt: string;
   heartbeatAt: string;
 }

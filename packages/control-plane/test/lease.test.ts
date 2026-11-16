@@ -93,6 +93,7 @@ test("acquire: 首次获取成功并返回完整 Lease", () => {
       sessionKey: KEY,
       driver: "pi",
       clientId: "client-a",
+      instanceId: "",
       expiresAt: iso(clock.now() + TTL),
       heartbeatAt: iso(clock.now()),
     });

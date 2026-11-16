@@ -42,11 +42,12 @@ type LeaseRow = {
   session_key: string;
   driver: string;
   client_id: string;
+  instance_id: string;
   expires_at: string;
   heartbeat_at: string;
 };
 
-const LEASE_COLUMNS = "session_key, driver, client_id, expires_at, heartbeat_at";
+const LEASE_COLUMNS = "session_key, driver, client_id, instance_id, expires_at, heartbeat_at";
 
 /**
  * 单 driver 租约：同一 sessionKey 同时最多一个 writer。
@@ -80,7 +81,8 @@ export class LeaseManager {
 
     const result = this.#db
       .prepare(
-        `INSERT INTO leases (${LEASE_COLUMNS}, instance_id) VALUES (?, ?, ?, ?, ?, ?)
+        `INSERT INTO leases (session_key, driver, client_id, instance_id, expires_at, heartbeat_at)
+         VALUES (?, ?, ?, ?, ?, ?)
          ON CONFLICT(session_key) DO UPDATE SET
            driver = excluded.driver,
            client_id = excluded.client_id,
@@ -89,7 +91,7 @@ export class LeaseManager {
            instance_id = excluded.instance_id
          WHERE leases.expires_at <= ? OR leases.client_id = ?`,
       )
-      .run(sessionKey, driver, clientId, expiresAt, heartbeatAt, this.#instanceId, heartbeatAt, clientId);
+      .run(sessionKey, driver, clientId, this.#instanceId, expiresAt, heartbeatAt, heartbeatAt, clientId);
 
     if (Number(result.changes) === 0) {
       const held = this.#read(sessionKey);
@@ -170,18 +172,23 @@ export class LeaseManager {
   }
 
   /**
-   * 启动清扫（spec §7.1 第 4 步）：单实例锁保证其他实例已死，先删除 `instance_id != 当前` 的租约
-   *（含 v4 之前的空串历史行，spec §5 约束 2），再给仍为空串的行补写当前实例（兜底）。
-   * 返回「删除 + 补写」行数。
+   * 启动清扫（spec §7.1 第 4 步）：单实例锁保证其他实例已死。
+   * 1. 未过期的 human handoff 租约跨重启保留（spec §7.1 对账表），先改归属到当前实例；
+   * 2. 删除其余 `instance_id != 当前` 的租约（含 v4 之前的空串历史行，spec §5 约束 2）。
+   * 返回删除行数；被接管的 human 租约不计入（它们没有被删除）。
    */
   sweepForBoot(): number {
+    const now = toIso(this.#now());
+    this.#db
+      .prepare(
+        `UPDATE leases SET instance_id = ?
+         WHERE instance_id != ? AND driver = 'human' AND expires_at > ?`,
+      )
+      .run(this.#instanceId, this.#instanceId, now);
     const deleted = this.#db
       .prepare("DELETE FROM leases WHERE instance_id != ?")
       .run(this.#instanceId);
-    const adopted = this.#db
-      .prepare("UPDATE leases SET instance_id = ? WHERE instance_id = ''")
-      .run(this.#instanceId);
-    return Number(deleted.changes) + Number(adopted.changes);
+    return Number(deleted.changes);
   }
 
   /** 写保护断言：无有效租约或租约属于他人 → `E_NO_LEASE`。 */
@@ -247,6 +254,7 @@ function toLease(row: LeaseRow): Lease {
     sessionKey: row.session_key,
     driver: asDriver(row.driver),
     clientId: row.client_id,
+    instanceId: row.instance_id,
     expiresAt: row.expires_at,
     heartbeatAt: row.heartbeat_at,
   };
