@@ -147,7 +147,13 @@ export class ClaudeAdapter implements AgentAdapter {
 
     let child: ChildProcess;
     try {
-      child = spawnProcess(file, args, { cwd: options.cwd, env, stdio: ["pipe", "pipe", "pipe"] });
+      child = spawnProcess(file, args, {
+        cwd: options.cwd,
+        env,
+        stdio: ["pipe", "pipe", "pipe"],
+        // daemon 是后台进程，ACP 子进程也不能在 Windows 弹控制台窗口。
+        windowsHide: true,
+      });
     } catch (error) {
       throw new WorkbenchError("E_ADAPTER_DOWN", "启动 adapter 子进程失败：" + describeError(error), {
         adapterCmd: command,

@@ -64,6 +64,29 @@ export function resolveDefaultCodexAdapterCmd(resolveModule: ModuleResolver = re
   return resolvePackageCmd(CODEX_ADAPTER_PKG_SPECIFIER, FALLBACK_CODEX_ADAPTER_CMD, resolveModule);
 }
 
+function sameCommand(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((part, index) => part === right[index]);
+}
+
+/**
+ * 兼容旧版自动生成的配置（B08 后续）：早期 config.yaml 把 codex.adapterCmd
+ * 落成 npx 回落命令；Windows 的 child_process.spawn 不会解析 npx.cmd，会直接
+ * ENOENT。包已经安装时优先用本地入口，避免用户升级后仍被旧配置卡住。
+ */
+function chooseAdapterCmd(
+  file: string[] | undefined,
+  resolved: string[],
+  fallback: string[],
+): { command: string[]; migrated: boolean } {
+  if (file === undefined) {
+    return { command: resolved, migrated: false };
+  }
+  if (sameCommand(file, fallback) && !sameCommand(resolved, fallback)) {
+    return { command: resolved, migrated: true };
+  }
+  return { command: file, migrated: false };
+}
+
 function resolvePackageCmd(specifier: string, fallback: string[], resolveModule: ModuleResolver): string[] {
   try {
     const pkgPath = resolveModule(specifier);
@@ -263,6 +286,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const fileMode = readPermissionMode(claude["permissionMode"], configPath, "claude.permissionMode");
   const fileCodexAdapter = readCommand(codex["adapterCmd"], configPath, "codex.adapterCmd");
   const fileCodexMode = readPermissionMode(codex["permissionMode"], configPath, "codex.permissionMode");
+
+  // 先解析本地包，再判断文件里的旧 npx 回落命令是否需要迁到本地入口。
+  const resolvedAdapter = resolveDefaultAdapterCmd();
+  const resolvedCodexAdapter = resolveDefaultCodexAdapterCmd();
+  const chosenAdapter = chooseAdapterCmd(fileAdapter, resolvedAdapter, FALLBACK_ADAPTER_CMD);
+  const chosenCodexAdapter = chooseAdapterCmd(fileCodexAdapter, resolvedCodexAdapter, FALLBACK_CODEX_ADAPTER_CMD);
   const filePiCmd = readCommand(pi["rpcCmd"], configPath, "pi.rpcCmd");
   const filePiProvider = readString(pi, "provider");
   const filePiModel = readString(pi, "model");
@@ -275,11 +304,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     authToken: fileToken ?? null,
     leaseTtlMs: assertLeaseTtl(fileTtl ?? DEFAULT_LEASE_TTL_MS, configPath),
     claude: {
-      adapterCmd: fileAdapter ?? resolveDefaultAdapterCmd(),
+      adapterCmd: chosenAdapter.command,
       permissionMode: fileMode ?? DEFAULT_PERMISSION_MODE,
     },
     codex: {
-      adapterCmd: fileCodexAdapter ?? resolveDefaultCodexAdapterCmd(),
+      adapterCmd: chosenCodexAdapter.command,
       permissionMode: fileCodexMode ?? DEFAULT_PERMISSION_MODE,
     },
     pi: {
@@ -325,6 +354,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     fileMode === undefined ||
     fileCodexAdapter === undefined ||
     fileCodexMode === undefined ||
+    chosenAdapter.migrated ||
+    chosenCodexAdapter.migrated ||
     filePiCmd === undefined;
 
   if (needsWrite) {

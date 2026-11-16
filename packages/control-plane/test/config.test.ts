@@ -340,6 +340,36 @@ test("loadConfig: 缺省生成 codex 与 pi 配置块并回写 config.yaml", () 
   }
 });
 
+test("loadConfig: 旧的 npx codex 回落配置自动迁到本地已安装入口", () => {
+  const home = freshHome();
+  try {
+    const cfgPath = join(home, "config.yaml");
+    writeFileSync(
+      cfgPath,
+      [
+        "codex:",
+        "  adapterCmd:",
+        "    - npx",
+        "    - -y",
+        '    - "@agentclientprotocol/codex-acp@2.6.0"',
+        "  permissionMode: auto_allow",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    const cfg = loadConfig({ PI_WORKBENCH_HOME: home });
+    assert.notEqual(cfg.codex.adapterCmd[0], "npx", "旧 npx 回落命令必须被本地入口替换");
+    assert.equal(cfg.codex.adapterCmd[0], process.execPath);
+    assert.ok(cfg.codex.adapterCmd[1]?.includes("codex-acp"), JSON.stringify(cfg.codex.adapterCmd));
+
+    const written = parseYaml(readFileSync(cfgPath, "utf8")) as Record<string, unknown>;
+    const codex = written["codex"] as Record<string, unknown>;
+    assert.deepEqual(codex["adapterCmd"], cfg.codex.adapterCmd, "迁移结果应回写 config.yaml");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("loadConfig: PI_WORKBENCH_CODEX_CMD 覆盖 codex.adapterCmd（只覆盖运行值，不写回文件）", () => {
   const home = freshHome();
   try {
