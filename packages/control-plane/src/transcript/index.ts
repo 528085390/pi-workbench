@@ -10,6 +10,7 @@ import type { AgentName, UnifiedMessage } from "@pi-workbench/shared";
 import { WorkbenchError } from "../errors.ts";
 import { readClaudeTranscript } from "./claude.ts";
 import { readCodexTranscript } from "./codex.ts";
+import { readPiTranscript } from "./pi.ts";
 
 /** 解析器返回的统一页结构；skipped 缺省按 0 处理（Claude 解析器尚无该口径） */
 export type TranscriptPage = {
@@ -38,6 +39,7 @@ export type ReadTranscriptResult = {
 const parsers = new Map<string, TranscriptParser>();
 parsers.set("claude", readClaudeTranscript);
 parsers.set("codex", readCodexTranscript);
+registerTranscriptParser("pi", readPiTranscript);
 
 /** 注册/覆盖某 Agent 的解析器（T7 的 pi 解析器从这里接） */
 export function registerTranscriptParser(agent: AgentName, parser: TranscriptParser): void {
