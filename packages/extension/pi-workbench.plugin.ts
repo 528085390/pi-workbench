@@ -45,6 +45,10 @@ export default function piWorkbench(pi: ExtensionAPI): void {
   let notifier: TurnNotifier | undefined;
   let connection: NotifierConnection | undefined;
   let setStatus: ((text: string | undefined) => void) | undefined;
+  let notifierStarting = false;
+  let sessionActive = true;
+  /** 当前 Pi 进程自己的会话 key；通知器与 cp_sessions 都要排除它。 */
+  let currentSessionKey: string | undefined;
 
   const client = createWorkbenchClient({
     baseUrl,
@@ -62,6 +66,7 @@ export default function piWorkbench(pi: ExtensionAPI): void {
       // 同一轮里 Pi 自己读完的会话，待发提醒立刻作废（规则 3）
       notifier?.clearSession(key);
     },
+    excludeSessionKeys: () => (currentSessionKey === undefined ? [] : [currentSessionKey]),
   });
 
   const api: PiToolApi = {
@@ -73,7 +78,7 @@ export default function piWorkbench(pi: ExtensionAPI): void {
         parameters: def.inputSchema as never,
         async execute(_toolCallId: string, params: unknown) {
           // B2：只有「LLM 真的调了工具」才算 Pi 动了（notifier 内部 HTTP 不算）
-          const text = await wrapToolExecute(notifier, () => Promise.resolve(def.handler(params)));
+          const text = await wrapToolExecute(notifier, () => Promise.resolve(def.handler(params)), name);
           return { content: [{ type: "text" as const, text: String(text) }], details: {} };
         },
       } as never);
@@ -83,6 +88,15 @@ export default function piWorkbench(pi: ExtensionAPI): void {
 
   // I2：徽标与唤醒解耦 —— PI_WORKBENCH_NOTIFY=0 只是不发消息，WS/徽标照常
   pi.on("session_start", async (_event: unknown, ctx: unknown) => {
+    try {
+      const manager = (ctx as { sessionManager?: { getSessionId?: () => string } }).sessionManager;
+      const sessionId = manager?.getSessionId?.();
+      currentSessionKey =
+        typeof sessionId === "string" && sessionId.length > 0 ? "pi:" + sessionId : undefined;
+    } catch {
+      currentSessionKey = undefined;
+    }
+    sessionActive = true;
     const ui = (ctx as { ui?: { setStatus?: (key: string, text: string | undefined) => void } }).ui;
     if (ui?.setStatus !== undefined) {
       setStatus = (text: string | undefined) => {
@@ -96,34 +110,51 @@ export default function piWorkbench(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", async () => {
+    sessionActive = false;
+    currentSessionKey = undefined;
     connection?.close();
     connection = undefined;
     notifier?.dispose();
     notifier = undefined;
   });
 
-  void ready.then(() => {
-    notifier = new TurnNotifier({
-      mode,
-      sendEnabled: notifyEnabled,
-      listSessions: async () => client.sessions(),
-      sink: {
-        send: async (message, options) => {
-          await pi.sendMessage(message, options as never);
+  // session_start 在 /new、/resume、reload 后会再次触发；通知器必须能重新建立，
+  // 不能只在插件加载时建立一次，否则切过一次会话就永久失去唤醒。
+  const startNotifier = (): void => {
+    if (notifier !== undefined || notifierStarting) {
+      return;
+    }
+    notifierStarting = true;
+    void ready.then(() => {
+      notifierStarting = false;
+      if (!sessionActive || notifier !== undefined) {
+        return;
+      }
+      notifier = new TurnNotifier({
+        mode,
+        sendEnabled: notifyEnabled,
+        listSessions: async () => client.sessions(),
+        sink: {
+          send: async (message, options) => {
+            await pi.sendMessage(message, options as never);
+          },
+          setStatus: (text: string | undefined) => {
+            setStatus?.(text);
+          },
         },
-        setStatus: (text: string | undefined) => {
-          setStatus?.(text);
-        },
-      },
-      log: (line: string) => { console.error(line); },
+        log: (line: string) => { console.error(line); },
+      });
+      connection = connectNotifier({
+        baseUrl,
+        token,
+        onEvent: (event) => { notifier?.handleEvent(event); },
+        onError: (err: unknown) => { console.error("[pi-workbench] WS 错误：" + (err instanceof Error ? err.message : String(err))); },
+        log: (line: string) => { console.error(line); },
+      });
+      void notifier.refreshBadge();
     });
-    connection = connectNotifier({
-      baseUrl,
-      token,
-      onEvent: (event) => { notifier?.handleEvent(event); },
-      onError: (err: unknown) => { console.error("[pi-workbench] WS 错误：" + (err instanceof Error ? err.message : String(err))); },
-      log: (line: string) => { console.error(line); },
-    });
-    void notifier.refreshBadge();
-  });
+  };
+
+  startNotifier();
+  pi.on("session_start", () => { startNotifier(); });
 }

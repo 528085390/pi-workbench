@@ -251,7 +251,11 @@ export class PiDriver implements AgentDriver {
     const options: PiRpcClientOptions = {
       cliPath: this.#cliPath ?? this.#cliPathOfRpcCmd() ?? resolveDefaultPiCliPath(),
       cwd: ref.cwd,
-      args: [...this.#extraRpcArgs(), ...(transcriptPath === undefined ? [] : ["--session", transcriptPath])],
+      args: [
+        ...this.#extensionRpcArgs(),
+        ...this.#extraRpcArgs(),
+        ...(transcriptPath === undefined ? [] : ["--session", transcriptPath]),
+      ],
       ...(this.#env === undefined ? {} : { env: this.#env }),
       ...(this.#provider === undefined ? {} : { provider: this.#provider }),
       ...(this.#model === undefined ? {} : { model: this.#model }),
@@ -264,9 +268,24 @@ export class PiDriver implements AgentDriver {
       client = new Ctor(options);
     }
     client.onEvent((event) => {
-      this.#emit(event);
+      this.#emit(event, ref);
     });
     return client;
+  }
+
+  /**
+   * 受控 Pi 子进程默认不加载宿主扩展。否则用户级安装的 pi-workbench 插件会在每个
+   * cp_dispatch 出来的 Pi 进程里再注册一套 cp_* 工具，并把它自己的会话当远程会话通知，
+   * 形成 self-notification loop。Pi 1.5.2 的 --no-extensions 只关闭发现与内建扩展，
+   * 显式 --extension/-e 路径仍会加载；因此这里仍追加 --no-extensions，不能因为用户
+   * 配了 --extension 就跳过，否则宿主插件 discovery 会重新引入递归。
+   */
+  #extensionRpcArgs(): string[] {
+    const configured = this.#rpcCmd ?? [];
+    if (configured.includes("--no-extensions") || configured.includes("-ne")) {
+      return [];
+    }
+    return ["--no-extensions"];
   }
 
   /** config.pi.rpcCmd 的首项是绝对路径时用它覆盖默认 cli.js（其余参数见 #extraRpcArgs）。 */
@@ -329,6 +348,10 @@ export class PiDriver implements AgentDriver {
         throw new WorkbenchError("E_ADAPTER_DOWN", "Pi new_session 后 get_state 没有 sessionId", { agent: "pi" });
       }
       const transcriptPath = typeof state.sessionFile === "string" && state.sessionFile.length > 0 ? state.sessionFile : undefined;
+      // #createClient 的 onEvent 闭包捕获的是这个对象；拿到真实 id 后同步改写，
+      // 避免新会话的 update 一直被打上"pending"而无法与注册表匹配。
+      pseudo.key = "pi:" + sessionId;
+      pseudo.nativeId = sessionId;
       this.#clients.set("pi:" + sessionId, { client, transcriptPath: transcriptPath ?? "" });
       return { sessionId, ...(transcriptPath === undefined ? {} : { transcriptPath }) };
     } catch (error) {
@@ -413,7 +436,7 @@ export class PiDriver implements AgentDriver {
     }
   }
 
-  #emit(event: unknown): void {
+  #emit(event: unknown, ref?: SessionRef): void {
     let update: AdapterUpdate | null;
     try {
       update = normalizePiEvent(event, "pi-u" + String(++this.#updateSeq));
@@ -422,6 +445,9 @@ export class PiDriver implements AgentDriver {
     }
     if (update === null) {
       return;
+    }
+    if (ref !== undefined) {
+      update = { ...update, sessionId: ref.nativeId };
     }
     for (const listener of [...this.#listeners]) {
       try {

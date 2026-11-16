@@ -156,6 +156,7 @@ test("prompt 立即返回 messageId，并把 session/update 映射成 text", asy
 
     const text = await waitForUpdate(updates, (u) => u.kind === "text");
     assert.equal(text.text, "pong");
+    assert.equal(text.sessionId, sessionId, "update 必须带来源 sessionId（跨会话隔离依赖它）");
 
     // thought / tool_call / tool_result / state 都要映射出来
     await waitForUpdate(updates, (u) => u.kind === "thought");

@@ -65,6 +65,11 @@ export type WorkbenchClientOptions = {
    * 同一轮里 Pi 自己读过的，绝不能再收到过期提醒（spec §6.6 规则 3）。
    */
   onSessionRead?: (sessionKey: string) => void;
+  /**
+   * 当前 Pi 自己的会话 key（数组或动态读取函数）。列表接口会在客户端侧过滤掉这些 key，
+   * 防止 Pi 把自己当成远程会话：cp_sessions 不展示自身，通知器也不会叫醒自己。
+   */
+  excludeSessionKeys?: readonly string[] | (() => readonly string[]);
 };
 
 /**
@@ -286,6 +291,13 @@ export function createWorkbenchClient(options: WorkbenchClientOptions = {}): Wor
   const envToken = process.env["PI_WORKBENCH_AUTH_TOKEN"] ?? process.env["PI_WORKBENCH_TOKEN"];
   const authToken = explicitToken ?? envToken ?? null;
   const doFetch: typeof fetch = options.fetch ?? fetch;
+  const excludedSessionKeys = (): Set<string> => {
+    const value =
+      typeof options.excludeSessionKeys === "function"
+        ? options.excludeSessionKeys()
+        : options.excludeSessionKeys;
+    return new Set(value ?? []);
+  };
 
   async function call(method: "GET" | "POST", path: string, body?: unknown): Promise<unknown> {
     if (options.beforeCall !== undefined) {
@@ -317,8 +329,8 @@ export function createWorkbenchClient(options: WorkbenchClientOptions = {}): Wor
     clientId,
     health: async () => (await call("GET", "/health")) as HealthBody,
     agents: async () => (await call("GET", "/api/cp/agents")) as AgentDescriptor[],
-    sessions: async (filter) =>
-      (await call(
+    sessions: async (filter) => {
+      const list = (await call(
         "GET",
         "/api/cp/sessions" +
           queryOf({
@@ -326,7 +338,10 @@ export function createWorkbenchClient(options: WorkbenchClientOptions = {}): Wor
             status: filter?.status,
             clientId: filter?.clientId ?? clientId,
           }),
-      )) as SessionView[],
+      )) as SessionView[];
+      const excluded = excludedSessionKeys();
+      return excluded.size === 0 ? list : list.filter((session) => !excluded.has(session.key));
+    },
     unread: async (key, readOptions) => {
       const page = (await call(
         "GET",
@@ -398,10 +413,11 @@ export function createWorkbenchClient(options: WorkbenchClientOptions = {}): Wor
  * 每次复核都清一次，连击上限永远不触发（评审实测 6 次发 6 条）。
  */
 export function wrapToolExecute(
-  activity: { noteToolActivity(): void } | undefined,
+  activity: { noteToolActivity(toolName?: string): void } | undefined,
   run: () => Promise<unknown>,
+  toolName?: string,
 ): Promise<unknown> {
-  activity?.noteToolActivity();
+  activity?.noteToolActivity(toolName);
   return run();
 }
 
@@ -564,7 +580,7 @@ export function registerWorkbenchTools(
 
   api.registerTool("cp_sessions", {
     description:
-      "列出控制面里的会话（可按 agent / status 过滤），每行一个 key + 状态 + driver + 未读数 + cwd。unread>0 表示有你没读过的消息。",
+      "列出控制面里的会话（可按 agent / status 过滤），每行一个 key + 状态 + driver + 未读数 + cwd。unread>0 表示有你没读过的消息。当前 Pi 自己的会话不会列出。",
     inputSchema: {
       type: "object",
       properties: {

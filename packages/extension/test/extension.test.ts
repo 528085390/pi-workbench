@@ -688,3 +688,33 @@ test("cp_dispatch 的 /agents 预检有 30s 缓存：连续两次只探测一次
   assert.equal(calls.filter((call) => call.url.endsWith("/api/cp/agents")).length, 1);
   assert.equal(calls.filter((call) => call.url.endsWith("/api/cp/dispatch")).length, 2);
 });
+
+test("createWorkbenchClient：excludeSessionKeys 过滤自身会话（cp_sessions 与通知器共用）", async () => {
+  const { fetchImpl } = recorder(() => ({
+    body: [
+      { key: "pi:self", agent: "pi", status: "idle", driver: "pi", cwd: "/w", unread: 0 },
+      { key: "claude:a", agent: "claude", status: "idle", driver: "pi", cwd: "/w", unread: 1 },
+    ],
+  }));
+  let self: string | undefined = "pi:self";
+  const client = createWorkbenchClient({
+    baseUrl: "http://h:1",
+    clientId: "pi:7",
+    fetch: fetchImpl,
+    excludeSessionKeys: () => (self === undefined ? [] : [self]),
+  });
+  assert.deepEqual((await client.sessions()).map((item) => item.key), ["claude:a"]);
+  self = undefined;
+  assert.deepEqual((await client.sessions()).map((item) => item.key), ["pi:self", "claude:a"]);
+});
+
+test("wrapToolExecute：把工具名传给 noteToolActivity（供 cp_sessions 识别观察动作）", async () => {
+  const names: Array<string | undefined> = [];
+  const activity = {
+    noteToolActivity(toolName?: string): void {
+      names.push(toolName);
+    },
+  };
+  await wrapToolExecute(activity, async () => "ok", "cp_sessions");
+  assert.deepEqual(names, ["cp_sessions"]);
+});

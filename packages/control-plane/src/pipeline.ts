@@ -196,6 +196,15 @@ export class EventPipeline {
         return;
       }
 
+      // ACP 一个 adapter 进程可能服务多个会话；事件必须按来源 sessionId 过滤，
+      // 否则 A 会话的 token/tool_call 会被写进 B 会话，制造假未读和重复唤醒。
+      if (update.sessionId !== undefined && update.sessionId !== ref.nativeId) {
+        this.#logger.debug(
+          "AdapterUpdate 属于其他会话（" + update.sessionId + "），已从 " + sessionKey + " 丢弃",
+        );
+        return;
+      }
+
       if (update.id.length === 0) {
         this.#logger.debug("AdapterUpdate 缺少 id（会话 " + sessionKey + "），已丢弃");
         return;

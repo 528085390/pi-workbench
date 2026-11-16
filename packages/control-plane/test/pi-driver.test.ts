@@ -269,6 +269,7 @@ test("PiDriver.attach: 以 --session <file> 拉起 RPC 子进程并完成 get_st
     const at = argv.indexOf("--session");
     assert.ok(at >= 0, "argv 缺少 --session");
     assert.equal(argv[at + 1], h.ref.transcriptPath);
+    assert.ok(argv.includes("--no-extensions"), "受控 Pi 子进程必须隔离宿主扩展，避免插件递归");
 
     assert.ok(log.some((record) => record.event === "request" && record.command === "get_state"));
   } finally {
@@ -303,6 +304,7 @@ test("PiDriver.inject→prompt / interrupt→abort，RPC 事件归一化为 Adap
     assert.ok(updates.some((update) => update.kind === "tool_call" && update.toolName === "read"));
     assert.ok(updates.some((update) => update.kind === "tool_result"));
     assert.ok(updates.some((update) => update.kind === "state" && update.state === "idle"));
+    assert.ok(updates.every((update) => update.sessionId === h.ref.nativeId), "所有 update 应带来源 sessionId");
     assert.equal(updates.some((update) => update.kind === "error"), false, "未知事件不得变成 error");
   } finally {
     await h.disposeAll();
@@ -474,7 +476,7 @@ test("PiDriver.rpcCmd: 额外参数透传，--mode rpc 不重复", async () => {
     const start = h.readLog().find((record) => record.event === "start");
     assert.ok(start !== undefined);
     const argv = start.argv as string[];
-    assert.deepEqual(argv.slice(0, 5), ["--mode", "rpc", "--provider", "zz", "--session"]);
+    assert.deepEqual(argv.slice(0, 6), ["--mode", "rpc", "--no-extensions", "--provider", "zz", "--session"]);
   } finally {
     await h.disposeAll();
     h.db.close();

@@ -28,6 +28,8 @@ export type AdapterUpdate = {
   text?: string;
   toolName?: string;
   state?: SessionStatus;
+  /** 产生此 update 的 agent 原生会话 id；缺省表示无法归属（如 adapter 整体挂掉） */
+  sessionId?: string;
   /** 原始 ACP 负载，未识别的字段都靠它兜底 */
   raw?: unknown;
 };

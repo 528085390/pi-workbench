@@ -443,7 +443,7 @@ export class ClaudeAdapter implements AgentAdapter {
     const update = params.update;
     const mapped = mapSessionUpdate(update, () => this.#nextId());
     if (mapped !== null) {
-      this.#emit(mapped);
+      this.#emit({ ...mapped, sessionId: params.sessionId });
     }
     const record = asRecord(update);
     if (record === null || record["sessionUpdate"] !== "state_update" || record["state"] !== "idle") {
@@ -453,7 +453,7 @@ export class ClaudeAdapter implements AgentAdapter {
     if (stopReason === "error") {
       // C1：回合失败绝不能被当成成功。先 emit kind:"error"（监听者先看到原因），再 reject 该回合。
       const failure = turnFailureMessage(record);
-      this.#emit({ kind: "error", id: this.#nextId(), text: failure, raw: update });
+      this.#emit({ kind: "error", id: this.#nextId(), text: failure, sessionId: params.sessionId, raw: update });
       this.#failTurn(
         params.sessionId,
         new WorkbenchError("E_BAD_REQUEST", "回合失败：" + failure, {
@@ -471,6 +471,7 @@ export class ClaudeAdapter implements AgentAdapter {
       kind: "permission_request",
       id: this.#nextId(),
       text: params.title,
+      sessionId: params.sessionId,
       raw: params,
     });
     return permissionOutcome(this.#permissionMode, params.options);
