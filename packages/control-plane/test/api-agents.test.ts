@@ -370,6 +370,43 @@ test("codex dispatch 挂 codex driver 的 update 流；claude dispatch 挂 claud
   }
 });
 
+test("Pi dispatch 投递后释放内部 pi 租约，普通 clientId 可以继续 inject", async () => {
+  const holders: string[] = [];
+  let h: Harness | null = null;
+  const pi = makeDriver("pi", capsOf("pi"), {
+    newSession: async () => ({ sessionId: "sess-pi-dispatch" }),
+    inject: async (ref) => {
+      holders.push(h?.leases.current(ref.key)?.clientId ?? "none");
+      h?.leases.acquire(ref.key, "pi", "pi");
+      return { messageId: "pi-m1", effective: "now" };
+    },
+  });
+  h = await makeHarness({ drivers: [{ driver: pi.driver }] });
+  try {
+    const dispatched = await h.app.inject({
+      method: "POST",
+      url: API + "/dispatch",
+      payload: { agent: "pi", task: "干活", idempotencyKey: "k-pi-dispatch" },
+    });
+    assert.equal(dispatched.statusCode, 200, dispatched.body);
+    const key = dispatched.json<SessionRef>().key;
+    assert.equal(holders[0], "none", "dispatch 投递前不应有租约");
+    assert.equal(h.leases.current(key), null, "dispatch 返回后内部 pi 租约必须释放");
+
+    await acquire(h.app, key);
+    const injected = await h.app.inject({
+      method: "POST",
+      url: API + "/sessions/" + encodeURIComponent(key) + "/inject",
+      payload: { text: "继续", clientId: "pi:7" },
+    });
+    assert.equal(injected.statusCode, 200, injected.body);
+    assert.deepEqual(holders, ["none", "pi"], "第二次写操作期间 driver 看到的租约应是 pi");
+    assert.equal(h.leases.current(key)?.clientId, "pi:7", "写操作结束后租约应还给扩展身份");
+  } finally {
+    await h.close();
+  }
+});
+
 test("/transcript：会话没有 transcriptPath 时委派 driver.see（Codex ACP 新会话）", async () => {
   const codex = makeDriver("codex", CODEX_CAPABILITIES, {
     see: async () => ({

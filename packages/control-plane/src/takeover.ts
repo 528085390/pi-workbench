@@ -549,6 +549,15 @@ export class TakeoverEngine {
       }
     } catch {
       // R28：投递失败不影响 dispatch 返回；回合结果通过事件流观察
+    } finally {
+      // dispatch 的内部 pi 租约只覆盖本次投递；返回后释放，否则普通 clientId 无法
+      // acquire 租约，后续 cp_inject / interrupt / checkpoint 会直接 409。
+      if (driver !== null && input.agent !== "claude") {
+        const holder = this.#leases.current(ref.key);
+        if (holder !== null && holder.clientId === this.#piClientId) {
+          this.#leases.release(ref.key, this.#piClientId);
+        }
+      }
     }
     return ref;
   }
