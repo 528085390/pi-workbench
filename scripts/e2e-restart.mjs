@@ -5,7 +5,7 @@
  *   node scripts/e2e-restart.mjs
  *
  * 隔离：默认 PI_WORKBENCH_HOME=<repo>/tmp/e2e-restart，端口每次从空闲端口里挑
- * （绝不占用 7331）；PI_WORKBENCH_E2E_KEEP=0 时结束后删除 home，默认保留供复查。
+ * （绝不占用 7331）；默认 PASS 后删除 home，失败保留；PI_WORKBENCH_E2E_KEEP=1 时 PASS 后也保留。
  *
  * 流程（任一步失败 → 退出码 1，但后续清理照做）：
  *   启动 daemon #1 → dispatch 一个 claude 任务 → 等 session/assistant 出现
@@ -15,9 +15,14 @@
  *     E_CAP_UNSUPPORTED，属预期分支）
  *   → 断言 workbench.db 有 2 个 instances 行、1 条 daemon_restart 事件。
  *
- * 证据：<home>/e2e-restart.jsonl，每步一行 {ts, step, ok, detail}。
+ * 证据：<home>/e2e-restart.jsonl，每步一行 {ts, step, ok, detail}；默认 PASS 后随 home 删除，
+ * 需要复查时设 PI_WORKBENCH_E2E_KEEP=1 保留。
  * 只用 Node 内置能力 + HTTP：不 import packages 下的任何模块（避免把控制面代码
  * import 进脚本，让「跑不通」只剩一种解释：daemon / adapter 真的不行）。
+ *
+ * 已知偏差（C07 裁定）：Claude 交互式会话 attach=false，POST attach 会在能力闸门
+ * 返回 422 E_CAP_UNSUPPORTED（契约已记录）；因此「attach 200 后 restart 再 inject」的
+ * 正向链路无法用 Claude interactive 演练。本脚本把 422 作为负向断言保留，不伪造 200。
  */
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -31,7 +36,7 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const home = resolve(process.env.PI_WORKBENCH_HOME ?? join(repoRoot, "tmp", "e2e-restart"));
 const workspace = join(home, "workspace");
 const evidencePath = join(home, "e2e-restart.jsonl");
-const keepHome = process.env.PI_WORKBENCH_E2E_KEEP !== "0";
+const keepHome = process.env.PI_WORKBENCH_E2E_KEEP === "1";
 const nonce = randomUUID().slice(0, 8);
 
 const state = { daemon: null, port: 0, baseUrl: "", daemonLog: "", checks: 0, failures: [] };
@@ -144,6 +149,24 @@ function pidAlive(pid) {
   } catch (error) {
     return error?.code === "EPERM";
   }
+}
+
+/** 杀掉 daemon 前核对命令行的最后一道闸：pid 复用/拿错 pid 时绝不下手。 */
+function commandLineOf(pid) {
+  if (process.platform !== "win32") {
+    try {
+      return readFileSync("/proc/" + String(pid) + "/cmdline", "utf8").replaceAll("\0", " ").trim();
+    } catch {
+      return "";
+    }
+  }
+  const script = "Get-CimInstance Win32_Process -Filter \"ProcessId = " + String(pid) + "\" | Select-Object -ExpandProperty CommandLine";
+  const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+    encoding: "utf8",
+    timeout: 20_000,
+    env: { ...process.env, ...winEnv },
+  });
+  return (result.stdout ?? "").trim();
 }
 
 /** 上一轮崩溃/中断留下的 daemon 先清掉，否则单实例锁会让本轮启动失败 */
@@ -272,13 +295,23 @@ async function main() {
   const listed = await waitForSession(key);
   record("session-listed-before-restart", listed.key === key, { key: listed.key, status: listed.status, driver: listed.driver });
 
+  const sessionsBeforeResponse = await http("GET", "/api/cp/sessions", undefined, 10_000);
+  must(sessionsBeforeResponse.status === 200, "重启前 GET /sessions 失败：" + JSON.stringify(sessionsBeforeResponse.body));
+  const sessionCountBefore = Array.isArray(sessionsBeforeResponse.body) ? sessionsBeforeResponse.body.length : -1;
+  record("sessions-count-before-restart", sessionCountBefore >= 1, { count: sessionCountBefore });
+
   // 只要求「有一条 assistant 输出」：模型不一定会照抄 nonce，内容不该成为回归门槛
   const before = await pollTranscript(key, (messages) => messages.some((message) => roleOf(message) === "assistant" && textOf(message).length > 0), 120_000);
   record("transcript-before-restart", before.hit, { messages: before.messages.length, waited: before.hit });
   must(before.hit, "120s 内没有等到 assistant 回复，无法建立重启前的基线");
 
-  // 硬杀：模拟 daemon 崩溃（计划要求 taskkill /F /PID）
+  // 硬杀：模拟 daemon 崩溃（计划要求 taskkill /F /PID）。
+  // 先核对 pid 的命令行，避免 pid 复用/拿错进程时误杀无关进程。
   const pid = state.daemon.pid;
+  const daemonCommandLine = commandLineOf(pid);
+  const isControlPlane = daemonCommandLine.toLowerCase().includes("control-plane");
+  record("daemon-pid-is-control-plane", isControlPlane, { pid, cmd: daemonCommandLine.slice(0, 400) });
+  must(isControlPlane, "拒绝 taskkill：pid " + String(pid) + " 的命令行不含 control-plane：" + daemonCommandLine);
   killTree(state.daemon);
   const exited = await withTimeout(new Promise((done) => state.daemon.once("exit", () => done(true))), 20_000, "daemon #1 退出");
   record("daemon-1-killed", exited === true, { pid });
@@ -293,6 +326,10 @@ async function main() {
   const sessionsResponse = await http("GET", "/api/cp/sessions", undefined, 10_000);
   must(sessionsResponse.status === 200, "重启后 GET /sessions 失败：" + JSON.stringify(sessionsResponse.body));
   const sessions = Array.isArray(sessionsResponse.body) ? sessionsResponse.body : [];
+  record("sessions-count-unchanged", sessions.length === sessionCountBefore, {
+    before: sessionCountBefore,
+    after: sessions.length,
+  });
   const restored = sessions.find((session) => session.key === key);
   record("sessions-after-restart", restored !== undefined, {
     total: sessions.length,
@@ -313,12 +350,17 @@ async function main() {
     beforeMessages: before.messages.length,
   });
 
-  // 200 / E_RESUME_REJECTED 是计划口径；Claude 交互式会话 attach=false，
-  // 能力闸门会先返回 422 E_CAP_UNSUPPORTED（同一语义：没有建立控制通道）。
+  // 已知偏差（C07 裁定）：Claude 交互式会话 attach=false，能力闸门会先返回
+  // 422 E_CAP_UNSUPPORTED。这里把它作为明确的负向断言，而不是接受 200 的假正向。
   const attach = await http("POST", "/api/cp/sessions/" + encodeURIComponent(key) + "/attach", {}, 30_000);
   const attachCode = errorCodeOf(attach);
-  const attachOk = attach.status === 200 || (attach.status === 409 && attachCode === "E_RESUME_REJECTED") || (attach.status === 422 && attachCode === "E_CAP_UNSUPPORTED");
-  record("attach-after-restart", attachOk, { status: attach.status, code: attachCode, body: attach.body });
+  const attachOk = attach.status === 422 && attachCode === "E_CAP_UNSUPPORTED";
+  record("attach-after-restart-capability-gate-422", attachOk, {
+    status: attach.status,
+    code: attachCode,
+    knownDeviation: "Claude interactive attach=false; attach 200 + inject-after-restart is not exercised",
+    body: attach.body,
+  });
 
   const dbPath = join(home, "workbench.db");
   must(existsSync(dbPath), "workbench.db 不存在：" + dbPath);
@@ -355,6 +397,6 @@ if (state.failures.length > 0) {
   process.exit(1);
 }
 process.stdout.write("PASS " + String(total) + " checks\n");
-if (!keepHome) {
-  rmSync(home, { recursive: true, force: true });
+if (!keepHome && state.failures.length === 0) {
+  rmSync(home, { recursive: true, force: true, maxRetries: 3 });
 }

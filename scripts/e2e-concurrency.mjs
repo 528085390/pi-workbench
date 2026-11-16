@@ -12,8 +12,8 @@
  *      库里 dispatches 只有 1 行（幂等预留原子生效）。
  *   2. 两个客户端抢同一会话租约 → 第二个 E_LEASE_CONFLICT（R25 单写者）。
  *   3. 同一会话并发 inject 10 条 → 全部 200、messageId 互不相同；transcript 恰好
- *      10 条完整用户消息；事件 seq 严格递增、每条 payload 恰好是一条完整注入文本
- *      （写队列串行化，没有交错/截断）。
+ *      10 条完整用户消息；WS 帧按 seq 到达（无重复/乱序），状态机
+ *      running→idle 交替 10 个回合（写队列串行化，没有交错/截断）。
  *
  * 只用 Node 内置能力 + HTTP + 只读 SQLite：不 import packages 下的模块。
  */
@@ -35,7 +35,7 @@ const CLIENTS = { conflictA: "e2e-conflict-a", conflictB: "e2e-conflict-b", inje
 const INJECT_COUNT = 10;
 const DISPATCH_COUNT = 3;
 
-const state = { daemon: null, port: 0, baseUrl: "", daemonLog: "", checks: 0, failures: [] };
+const state = { daemon: null, port: 0, baseUrl: "", daemonLog: "", checks: 0, failures: [], ws: null };
 const winEnv = { SystemDrive: "C:", SystemRoot: "C:\\Windows" };
 
 function messageOf(error) {
@@ -110,6 +110,28 @@ async function http(method, path, body, timeoutMs = 60_000) {
 function errorCodeOf(response) {
   const error = response.body !== null && typeof response.body === "object" ? response.body.error : undefined;
   return error !== undefined && typeof error.code === "string" ? error.code : null;
+}
+
+/** 订阅 WS：从 after 开始回放 + 实时帧，按「到达顺序」记录 seq。 */
+async function openWsCollector(afterSeq, frames) {
+  const url = state.baseUrl.replace(/^http/, "ws") + "/api/cp/ws?after=" + String(afterSeq);
+  const socket = new WebSocket(url);
+  socket.addEventListener("message", (event) => {
+    let frame = null;
+    try {
+      frame = JSON.parse(String(event.data));
+    } catch {
+      return;
+    }
+    if (frame !== null && typeof frame === "object" && Number.isInteger(frame.seq)) {
+      frames.push({ at: Date.now(), seq: frame.seq, type: typeof frame.type === "string" ? frame.type : "" });
+    }
+  });
+  await new Promise((resolve, reject) => {
+    socket.addEventListener("open", () => resolve(), { once: true });
+    socket.addEventListener("error", () => reject(new Error("WS 连接失败：" + url)), { once: true });
+  });
+  return socket;
 }
 
 function messagesOf(page) {
@@ -287,6 +309,9 @@ async function main() {
     messages: baseline.length,
   });
   const baselineSeq = Number(dbQuery("SELECT COALESCE(MAX(seq), 0) AS maxSeq FROM events")[0]?.maxSeq ?? 0);
+  const wsFrames = [];
+  state.ws = await openWsCollector(baselineSeq, wsFrames);
+  record("ws-connected", true, { after: baselineSeq });
 
   // ---- 2. 租约冲突 ---------------------------------------------------------------
   const leaseA = await http("POST", "/api/cp/sessions/" + encodeURIComponent(key) + "/lease", {
@@ -335,8 +360,8 @@ async function main() {
     (messages) => messages.filter((message) => roleOf(message) === "user" && textOf(message).startsWith(prefix)).length >= INJECT_COUNT,
     240_000,
   );
-  const userInjectTexts = finalMessages.filter((message) => roleOf(message) === "user" && textOf(message).startsWith(prefix)).map(textOf);
-  const exactTexts = texts.slice().sort();
+  const userInjectTexts = finalMessages.filter((message) => roleOf(message) === "user" && textOf(message).startsWith(prefix)).map((message) => textOf(message).trim());
+  const exactTexts = texts.map((text) => text.trim()).sort();
   const sortedObserved = userInjectTexts.slice().sort();
   record("transcript-10-complete-user-messages", userInjectTexts.length === INJECT_COUNT && JSON.stringify(sortedObserved) === JSON.stringify(exactTexts), {
     count: userInjectTexts.length,
@@ -347,17 +372,40 @@ async function main() {
   // 事件是 token/thought/state 流（不是整条消息），「无交错」的可观测口径：
   // 状态机必须 running → idle → running 严格交替，10 次 inject 恰好对应 10 个回合，
   // 且每个回合内至少有一条 token/thought 事件（没有两个回合的流交织在一起）。
-  const eventRows = dbQuery("SELECT seq, type, payload_json FROM events WHERE session_key = ? ORDER BY seq", [key]).map((row) => ({
-    seq: Number(row.seq),
-    type: row.type,
-    payload: JSON.parse(row.payload_json),
-  }));
+  // 10 条 inject 已落 transcript 不代表第 10 个回合已启动；等到 10 个 running 状态再评估交替，
+  // 否则最后一条 inject 尚未开始会被误判成少一个回合。
+  let eventRows = [];
+  const cycleDeadline = Date.now() + 120_000;
+  while (Date.now() < cycleDeadline) {
+    eventRows = dbQuery("SELECT seq, type, payload_json FROM events WHERE session_key = ? ORDER BY seq", [key]).map((row) => ({
+      seq: Number(row.seq),
+      type: row.type,
+      payload: JSON.parse(row.payload_json),
+    }));
+    const runningStates = eventRows.filter(
+      (event) => event.type === "state_update" && event.seq > baselineSeq && event.payload.state === "running",
+    ).length;
+    if (runningStates >= INJECT_COUNT) break;
+    await sleep(500);
+  }
   const seqs = eventRows.map((event) => event.seq);
-  const strictlyIncreasing = seqs.length > 0 && seqs.every((seq, index) => index === 0 || seq > seqs[index - 1]);
-  record("events-seq-strictly-increasing", strictlyIncreasing && new Set(seqs).size === seqs.length, {
-    count: seqs.length,
-    first: seqs[0],
-    last: seqs[seqs.length - 1],
+  // WS 到达顺序是独立于 DB 的证据：帧必须从 baselineSeq+1 起按 seq 单调到达，且不重复。
+  // 不把 DB 的 MAX(seq) 当作序列化证据——那是存储层自己生成的，属于同义反复。
+  await sleep(2000);
+  const receivedSeqs = wsFrames.map((frame) => frame.seq);
+  // 只断言「WS 到达顺序」：首帧从 baselineSeq+1 开始，后续严格递增且不重复。
+  // 不要求收到全部历史帧（订阅/回放可能按会话过滤或延迟），也不拿 DB MAX(seq) 当证据。
+  const wsOrdered = receivedSeqs.length > 0
+    && receivedSeqs[0] === baselineSeq + 1
+    && receivedSeqs.every((seq, index) => index === 0 || seq > receivedSeqs[index - 1])
+    && new Set(receivedSeqs).size === receivedSeqs.length;
+  record("ws-arrival-order", wsOrdered, {
+    after: baselineSeq,
+    received: receivedSeqs.length,
+    first: receivedSeqs[0] ?? null,
+    last: receivedSeqs[receivedSeqs.length - 1] ?? null,
+    dbMaxSeq: seqs.length > 0 ? seqs[seqs.length - 1] : null,
+    sample: wsFrames.slice(0, 5),
   });
 
   const stateEvents = eventRows.filter(
@@ -408,6 +456,10 @@ try {
 } catch (error) {
   record("fatal", false, messageOf(error));
 } finally {
+  if (state.ws !== null) {
+    try { state.ws.close(); } catch {}
+    state.ws = null;
+  }
   killTree(state.daemon);
   state.daemon = null;
 }
