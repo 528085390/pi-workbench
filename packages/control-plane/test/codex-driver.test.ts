@@ -434,6 +434,29 @@ test("see：有 transcriptPath 时走 readTranscript", async () => {
   }
 });
 
+test("see：无路径时懒解析成功就直接读，不返回 pending", async () => {
+  const calls: Array<Record<string, unknown>> = [];
+  const driver = new CodexDriver(makeConfig([process.execPath, FIXTURE]), {
+    resolveRolloutPath: async () => "C:\\lazy\\see.jsonl",
+    readTranscript: (input) => {
+      calls.push(input);
+      return {
+        messages: [{ id: "m1", role: "assistant", kind: "text", text: "lazy", ts: "2026-11-16T00:00:00.000Z" }],
+        nextCursor: "9",
+        pending: false,
+      };
+    },
+  });
+  try {
+    const page = await driver.see(makeRef(), "0", 10);
+    assert.equal(page.pending, false);
+    assert.equal(page.messages[0]?.text, "lazy");
+    assert.equal(calls[0]?.["path"], "C:\\lazy\\see.jsonl");
+  } finally {
+    await driver.dispose();
+  }
+});
+
 test("resolveTranscriptPath：懒解析出的 rollout 路径可供 see 使用", async () => {
   const calls: Array<Record<string, unknown>> = [];
   const driver = new CodexDriver(makeConfig([process.execPath, FIXTURE]), {

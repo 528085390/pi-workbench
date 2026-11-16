@@ -165,6 +165,7 @@ const ROUTE_TRANSCRIPT = "GET /sessions/:key/transcript";
 const ROUTE_LEASE = "POST /sessions/:key/lease";
 const ROUTE_INJECT = "POST /sessions/:key/inject";
 const ROUTE_INTERRUPT = "POST /sessions/:key/interrupt";
+const ROUTE_ATTACH = "POST /sessions/:key/attach";
 const ROUTE_CHECKPOINT = "POST /sessions/:key/checkpoint";
 const ROUTE_HANDOFF = "POST /sessions/:key/handoff";
 const ROUTE_HANDBACK = "POST /sessions/:key/handback";
@@ -358,7 +359,13 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         const limit = optionalPositiveInt(query, "limit", ROUTE_TRANSCRIPT);
         const path = session.transcriptPath;
         if (path === undefined || path.length === 0) {
-          // 没有 transcript 路径（会话刚建 / 非 Claude）→ 空页，游标停在调用方给的位置
+          // 0.5-B：Codex/Pi 的会话文件由各自驱动懒解析（spec §7.1）。路径未解析出来时
+          // 委派 driver.see；驱动没有 see 或解析不到，才返回空页（游标停在调用方给的位置）。
+          const driver = deps.router?.get(session.agent) ?? null;
+          if (driver !== null && typeof driver.see === "function") {
+            const page = await driver.see(session, after, limit);
+            return { messages: page.messages, nextCursor: page.nextCursor, pending: page.pending };
+          }
           return { messages: [] as UnifiedMessage[], nextCursor: after };
         }
         const page = readPage(session.agent, path, after, limit);
@@ -443,6 +450,39 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         return { released: true, sessionKey: key, clientId };
       });
 
+      /**
+       * 建立控制通道（规格 §6.1 attach / §14 Gate #4）。
+       * 能力裁决用**会话声明的 caps**：Claude 的 attach 随 kind 变化（交互式 false / 后台 true），
+       * driver.caps 只是交互式快照；Codex/Pi 两者都是 false。缺能力时在调用 driver 之前 422，
+       * 不产生任何 ACP / RPC 子进程调用。
+       */
+      api.post("/sessions/:key/attach", async (request) => {
+        const key = paramOf(request, "key");
+        const session = requireSession(deps.registry, key);
+        if (deps.router === undefined) {
+          throw new WorkbenchError("E_AGENT_UNAVAILABLE", "Agent 注册表未启用，无法 attach：" + session.agent, {
+            agent: session.agent,
+            cap: "attach",
+          });
+        }
+        const driver = deps.router.get(session.agent);
+        if (driver === null) {
+          throw new WorkbenchError("E_AGENT_UNAVAILABLE", "Agent 未注册或不可用：" + session.agent, {
+            agent: session.agent,
+            cap: "attach",
+          });
+        }
+        const declared = session.capabilities;
+        if (declared.attach !== true) {
+          throw new WorkbenchError("E_CAP_UNSUPPORTED", "Agent " + session.agent + " 不支持能力 attach", {
+            agent: session.agent,
+            cap: "attach",
+          });
+        }
+        await driver.attach(session);
+        return { attached: true, sessionKey: key, agent: session.agent };
+      });
+
       api.post("/sessions/:key/inject", async (request) => {
         const key = paramOf(request, "key");
         requireSession(deps.registry, key);
@@ -508,6 +548,15 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
       });
 
       api.post("/dispatch", async (request) => {
+        // 0.5-B：启动探测是后台跑的，探测未完成时 codex/pi 会以 available=false + reason 注册；
+        // 首次 dispatch 前先等这一次探测（3s 上限、in-flight 复用），避免刚启动就误报 E_AGENT_UNAVAILABLE。
+        if (deps.agentStatuses !== undefined) {
+          try {
+            await deps.agentStatuses();
+          } catch {
+            // 探测失败照常走注册表快照，由下面的可用性判定给出结构化错误
+          }
+        }
         const body = bodyOf(request.body, ROUTE_DISPATCH);
         // 0.5-B B01-b：agent 缺省 claude（保持 0.5-A 调用方兼容），透传给引擎按注册表判可用
         const agent = optionalString(body, "agent", ROUTE_DISPATCH) ?? "claude";

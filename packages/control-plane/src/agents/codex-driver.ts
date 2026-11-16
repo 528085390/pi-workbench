@@ -138,9 +138,18 @@ export class CodexDriver implements AgentDriver {
 
   async see(ref: SessionRef, cursor: string, limit?: number): Promise<SeeResult> {
     const inline = ref.transcriptPath;
-    const path = inline !== undefined && inline.trim().length > 0 ? inline : this.#rolloutPaths.get(ref.nativeId);
+    let path = inline !== undefined && inline.trim().length > 0 ? inline : this.#rolloutPaths.get(ref.nativeId);
     if (path === undefined || path.trim().length === 0) {
-      // 规格 §7.1：ACP 新会话的 rollout 可能尚未落盘/被 T3 索引；空页 + pending，不报错。
+      // 规格 §7.1 lazy resolve：ACP 新会话的 rollout 通常在 newSession 之后几秒才落盘，
+      // 首次 see 时补解析一次；解析不到才返回 pending（不报错、不 spawn adapter）。
+      try {
+        await this.resolveTranscriptPath(ref);
+      } catch {
+        // 解析失败按「尚未落盘」处理
+      }
+      path = this.#rolloutPaths.get(ref.nativeId);
+    }
+    if (path === undefined || path.trim().length === 0) {
       return { messages: [], nextCursor: cursor, pending: true };
     }
     const page = await this.#readTranscript({

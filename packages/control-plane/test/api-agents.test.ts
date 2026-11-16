@@ -15,7 +15,12 @@ import type { FastifyInstance } from "fastify";
 import type { AgentAdapter } from "../src/adapters/types.ts";
 import { AgentRouter } from "../src/agents/router.ts";
 import type { AgentDriver, AgentStatus } from "../src/agents/types.ts";
-import { CLAUDE_CAPABILITIES, CODEX_CAPABILITIES, capsOf } from "../src/capabilities.ts";
+import {
+  CLAUDE_BACKGROUND_CAPABILITIES,
+  CLAUDE_CAPABILITIES,
+  CODEX_CAPABILITIES,
+  capsOf,
+} from "../src/capabilities.ts";
 import { CheckpointStore } from "../src/checkpoints.ts";
 import type { Config } from "../src/config.ts";
 import { ReadCursorStore } from "../src/cursors.ts";
@@ -359,6 +364,32 @@ test("codex dispatch 成功时不走 Claude 的 pipeline.attach；claude dispatc
   }
 });
 
+test("/transcript：会话没有 transcriptPath 时委派 driver.see（Codex ACP 新会话）", async () => {
+  const codex = makeDriver("codex", CODEX_CAPABILITIES, {
+    see: async () => ({
+      messages: [{ id: "m1", role: "assistant", kind: "text", text: "delegated", ts: "2026-11-16T00:00:00.000Z" }],
+      nextCursor: "12",
+      pending: false,
+    }),
+  });
+  const h = await makeHarness({
+    drivers: [{ driver: codex.driver }],
+    seed: [sessionRef("codex", "sess-lazy")],
+  });
+  try {
+    const res = await h.app.inject({
+      method: "GET",
+      url: API + "/sessions/" + encodeURIComponent("codex:sess-lazy") + "/transcript?after=0&limit=10",
+    });
+    assert.equal(res.statusCode, 200, res.body);
+    const body = res.json<{ messages: Array<{ text: string }>; nextCursor: string }>();
+    assert.equal(body.messages[0]?.text, "delegated");
+    assert.equal(body.nextCursor, "12");
+  } finally {
+    await h.close();
+  }
+});
+
 test("codex handoff 走 driver.handoff 返回原生 resume 命令（attach=false 不是 422）", async () => {
   const codex = makeDriver("codex", CODEX_CAPABILITIES, {
     handoff: async () => ({ command: ["codex", "resume", "sess-codex", "--no-alt-screen"], mode: "resume-tui" }),
@@ -501,5 +532,93 @@ test("probeAgents：任一探测器失败只返回机器可读 reason，绝不�
     assert.equal(probe.available, false, probe.agent);
     assert.match(String(probe.reason), /^E_AGENT_UNAVAILABLE: /, probe.agent);
     assert.equal(probe.version, null);
+  }
+});
+
+test("POST /attach：claude 后台会话（caps.attach=true）→ 200 并调用 driver.attach", async () => {
+  const claude = makeDriver("claude", CLAUDE_BACKGROUND_CAPABILITIES);
+  const h = await makeHarness({
+    drivers: [{ driver: claude.driver }],
+    seed: [
+      sessionRef("claude", "sess-bg", {
+        kind: "background",
+        capabilities: { ...CLAUDE_BACKGROUND_CAPABILITIES },
+      }),
+    ],
+  });
+  try {
+    const res = await h.app.inject({
+      method: "POST",
+      url: API + "/sessions/" + encodeURIComponent("claude:sess-bg") + "/attach",
+    });
+    assert.equal(res.statusCode, 200, res.body);
+    assert.deepEqual(res.json<{ attached: boolean; agent: string }>(), {
+      attached: true,
+      sessionKey: "claude:sess-bg",
+      agent: "claude",
+    });
+    assert.deepEqual(claude.calls, ["attach"]);
+  } finally {
+    await h.close();
+  }
+});
+
+test("POST /attach：codex / pi（caps.attach=false）→ 422 E_CAP_UNSUPPORTED，且不调用 driver.attach", async () => {
+  const codex = makeDriver("codex", CODEX_CAPABILITIES);
+  const pi = makeDriver("pi", capsOf("pi"));
+  const h = await makeHarness({
+    drivers: [{ driver: codex.driver }, { driver: pi.driver }],
+    seed: [sessionRef("codex", "sess-codex"), sessionRef("pi", "sess-pi")],
+  });
+  try {
+    for (const key of ["codex:sess-codex", "pi:sess-pi"]) {
+      const res = await h.app.inject({
+        method: "POST",
+        url: API + "/sessions/" + encodeURIComponent(key) + "/attach",
+      });
+      assert.equal(res.statusCode, 422, res.body);
+      const body = res.json<ErrorEnvelope>();
+      assert.equal(body.error.code, "E_CAP_UNSUPPORTED");
+      assert.deepEqual(body.error.details, { agent: key.split(":")[0], cap: "attach" });
+    }
+    assert.deepEqual(codex.calls, [], "codex 不得调用 attach");
+    assert.deepEqual(pi.calls, [], "pi 不得调用 attach");
+  } finally {
+    await h.close();
+  }
+});
+
+test("POST /attach：claude 交互式会话（caps.attach=false）同样 422，不产生 driver 调用", async () => {
+  const claude = makeDriver("claude", CLAUDE_CAPABILITIES);
+  const h = await makeHarness({
+    drivers: [{ driver: claude.driver }],
+    seed: [sessionRef("claude", "sess-fg")],
+  });
+  try {
+    const res = await h.app.inject({
+      method: "POST",
+      url: API + "/sessions/" + encodeURIComponent("claude:sess-fg") + "/attach",
+    });
+    assert.equal(res.statusCode, 422, res.body);
+    assert.equal(res.json<ErrorEnvelope>().error.code, "E_CAP_UNSUPPORTED");
+    assert.deepEqual(claude.calls, []);
+  } finally {
+    await h.close();
+  }
+});
+
+test("POST /attach：会话不存在 → 404 E_SESSION_NOT_FOUND", async () => {
+  const claude = makeDriver("claude", CLAUDE_BACKGROUND_CAPABILITIES);
+  const h = await makeHarness({ drivers: [{ driver: claude.driver }] });
+  try {
+    const res = await h.app.inject({
+      method: "POST",
+      url: API + "/sessions/" + encodeURIComponent("claude:missing") + "/attach",
+    });
+    assert.equal(res.statusCode, 404, res.body);
+    assert.equal(res.json<ErrorEnvelope>().error.code, "E_SESSION_NOT_FOUND");
+    assert.deepEqual(claude.calls, []);
+  } finally {
+    await h.close();
   }
 });
