@@ -38,14 +38,14 @@
 
 ## 文档
 
-- `docs/开发顺序与阶段门禁.md`：Gate 0.5-B 七条勾选并写结论。
+- `docs/开发顺序与阶段门禁.md`：Gate 0.5-B 七条勾选并写结论（注：该勾选在复审修复提交 `5f8243a` 实际落盘；本记录最初写于 `795e0a7`，当时尚未落盘）。
 - `docs/evidence/phase-0.5b-gate.md`：更新测试数字、E2E 行号、Gate #3/#5 的 Pi 可用性条件、Gate #6 拆分 transcript 与事件流、record-enumeration 实际拆分说明。
 - `docs/specs/2026-11-16-phase-0.5b-codex-pi.md` §10.4：说明记录枚举证据实际拆成 `codex-records.md` + `pi-records.md`。
 
 ## 验证
 
 - `pnpm -r build`：三包 Done。
-- control-plane：341 tests / 340 pass / 1 skip / 0 fail；extension：53 pass。
+- control-plane：341 tests / 340 pass / 1 skip / 0 fail；extension：53 pass。（本记录是 B08 时快照；复审后最终数字为 347 / 346 / 1 skip / 0 fail，见 `review-fixes-final-2026-11-16.md`。）
 - 三 Agent E2E：PASS（65 行，`docs/evidence/phase-0.5b/e2e-three-agents.jsonl`）。
 - Claude 严格回归两轮：均 exit 0 / PASS（`claude-regression-run1/2.jsonl`）。
 
