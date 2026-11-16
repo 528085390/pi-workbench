@@ -14,6 +14,7 @@ import type { CodexWriteAction } from "./agents/codex-driver.ts";
 import { PiDriver, resolvePiPackageDir } from "./agents/pi-driver.ts";
 import { AgentRouter } from "./agents/router.ts";
 import type { AgentDriver } from "./agents/types.ts";
+import { AUDIT_RETENTION_DAYS, AuditStore } from "./audit.ts";
 import { reconcileSessions } from "./boot-recovery.ts";
 import type { RecoveryReport } from "./boot-recovery.ts";
 import { hideWindowsChildProcesses } from "./child-process.ts";
@@ -316,6 +317,21 @@ export async function main(): Promise<void> {
   }
   const { db, store, leases, registry, restored, recovery, checkpoints, dispatches, cursors, instances } = boot;
 
+  // C03 / spec §7.4：审计只追加；启动先按 30 天保留期清一次，失败只告警不阻断启动。
+  const audit = new AuditStore(db, { instanceId: instances.id ?? "unknown" });
+  try {
+    const pruned = audit.prune(AUDIT_RETENTION_DAYS);
+    console.log(
+      "[pi-workbenchd] 审计日志清理完成：删除 " +
+        String(pruned) +
+        " 条（保留 " +
+        String(AUDIT_RETENTION_DAYS) +
+        " 天）",
+    );
+  } catch (err) {
+    console.error("[pi-workbenchd] 审计日志清理失败（启动继续）：" + errorMessage(err));
+  }
+
   // C02：dispatch 幂等记录保留 24h；启动先扫一次，之后每小时扫一次（含超期 reserved）。
   const sweepDispatches = (): number => {
     const retained = dispatches.pruneRetained(DISPATCH_RETENTION_MS);
@@ -472,6 +488,7 @@ export async function main(): Promise<void> {
       agentStatuses: refreshAgentStatuses,
       checkpoints,
       cursors,
+      audit,
       pipeline,
     });
   } catch (err) {

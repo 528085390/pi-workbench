@@ -25,6 +25,7 @@ import type { FastifyError, FastifyInstance, FastifyRequest } from "fastify";
 import type { AdapterUpdate, AgentAdapter } from "./adapters/types.ts";
 import type { AgentRouter } from "./agents/router.ts";
 import type { AgentStatus } from "./agents/types.ts";
+import type { AuditStore } from "./audit.ts";
 import { capsOf, CLAUDE_CAPABILITIES } from "./capabilities.ts";
 import type { CheckpointStore } from "./checkpoints.ts";
 import type { Config } from "./config.ts";
@@ -80,6 +81,11 @@ export type ServerDeps = {
   checkpoints: CheckpointStore;
   /** 每读者未读游标（spec §6.5） */
   cursors: ReadCursorStore;
+  /**
+   * C03 审计日志：写操作留痕 + GET /audit 查询。
+   * 缺省（单测 / 裁剪构建）时 /audit 返回空数组，业务写操作照常进行。
+   */
+  audit?: AuditStore;
   /**
    * per-session 写队列（C02）。缺省时由 createServer 自建（单实例一个）；
    * 生产装配可显式注入以便共享 / 观测。
@@ -183,6 +189,7 @@ const ROUTE_HANDBACK = "POST /sessions/:key/handback";
 const ROUTE_DISPATCH = "POST /dispatch";
 const ROUTE_UNREAD = "GET /sessions/:key/unread";
 const ROUTE_READ = "POST /sessions/:key/read";
+const ROUTE_AUDIT = "GET /audit";
 
 /** GET /agents 的缓存窗口（spec §11.1：30s 内不重复探测） */
 export const AGENT_STATUS_CACHE_MS = 30_000;
@@ -203,6 +210,25 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
   /** C02：同一 sessionKey 的写操作串行；不同 sessionKey 各自并行。 */
   const writeQueue = deps.writeQueue ?? new SessionWriteQueue();
   const runWrite = <T>(key: string, fn: () => Promise<T>): Promise<T> => writeQueue.run(key, fn);
+  /** C03：审计是旁路 —— 未注入或写入失败都不影响业务（AuditStore.record 自身吞异常）。 */
+  const recordAudit = (entry: Parameters<AuditStore["record"]>[0]): void => {
+    deps.audit?.record(entry);
+  };
+  const errorCodeOf = (err: unknown): string => (isWorkbenchError(err) ? err.code : INTERNAL_ERROR_CODE);
+  /** handoff 的止损错误在 details.action 里带 cancel / close / handoff；其它错误按 fallback 记。 */
+  const auditStepOf = (err: unknown, fallback: string): string => {
+    if (!isWorkbenchError(err)) {
+      return fallback;
+    }
+    const details = err.details;
+    if (typeof details === "object" && details !== null && "action" in details) {
+      const action = (details as { action?: unknown }).action;
+      if (typeof action === "string" && action.length > 0) {
+        return action;
+      }
+    }
+    return fallback;
+  };
   /**
    * 统一读路径（0.5-B B06）：按会话 agent 选择 transcript parser。
    * 0.5-A 注入的 ServerTranscriptReader 仍是 path-only 旧签名，优先调用它，
@@ -368,6 +394,32 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
 
       // 0.5-B B01-b：有注册表时由 router.list() 动态生成；缺省保留 0.5-A 的 claude-only 描述
       api.get("/agents", async () => await currentAgents());
+
+      /**
+       * C03 审计查询：GET /audit?sessionKey=&since=&limit=
+       * 按 id 升序返回 { items }；limit 默认 100、上限 1000（截断由 AuditStore 负责）。
+       */
+      api.get("/audit", async (request) => {
+        const query = queryOf(request);
+        const sessionKey = optionalString(query, "sessionKey", ROUTE_AUDIT);
+        const since = optionalString(query, "since", ROUTE_AUDIT);
+        const rawLimit = query["limit"];
+        let limit: number | undefined;
+        if (rawLimit !== undefined) {
+          if (typeof rawLimit !== "string" || !/^\d+$/.test(rawLimit.trim()) || Number(rawLimit) <= 0) {
+            throw new WorkbenchError("E_BAD_REQUEST", ROUTE_AUDIT + " 的 limit 必须是正整数", { limit: rawLimit });
+          }
+          limit = Number(rawLimit);
+        }
+        return {
+          items:
+            deps.audit?.list({
+              ...(sessionKey === undefined ? {} : { sessionKey }),
+              ...(since === undefined ? {} : { since }),
+              ...(limit === undefined ? {} : { limit }),
+            }) ?? [],
+        };
+      });
 
       // 0.5-B B08（评审 M4）：发现层必须有产品出口，否则用户无法让 daemon 认识既有原生会话。
       // GET /sessions/discover?agent=codex&cwd=...&limit=... → 发现并登记（幂等 upsert），返回登记后的 SessionRef。
@@ -627,7 +679,30 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         const summary = requireString(body, "summary", ROUTE_CHECKPOINT);
         const nextStep = optionalString(body, "nextStep", ROUTE_CHECKPOINT) ?? "";
         const touchedFiles = optionalStringArray(body, "touchedFiles", ROUTE_CHECKPOINT) ?? [];
-        return runWrite(key, async () => deps.engine.checkpoint(key, { summary, touchedFiles, nextStep }, clientId));
+        return await runWrite(key, async () => {
+          try {
+            const checkpoint = await deps.engine.checkpoint(key, { summary, touchedFiles, nextStep }, clientId);
+            recordAudit({
+              actor: clientId,
+              action: "checkpoint",
+              sessionKey: key,
+              outcome: "ok",
+              errorCode: null,
+              detail: { cursor: checkpoint?.transcriptCursor ?? null, createdAt: checkpoint?.createdAt ?? null },
+            });
+            return checkpoint;
+          } catch (err) {
+            recordAudit({
+              actor: clientId,
+              action: "checkpoint",
+              sessionKey: key,
+              outcome: "error",
+              errorCode: errorCodeOf(err),
+              detail: { step: "checkpoint" },
+            });
+            throw err;
+          }
+        });
       });
 
       api.get("/sessions/:key/checkpoint", async (request) => {
@@ -654,7 +729,30 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
           summary === undefined && nextStep === undefined && touchedFiles === undefined
             ? undefined
             : { summary: summary ?? "", touchedFiles: touchedFiles ?? [], nextStep: nextStep ?? "" };
-        return await runWrite(key, () => deps.engine.handoff(key, to, clientId, input));
+        return await runWrite(key, async () => {
+          try {
+            const result = await deps.engine.handoff(key, to, clientId, input);
+            recordAudit({
+              actor: clientId,
+              action: "handoff",
+              sessionKey: key,
+              outcome: "ok",
+              errorCode: null,
+              detail: { to, mode: result.mode, cursor: result.checkpoint?.transcriptCursor ?? null },
+            });
+            return result;
+          } catch (err) {
+            recordAudit({
+              actor: clientId,
+              action: "handoff",
+              sessionKey: key,
+              outcome: "error",
+              errorCode: errorCodeOf(err),
+              detail: { to, step: auditStepOf(err, "handoff") },
+            });
+            throw err;
+          }
+        });
       });
 
       api.post("/sessions/:key/handback", async (request) => {
@@ -662,7 +760,30 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         requireSession(deps.registry, key);
         const body = bodyOf(request.body, ROUTE_HANDBACK);
         const clientId = requireString(body, "clientId", ROUTE_HANDBACK);
-        const result = await runWrite(key, () => deps.engine.handback(key, clientId));
+        const result = await runWrite(key, async () => {
+          try {
+            const resumed = await deps.engine.handback(key, clientId);
+            recordAudit({
+              actor: clientId,
+              action: "handback",
+              sessionKey: key,
+              outcome: "ok",
+              errorCode: null,
+              detail: { resumed: resumed.resumed, deltaSummaryLength: resumed.deltaSummary?.length ?? 0 },
+            });
+            return resumed;
+          } catch (err) {
+            recordAudit({
+              actor: clientId,
+              action: "handback",
+              sessionKey: key,
+              outcome: "error",
+              errorCode: errorCodeOf(err),
+              detail: { step: "resume" },
+            });
+            throw err;
+          }
+        });
         const session = deps.registry.get(key);
         if (session !== null) {
           attachPipeline(session);
