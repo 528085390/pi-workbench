@@ -110,7 +110,8 @@ CREATE TABLE IF NOT EXISTS dispatches (
     }
 
     if (current < 3) {
-      // v3：每读者游标（spec §6.5）。unread = 会话最新 seq - last_read_seq。
+      // v3：每读者游标（spec §6.5）。游标是 transcript 字节偏移字符串，
+      // unread = 该游标之后还剩几条消息（不是事件 seq 之差：事件与消息不是一一对应）。
       db.exec(`
 CREATE TABLE IF NOT EXISTS read_cursors (
   session_key TEXT NOT NULL,

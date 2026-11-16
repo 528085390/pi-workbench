@@ -1402,11 +1402,19 @@ test("读语义：GET /unread 默认只读不推进（peek），ack=1 才推进�
   try {
     const peek = await h.app.inject({ method: "GET", url: SESSIONS + "/unread?clientId=pi:1&limit=2" });
     assert.equal(peek.statusCode, 200);
-    const peeked = peek.json<{ messages: unknown[]; nextCursor: string; lastReadCursor: string; unread: number; acked: boolean }>();
+    const peeked = peek.json<{
+      messages: unknown[];
+      nextCursor: string;
+      lastReadCursor: string;
+      unread: number;
+      pageCount: number;
+      acked: boolean;
+    }>();
     assert.equal(peeked.messages.length, 2);
     assert.equal(peeked.nextCursor, "2");
     assert.equal(peeked.lastReadCursor, "0", "peek 不推进");
-    assert.equal(peeked.unread, 2);
+    assert.equal(peeked.unread, 3, "I1：unread 是剩余总数（5-2），不是本页 2 条");
+    assert.equal(peeked.pageCount, 2, "本页条数单列");
     assert.equal(peeked.acked, false);
 
     const stillUnread = await h.app.inject({ method: "GET", url: API + "/sessions?clientId=pi:1" });
@@ -1470,6 +1478,43 @@ test("读语义：POST /read 不给 cursor 即读到底；显式 cursor 只进�
   }
 });
 
+test("读语义：>200 条未读不被默认分页上限截断（B1：未读总数 / 读到底 / 分页剩余）", async () => {
+  // 真实 transcript 默认 limit=200（transcript/claude.ts DEFAULT_TRANSCRIPT_LIMIT）：
+  // 250 条时必须报 250，而不是封顶 200；POST /read 也必须推进到 250。
+  const LONG = Array.from({ length: 250 }, (_, i) => ({
+    id: "L" + String(i),
+    role: "assistant" as const,
+    kind: "text" as const,
+    text: "长会话消息 " + String(i),
+    ts: "2026-11-16T00:00:00.000Z",
+  }));
+  const readLong: ServerTranscriptReader = (_path, cursor, limit) => {
+    const from = Number(cursor ?? "0");
+    const rest = LONG.slice(from);
+    const page = limit === undefined || limit === Number.POSITIVE_INFINITY ? rest : rest.slice(0, limit);
+    return { messages: page, nextCursor: String(from + page.length), pending: false };
+  };
+  const h = await makeHarness({ readTranscript: readLong });
+  try {
+    const list = await h.app.inject({ method: "GET", url: API + "/sessions?clientId=pi:1" });
+    assert.equal(list.json<{ unread: number }[]>()[0]?.unread, 250, "未读总数不能被 200 截断");
+
+    const peek = await h.app.inject({ method: "GET", url: SESSIONS + "/unread?clientId=pi:1&limit=2" });
+    const peeked = peek.json<{ messages: unknown[]; unread: number; pageCount: number }>();
+    assert.equal(peeked.messages.length, 2);
+    assert.equal(peeked.pageCount, 2);
+    assert.equal(peeked.unread, 248, "分页只看 2 条，剩余仍是 248");
+
+    const readAll = await h.app.inject({ method: "POST", url: SESSIONS + "/read", payload: { clientId: "pi:1" } });
+    assert.equal(readAll.json<{ lastReadCursor: string }>().lastReadCursor, "250", "读到底要跨过 200 上限");
+
+    const after = await h.app.inject({ method: "GET", url: API + "/sessions?clientId=pi:1" });
+    assert.equal(after.json<{ unread: number }[]>()[0]?.unread, 0);
+  } finally {
+    await h.close();
+  }
+});
+
 test("读语义：缺 clientId / 非法 ack → 400 E_BAD_REQUEST", async () => {
   const h = await makeHarness({ readTranscript: readFixed });
   try {
@@ -1483,6 +1528,14 @@ test("读语义：缺 clientId / 非法 ack → 400 E_BAD_REQUEST", async () => 
 
     const noBody = await h.app.inject({ method: "POST", url: SESSIONS + "/read", payload: {} });
     assert.equal(noBody.statusCode, 400);
+
+    const badCursor = await h.app.inject({
+      method: "POST",
+      url: SESSIONS + "/read",
+      payload: { clientId: "pi:1", cursor: "12abc" },
+    });
+    assert.equal(badCursor.statusCode, 400, "游标必须是非负整数字符串");
+    assert.equal(badCursor.json<ErrorEnvelope>().error.code, "E_BAD_REQUEST");
 
     const unknown = await h.app.inject({ method: "GET", url: API + "/sessions/claude:nope/unread?clientId=pi:1" });
     assert.equal(unknown.statusCode, 404);

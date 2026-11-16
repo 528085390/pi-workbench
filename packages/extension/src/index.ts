@@ -20,6 +20,7 @@ export const WORKBENCH_TOOL_NAMES = [
   "cp_inject",
   "cp_interrupt",
   "cp_handoff",
+  "cp_handback",
   "cp_checkpoint",
   "cp_lease",
 ] as const;
@@ -202,7 +203,8 @@ export type WorkbenchClient = {
   interrupt(key: string): Promise<InterruptResult>;
   checkpoint(key: string, input: CheckpointInput): Promise<Checkpoint>;
   handoff(key: string, to: "human" | "pi", input?: CheckpointInput): Promise<HandoffResult>;
-  handback(key: string): Promise<HandbackResult>;
+  /** 交回控制权；缺省用本 client 身份（服务端认 handoff- 派生前缀，见 takeover.handback） */
+  handback(key: string, clientId?: string): Promise<HandbackResult>;
   /**
    * 取/续/还租约（A09 补）。写操作（inject/interrupt/checkpoint/handoff）都要求
    * 同一 `clientId` 先 acquire；没有这个方法，Pi 侧工具在真实宿主里全是 E_NO_LEASE。
@@ -277,7 +279,9 @@ export function createWorkbenchClient(options: WorkbenchClientOptions = {}): Wor
   // 想跨进程保持同一"读者/租约持有人"（例如 Pi 常驻但每次重启都换 pid）就设环境变量。
   const clientId = options.clientId ?? process.env["PI_WORKBENCH_CLIENT_ID"] ?? `pi:${process.pid}`;
   const explicitToken = options.authToken ?? options.token;
-  const envToken = process.env["PI_WORKBENCH_TOKEN"];
+  // C2：daemon 侧历史上认 PI_WORKBENCH_AUTH_TOKEN（config.ts 的旧名），客户端只读 PI_WORKBENCH_TOKEN
+  // → 用旧名启动 daemon 时插件静默无鉴权。两个名字都认，主名仍是 PI_WORKBENCH_TOKEN。
+  const envToken = process.env["PI_WORKBENCH_TOKEN"] ?? process.env["PI_WORKBENCH_AUTH_TOKEN"];
   const authToken = explicitToken ?? envToken ?? null;
   const doFetch: typeof fetch = options.fetch ?? fetch;
 
@@ -375,8 +379,8 @@ export function createWorkbenchClient(options: WorkbenchClientOptions = {}): Wor
       }
       return (await call("POST", sessionPath(key, "/handoff"), body)) as HandoffResult;
     },
-    handback: async (key) =>
-      (await call("POST", sessionPath(key, "/handback"), { clientId })) as HandbackResult,
+    handback: async (key, asClientId) =>
+      (await call("POST", sessionPath(key, "/handback"), { clientId: asClientId ?? clientId })) as HandbackResult,
     lease: async (key, action, options) => {
       const body: Record<string, unknown> = { action, clientId };
       if (options?.driver !== undefined) body["driver"] = options.driver;
@@ -384,6 +388,19 @@ export function createWorkbenchClient(options: WorkbenchClientOptions = {}): Wor
       return (await call("POST", sessionPath(key, "/lease"), body)) as LeaseResult;
     },
   };
+}
+
+/**
+ * 工具执行包装（B2）：只有「LLM 真的调了 cp_* 工具」才把连击计数清零。
+ * 不能放进 WorkbenchClient 的 beforeCall —— 通知器投递前复核也走那个 client，
+ * 每次复核都清一次，连击上限永远不触发（评审实测 6 次发 6 条）。
+ */
+export function wrapToolExecute(
+  activity: { noteToolActivity(): void } | undefined,
+  run: () => Promise<unknown>,
+): Promise<unknown> {
+  activity?.noteToolActivity();
+  return run();
 }
 
 /** 工具层自己的入参错误（区别于 HTTP 错误码） */
@@ -407,6 +424,11 @@ export function formatToolError(error: unknown): string {
   }
   if (error instanceof ToolInputError) {
     return error.code + ": " + error.message;
+  }
+  // 非 HTTP 的领域错误（如 DaemonDownError）：带 E_* code 就原样显示，别糊成 E_INTERNAL
+  const code = isRecord(error) ? error["code"] : undefined;
+  if (error instanceof Error && typeof code === "string" && /^E_[A-Z_]+$/.test(code)) {
+    return code + ": " + error.message.replace(/^E_[A-Z_]+: /, "");
   }
   if (error instanceof Error) {
     return "E_INTERNAL: " + error.message;
@@ -635,6 +657,26 @@ export function registerWorkbenchTools(
         return (
           "handoff " + key + " to " + to + " (" + result.mode + "); 接管命令：" + result.command.join(" ")
         );
+      } catch (error) {
+        return formatToolError(error);
+      }
+    },
+  });
+
+  api.registerTool("cp_handback", {
+    description: "把人类接管的会话交回 Pi：恢复 adapter 会话、返回人类这期间的新增内容摘要，租约回到 Pi。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        key: { type: "string", description: "会话 key（必填）" },
+      },
+      required: ["key"],
+    },
+    handler: async (input: unknown): Promise<string> => {
+      try {
+        const key = requireField(input, "key");
+        const result = await client.handback(key);
+        return "handback " + key + " (resumed=" + String(result.resumed) + "); 增量：\n" + result.deltaSummary;
       } catch (error) {
         return formatToolError(error);
       }

@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 
 import {
   createWorkbenchClient,
+  formatToolError,
   registerWorkbenchTools,
+  wrapToolExecute,
   WORKBENCH_TOOL_NAMES,
   WorkbenchHttpError,
   type PiToolApi,
@@ -230,12 +232,12 @@ function fakeApi(): { api: PiToolApi; tools: Array<{ name: string; def: PiToolDe
   };
 }
 
-test("registerWorkbenchTools 只注册 8 个 cp_* 工具，各带 description/inputSchema/handler", () => {
+test("registerWorkbenchTools 只注册 9 个 cp_* 工具，各带 description/inputSchema/handler", () => {
   const { api, tools } = fakeApi();
   const { fetchImpl } = recorder();
   registerWorkbenchTools(api, { baseUrl: "http://h:1", fetch: fetchImpl });
 
-  assert.equal(tools.length, 8);
+  assert.equal(tools.length, 9);
   assert.deepEqual(
     tools.map((tool) => tool.name),
     [...WORKBENCH_TOOL_NAMES],
@@ -247,6 +249,40 @@ test("registerWorkbenchTools 只注册 8 个 cp_* 工具，各带 description/in
     assert.equal(typeof tool.def.inputSchema, "object");
     assert.equal(typeof tool.def.handler, "function");
   }
+});
+
+test("cp_handback 以本 client 身份打到 /handback 并回显增量摘要（I4）", async () => {
+  const { api, tools } = fakeApi();
+  const { calls, fetchImpl } = recorder(() => ({
+    body: { resumed: true, deltaSummary: "user: 我改好了\nassistant: 收到" },
+  }));
+  registerWorkbenchTools(api, { baseUrl: "http://h:1", clientId: "pi:7", fetch: fetchImpl });
+
+  const handback = tools.find((tool) => tool.name === "cp_handback");
+  assert.ok(handback !== undefined);
+  const out = String(await handback.def.handler({ key: "claude:abc" }));
+  assert.match(out, /handback claude:abc \(resumed=true\)/);
+  assert.match(out, /receiving|收到/);
+  assert.equal(calls[0]?.url, "http://h:1/api/cp/sessions/claude%3Aabc/handback");
+  assert.deepEqual(calls[0]?.body, { clientId: "pi:7" });
+});
+
+test("wrapToolExecute：工具执行前清连击；不执行就不清（B2：beforeCall 不再清账）", async () => {
+  let notes = 0;
+  const activity = { noteToolActivity: () => void (notes += 1) };
+  const out = await wrapToolExecute(activity, async () => "ok");
+  assert.equal(out, "ok");
+  assert.equal(notes, 1);
+
+  // 没有 activity（插件未建通知器）也不该炸
+  assert.equal(await wrapToolExecute(undefined, async () => 1), 1);
+});
+
+test("formatToolError：带 E_* code 的领域错误原样透出（I3 的 E_DAEMON_DOWN）", () => {
+  class Fake extends Error {
+    readonly code = "E_DAEMON_DOWN";
+  }
+  assert.equal(formatToolError(new Fake("E_DAEMON_DOWN: 找不到控制面入口 x")), "E_DAEMON_DOWN: 找不到控制面入口 x");
 });
 
 test("cp_lease 三种 action 打到 /lease 并带 clientId/driver/ttlMs", async () => {
@@ -269,6 +305,8 @@ test("cp_lease 三种 action 打到 /lease 并带 clientId/driver/ttlMs", async 
 
   const lease = tools.find((tool) => tool.name === "cp_lease");
   assert.ok(lease !== undefined, "必须注册 cp_lease —— 否则 Pi 侧写操作全 E_NO_LEASE");
+  const handback = tools.find((tool) => tool.name === "cp_handback");
+  assert.ok(handback !== undefined, "必须注册 cp_handback —— 否则人类接管后 Pi 交不回来");
 
   const acquired = await lease.def.handler({ key: "claude:abc", action: "acquire", ttlMs: 60000 });
   assert.equal(typeof acquired, "string");

@@ -80,6 +80,21 @@ test("实时事件入队，flush 发送一条指针消息", async () => {
   assert.equal(notifier.consecutiveWakes, 1);
 });
 
+test("I2：sendEnabled=false 只维护徽标、不发消息（PI_WORKBENCH_NOTIFY=0 不该连徽标一起关）", async () => {
+  const { sent, statuses, sink } = recorder();
+  const notifier = new TurnNotifier({
+    sink,
+    now: () => NOW,
+    sendEnabled: false,
+    listSessions: async () => [session({ key: "claude:a", unread: 4 })],
+  });
+  notifier.handleEvent({ seq: 9, sessionKey: "claude:a", type: "state_update", payload: { status: "idle" }, ts: LATER });
+  await notifier.flush();
+  assert.equal(sent.length, 0, "静音模式不发对话消息");
+  assert.deepEqual(notifier.pendingKeys, [], "静音也不攒着");
+  assert.ok(statuses.includes("pi-workbench: 4 未读"), "徽标照常反映未读");
+});
+
 test("投递前复核：未读已清零 → 静默丢弃", async () => {
   const { sent, sink } = recorder();
   const notifier = new TurnNotifier({

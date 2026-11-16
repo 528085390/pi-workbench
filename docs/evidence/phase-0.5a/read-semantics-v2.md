@@ -76,5 +76,5 @@ Pi 插件（`pi -p`，`PI_WORKBENCH_URL=http://127.0.0.1:7341`，已 `pi install
 
 - `unread` 每次现数（读 transcript 游标之后的剩余部分）。会话很多 + transcript 很大时是 O(尾部)，量级可接受（200 KB 级毫秒）；若将来成为瓶颈，可加 `message_count` 冗余列。
 - Pi 身份默认 `pi:<pid>`：每次 `pi -p` 是新 pid = 新读者。想跨进程保持同一读者/租约身份，设 `PI_WORKBENCH_CLIENT_ID`。
-- 主动推送（回合结束/needs-input 时 `pi.sendMessage` + 底栏徽标）尚未实现：目前是"未读事实 + 按需读"，Pi 想提醒自己再拉一次列表即可。
+- 主动推送已实现（spec §6.6，见 `docs/evidence/phase-0.5a/event-wake.md`）：回合结束/needs-input 时 `pi.sendMessage` + 底栏徽标；本节只描述读语义本身。
 - 列表接口未带 clientId 时不算未读，保持 v1 形状（兼容旧调用方）。

@@ -26,13 +26,14 @@ import type { AgentAdapter } from "./adapters/types.ts";
 import { CLAUDE_CAPABILITIES } from "./capabilities.ts";
 import type { CheckpointStore } from "./checkpoints.ts";
 import type { Config } from "./config.ts";
+import { SCHEMA_VERSION } from "./db.ts";
 import type { ReadCursorStore } from "./cursors.ts";
 import { isWorkbenchError, WorkbenchError } from "./errors.ts";
 import type { WorkbenchErrorCode } from "./errors.ts";
 import type { EventStore } from "./events.ts";
 import type { LeaseManager } from "./lease.ts";
 import type { SessionFilter, SessionRegistry } from "./registry.ts";
-import { readClaudeTranscript } from "./transcript/claude.ts";
+import { readClaudeTranscript, readClaudeTranscriptToEnd } from "./transcript/claude.ts";
 import type { UnifiedMessage } from "./transcript/claude.ts";
 import type { TakeoverEngine } from "./takeover.ts";
 
@@ -98,6 +99,8 @@ type HealthBody = {
   version: string;
   pid: number;
   uptimeMs: number;
+  /** C1：客户端（Pi 插件）据此拒绝连旧 daemon，别让插件跑在缺路由的版本上 */
+  schemaVersion: number;
 };
 
 type AgentDescriptor = {
@@ -171,6 +174,13 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
 
   const { config } = deps;
   const readTranscript = deps.readTranscript ?? defaultReader;
+  /**
+   * "还剩几条"专用读取（B1）：limit=Infinity，读到 EOF。
+   * viewOf / POST /read 过去漏传 limit，被生产默认 200 截断 → unread 封顶、/read 读不完。
+   * 走注入的 reader，测试里的假 reader 也要按"读到底"返回。
+   */
+  const readToEnd = (path: string, cursor: string): { messages: UnifiedMessage[]; nextCursor: string } =>
+    readTranscript(path, cursor, Number.POSITIVE_INFINITY);
   const startedAt = Date.now();
 
   const app = Fastify({ logger: false });
@@ -187,7 +197,8 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
     let unread = 0;
     if (path !== undefined && path.length > 0) {
       try {
-        unread = readTranscript(path, lastReadCursor).messages.length;
+        // B1：必须是"读到 EOF 的消息数"，不能受分页默认上限影响
+        unread = readToEnd(path, lastReadCursor).messages.length;
       } catch {
         unread = 0;
       }
@@ -202,6 +213,7 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
     version: WORKBENCH_VERSION,
     pid: process.pid,
     uptimeMs: Date.now() - startedAt,
+    schemaVersion: SCHEMA_VERSION,
   });
 
   // T1 兼容：裸 /health（CLI probeHealth 依赖 {ok,pid,version}）
@@ -315,11 +327,15 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         if (ack) {
           deps.cursors.set(key, clientId, page.nextCursor);
         }
+        // I1：unread 是"还剩几条"，不是"本页几条"——分页 limit 不该改变未读口径
+        const remaining =
+          path === undefined || path.length === 0 ? 0 : readToEnd(path, page.nextCursor).messages.length;
         return {
           messages: page.messages,
           nextCursor: page.nextCursor,
           lastReadCursor: ack ? page.nextCursor : lastReadCursor,
-          unread: page.messages.length,
+          unread: remaining,
+          pageCount: page.messages.length,
           awaiting: session.status === "needs-input",
           acked: ack,
         };
@@ -331,14 +347,15 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         const session = requireSession(deps.registry, key);
         const body = bodyOf(request.body, ROUTE_READ);
         const clientId = requireString(body, "clientId", ROUTE_READ);
-        const explicit = optionalString(body, "cursor", ROUTE_READ);
+        const explicit = optionalCursor(body, "cursor", ROUTE_READ);
         let target = explicit;
         if (target === undefined) {
           const path = session.transcriptPath;
+          // B1：不给游标 = 读到 EOF（全部已读），不能用分页默认上限
           target =
             path === undefined || path.length === 0
               ? deps.cursors.cursorOf(key, clientId)
-              : readTranscript(path, deps.cursors.cursorOf(key, clientId)).nextCursor;
+              : readToEnd(path, deps.cursors.cursorOf(key, clientId)).nextCursor;
         }
         const cursor = deps.cursors.set(key, clientId, target);
         return { sessionKey: key, clientId: cursor.clientId, lastReadCursor: cursor.lastReadCursor, updatedAt: cursor.updatedAt };
@@ -625,6 +642,18 @@ function requireString(source: JsonRecord, field: string, route: string): string
     throw new WorkbenchError("E_BAD_REQUEST", route + " 缺少必填字段 " + field, { route, field });
   }
   return value;
+}
+
+/** transcript 游标 = 非负整数字符串（字节偏移）；别的形状直接 400，别让脏游标落库 */
+function optionalCursor(source: JsonRecord, field: string, route: string): string | undefined {
+  const raw = optionalString(source, field, route);
+  if (raw === undefined) {
+    return undefined;
+  }
+  if (!/^\d+$/.test(raw)) {
+    throw new WorkbenchError("E_BAD_REQUEST", route + " 的 " + field + " 必须是非负整数字符串", { [field]: raw });
+  }
+  return raw;
 }
 
 function optionalString(source: JsonRecord, field: string, route: string): string | undefined {

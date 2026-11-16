@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -107,6 +109,73 @@ test("入口文件不存在 → 立刻报错（先 pnpm -r build），不白等"
     /E_DAEMON_DOWN: 找不到控制面入口/,
   );
   assert.equal(calls.length, 0);
+});
+
+test("C3：端口以 URL 为准（环境里残留 PI_WORKBENCH_PORT=7331 也不能起错端口）", async () => {
+  const calls: SpawnCall[] = [];
+  await ensureDaemon({
+    baseUrl: "http://127.0.0.1:7342",
+    entry: entryFile(),
+    pollMs: 1,
+    timeoutMs: 1000,
+    env: { PI_WORKBENCH_PORT: "7331" },
+    probe: (() => {
+      let n = 0;
+      return async () => {
+        n += 1;
+        return n >= 2;
+      };
+    })(),
+    spawnImpl: fakeSpawn(calls),
+  });
+  const env = calls[0]?.options["env"] as Record<string, string>;
+  assert.equal(env["PI_WORKBENCH_PORT"], "7342", "探 7342 就必须起 7342");
+});
+
+test("C1：健康但 schema 版本过旧 → 报 E_DAEMON_DOWN，不 spawn、不静默半残", async () => {
+  const server = createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, pid: 1, schemaVersion: 2 }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = String((server.address() as AddressInfo).port);
+  const calls: SpawnCall[] = [];
+  try {
+    await assert.rejects(
+      () =>
+        ensureDaemon({
+          baseUrl: "http://127.0.0.1:" + port,
+          entry: entryFile(),
+          spawnImpl: fakeSpawn(calls),
+        }),
+      (err: unknown) =>
+        err instanceof Error && err.message.includes("控制面版本过旧") && (err as { code?: string }).code === "E_DAEMON_DOWN",
+    );
+    assert.equal(calls.length, 0, "旧 daemon 还在跑，不能再起一个");
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("C1：健康且 schema 版本够新 → 直接用，started=false", async () => {
+  const server = createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, pid: 1, schemaVersion: 3 }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = String((server.address() as AddressInfo).port);
+  const calls: SpawnCall[] = [];
+  try {
+    const result = await ensureDaemon({
+      baseUrl: "http://127.0.0.1:" + port,
+      entry: entryFile(),
+      spawnImpl: fakeSpawn(calls),
+    });
+    assert.equal(result.started, false);
+    assert.equal(calls.length, 0);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
 });
 
 test("isLoopbackUrl：127/8、::1、localhost 算回环，其余不算", () => {

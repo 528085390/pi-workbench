@@ -558,6 +558,43 @@ test("handback: resume 同一 nativeId + 从 checkpoint 游标起读 transcript 
   }
 });
 
+test("handback: Pi 用自身 clientId（不带 handoff- 前缀）也能交回（I4）", async () => {
+  // 评审 I4：handoff 建的租约是 "handoff-pi-1"，Pi 扩展 handback 发的是自己的 "pi-1"。
+  // 修复前 assertWriter 直接比 clientId → E_NO_LEASE，cp_handback 永远失败。
+  const h = fresh();
+  try {
+    h.registry.upsert(makeRef({ status: "running" }));
+    h.leases.acquire(KEY, "pi", "pi-1");
+    await h.engine.handoff(KEY, "human", "pi-1", { summary: "交人", touchedFiles: [], nextStep: "" });
+    assert.equal(h.leases.current(KEY)?.clientId, "handoff-pi-1", "人类租约带派生前缀");
+
+    const result = await h.engine.handback(KEY, "pi-1");
+
+    assert.equal(result.resumed, true);
+    const lease = h.leases.current(KEY);
+    assert.equal(lease?.driver, "pi");
+    assert.equal(lease?.clientId, "pi-1", "交回后租约回到 Pi 自身身份");
+  } finally {
+    h.close();
+  }
+});
+
+test("handback: 非租约持有人（含错误的 handoff- 前缀）→ E_LEASE_CONFLICT，resume 0 次（I4 防越权）", async () => {
+  const h = fresh();
+  try {
+    h.registry.upsert(makeRef({ status: "running" }));
+    h.leases.acquire(KEY, "pi", "pi-1");
+    await h.engine.handoff(KEY, "human", "pi-1", { summary: "交人", touchedFiles: [], nextStep: "" });
+
+    // 写操作语义：不是租约持有人 → E_NO_LEASE（spec 里 E_LEASE_CONFLICT 留给"租约被别人占着"的 acquire 冲突）
+    await expectRejectCode(() => h.engine.handback(KEY, "pi-999"), "E_NO_LEASE");
+    assert.equal(h.fake.count("resume"), 0);
+    assert.equal(h.leases.current(KEY)?.clientId, "handoff-pi-1", "租约不被错误调用劫持");
+  } finally {
+    h.close();
+  }
+});
+
 test("handback: resume 被拒 → E_RESUME_REJECTED，不改 driver/状态", async () => {
   const h = fresh({ resumeError: new Error("session busy") });
   try {

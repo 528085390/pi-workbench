@@ -313,7 +313,7 @@ curl -s 127.0.0.1:7331/api/cp/sessions/<key>/checkpoint
 |---|---|---|---|
 | I-1 | daemon 只认 `PI_WORKBENCH_AUTH_TOKEN`，CLI/扩展/e2e 只认 `PI_WORKBENCH_TOKEN` → 用后者启动等于**静默无鉴权** | `config.ts` 两个名字都认（AUTH_TOKEN 优先）；spec §6 写明唯一名字 | 新增 `config.test.ts` 用例 3 attrs；真机 `0.0.0.0` + `PI_WORKBENCH_TOKEN=s3cr3t`：无 header 401、未知路由 401、带 header 200 |
 | I-2 | spec 里 checkpoint / handoff 表体没写 `clientId`，实现却要求 | spec §6 两行补 `clientId` | 与 `server.ts` 的 `requireString("clientId")` 对齐 |
-| I-3 | Pi 扩展 7 个 `cp_*` 无取租约入口 → 真实宿主里写工具全 `E_NO_LEASE` | 新增第 8 个工具 `cp_lease`（acquire/release/heartbeat，driver/ttlMs 校验）+ client 方法 | `extension.test.ts` 用例断言 URL/body/错误文案；全量 16 pass |
+| I-3 | Pi 扩展 7 个 `cp_*` 无取租约入口 → 真实宿主里写工具全 `E_NO_LEASE` | 新增第 8 个工具 `cp_lease`（acquire/release/heartbeat，driver/ttlMs 校验）+ client 方法；2026-11-16 分支评审后再补第 9 个 `cp_handback` | `extension.test.ts` 用例断言 URL/body/错误文案；本轮 47 pass |
 
 回归：`pnpm -r build`/typecheck 三包 Done；control-plane 212 tests / 211 pass / 1 skip；extension 16 pass。
 
@@ -367,3 +367,10 @@ $ git check-ignore -v spike/acp-probe/evidence/claude-full.jsonl          → .g
 - 防"提醒你看已经看完的东西"：投递前复查未读（0 则静默丢弃）、消息是指针不含完成断言、`cp_see`/`cp_read` 成功即清账、连续唤醒上限 5。
 - 真机闭环：Pi 派发任务后不轮询即结束本轮 → 20 秒后 claude 答完 → Pi 收到"1 个会话有更新（未读共 7 条）"并自行调用 `cp_see`，读到即结清。
 - 证据：`docs/evidence/phase-0.5a/event-wake.md` + `pi-wake-screen.txt`；extension 40 tests 全绿（notify 13）。
+
+## 22. 分支评审修复（2026-11-16）
+
+独立分支评审（`review-branch-2026-11-16.md`，master...HEAD 30 commits）结论 FIX-FIRST：
+2 阻塞（B1 未读被 200 上限截断、B2 通知器复核清空连击计数）+ 4 Important（I1 未读口径、I2 徽标被静音、I3 自动拉起错误码、I4 缺 `cp_handback`/租约身份不匹配）+ 3 Minor（C1 旧 schema、C2 token 双名、C3 端口优先级）。
+已全部修复并补回归用例；另补显式游标校验。全量：control-plane 229（228 pass / 1 skip）、extension 47 全绿；`pnpm -r build` 三包 Done。
+逐项清单与验证输出：`docs/evidence/phase-0.5a/review-fixes-2026-11-16.md`。九条 Gate 结论不变（修复只加强未读/通知路径）。

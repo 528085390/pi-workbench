@@ -253,7 +253,16 @@ export class TakeoverEngine {
    * resume 被拒立即 E_RESUME_REJECTED，不改注册表、不动租约。
    */
   async handback(key: string, clientId: string): Promise<HandbackResult> {
-    this.#leases.assertWriter(key, clientId);
+    // I4：handoff 把租约派生成 "handoff-<piClientId>"，而 Pi 侧 handback 用的是自己的身份
+    // （pi:<pid>）。两种写法都要认：先看当前租约持有人是不是 handoff-<去前缀后的 id>，
+    // 是就按那个 id 校验，否则按传入的 id 校验（兼容直接传 handoff-<id> 的调用方）。
+    const piClientId = clientId.startsWith(HANDOFF_CLIENT_PREFIX)
+      ? clientId.slice(HANDOFF_CLIENT_PREFIX.length)
+      : clientId;
+    const holder = this.#leases.current(key);
+    const writerId =
+      holder !== null && holder.clientId === HANDOFF_CLIENT_PREFIX + piClientId ? holder.clientId : clientId;
+    this.#leases.assertWriter(key, writerId);
     const ref = this.#requireSession(key);
 
     try {
@@ -278,8 +287,7 @@ export class TakeoverEngine {
     // 租约交还给 **pi 侧身份**：handback 的语义是「控制权回到 pi 驱动」。人类租约的 id 是
     // handoff 时派生的 "handoff-<piClientId>"（见 handoff），所以要剥掉这层前缀再发回去，
     // 否则 Pi 扩展用原来的 clientId 写会立刻 E_NO_LEASE。
-    const piClientId = clientId.startsWith(HANDOFF_CLIENT_PREFIX) ? clientId.slice(HANDOFF_CLIENT_PREFIX.length) : clientId;
-    this.#leases.release(key, clientId);
+    this.#leases.release(key, writerId);
     this.#leases.acquire(key, "pi", piClientId, DEFAULT_LEASE_TTL_MS);
     return { resumed: true, deltaSummary };
   }

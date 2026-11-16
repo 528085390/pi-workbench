@@ -72,6 +72,11 @@ export type TurnNotifierOptions = {
   maxConsecutiveWakes?: number;
   /** 只对 driver=pi 的会话唤醒（人接管中不吵） */
   wakeDrivers?: readonly string[];
+  /**
+   * false = 静音：不发对话消息，但徽标照常维护（I2：PI_WORKBENCH_NOTIFY=0 只关"叫醒"，
+   * 不关"有未读"这个事实）。
+   */
+  sendEnabled?: boolean;
   log?: (line: string) => void;
   now?: () => number;
 };
@@ -209,6 +214,11 @@ export class TurnNotifier {
     }
     const entries = [...this.#pending.entries()];
     this.#pending.clear();
+    if (this.#options.sendEnabled === false) {
+      // 静音模式：把待发清掉（不攒着，之后不补发），徽标仍反映真实未读
+      await this.refreshBadge();
+      return;
+    }
 
     const sessions = await this.#list();
     if (sessions === null) {
