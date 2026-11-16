@@ -679,6 +679,13 @@ test("GET /sessions/discover：按 agent 发现并登记，返回 SessionRef", a
     assert.equal(calls.length, 1);
     assert.deepEqual(JSON.parse(calls[0] ?? "{}"), { cwd: "E:\\work", limit: 5 });
 
+    const defaulted = await h.app.inject({
+      method: "GET",
+      url: API + "/sessions/discover?agent=codex&cwd=" + encodeURIComponent("E:\\work"),
+    });
+    assert.equal(defaulted.statusCode, 200, defaulted.body);
+    assert.deepEqual(JSON.parse(calls[1] ?? "{}"), { cwd: "E:\\work", limit: 100 }, "未显式传 limit 时默认 100");
+
     const list = await h.app.inject({ method: "GET", url: API + "/sessions?agent=codex" });
     assert.equal(list.statusCode, 200);
     const keys = list.json<SessionRef[]>().map((row) => row.key);

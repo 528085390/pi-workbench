@@ -180,6 +180,7 @@ function collectRolloutFiles(root: string): string[] {
     let entries: CachedDirEntry[];
     if (cached !== undefined && cached.mtimeMs === mtimeMs) {
       entries = cached.entries;
+      remember(DIR_CACHE, dir, cached, MAX_DIR_CACHE_ENTRIES);
     } else {
       let dirents;
       try {
@@ -214,6 +215,7 @@ function readRolloutMeta(path: string): RolloutMeta | null {
   }
   const cached = META_CACHE.get(path);
   if (cached !== undefined && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+    remember(META_CACHE, path, cached, MAX_META_CACHE_ENTRIES);
     return cached.meta;
   }
   const meta = parseRolloutMeta(path);

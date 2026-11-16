@@ -161,6 +161,8 @@ export const INTERNAL_ERROR_MESSAGE = "internal error";
 
 const ROUTE_LIST = "GET /sessions";
 const ROUTE_DISCOVER = "GET /sessions/discover";
+/** 发现路由默认上限：避免上千 rollout 一次性登记/挂管线；显式 limit 可覆盖。 */
+const DEFAULT_DISCOVER_LIMIT = 100;
 const ROUTE_DETAIL = "GET /sessions/:key";
 const ROUTE_TRANSCRIPT = "GET /sessions/:key/transcript";
 const ROUTE_LEASE = "POST /sessions/:key/lease";
@@ -353,7 +355,7 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         }
         const cwd = optionalString(query, "cwd", ROUTE_DISCOVER);
         const rawLimit = query["limit"];
-        let limit: number | undefined;
+        let limit = DEFAULT_DISCOVER_LIMIT;
         if (typeof rawLimit === "string" && rawLimit.trim().length > 0) {
           limit = Number(rawLimit);
           if (!Number.isInteger(limit) || limit <= 0) {
@@ -362,7 +364,7 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         }
         const refs = await driver.discover({
           ...(cwd === undefined || cwd.length === 0 ? {} : { cwd }),
-          ...(limit === undefined ? {} : { limit }),
+          limit,
         });
         // P1-1：发现结果只做「缺失时插入 / 补 transcriptPath」，绝不把活跃会话打回 idle。
         const registered = refs.map((ref) => deps.registry.registerDiscovered(ref).session);
