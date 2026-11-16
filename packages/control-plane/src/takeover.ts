@@ -19,6 +19,7 @@ import { join } from "node:path";
 import type { AgentName, Checkpoint, SessionRef } from "@pi-workbench/shared";
 
 import type { AgentAdapter } from "./adapters/types.ts";
+import type { AgentRouter } from "./agents/router.ts";
 import { CLAUDE_CAPABILITIES } from "./capabilities.ts";
 import type { CheckpointStore, StoredCheckpoint } from "./checkpoints.ts";
 import type { DispatchRecord, DispatchStore } from "./dispatch-store.ts";
@@ -83,6 +84,8 @@ export type TakeoverDeps = {
   leases: LeaseManager;
   registry: SessionRegistry;
   adapter: AgentAdapter;
+  /** Agent 注册表（0.5-B B01-b）：缺省保持 0.5-A 的 claude-only 行为 */
+  router?: AgentRouter;
   /** checkpoints 表（C3：handback 从这里读游标，不靠进程内存） */
   checkpoints: CheckpointStore;
   /** dispatches 表（C1/C2：原子占位保证并发与跨进程幂等） */
@@ -126,6 +129,7 @@ export class TakeoverEngine {
   readonly #leases: LeaseManager;
   readonly #registry: SessionRegistry;
   readonly #adapter: AgentAdapter;
+  readonly #router: AgentRouter | undefined;
   readonly #checkpoints: CheckpointStore;
   readonly #dispatches: DispatchStore;
   readonly #handoffDir: string;
@@ -145,6 +149,7 @@ export class TakeoverEngine {
     this.#leases = deps.leases;
     this.#registry = deps.registry;
     this.#adapter = deps.adapter;
+    this.#router = deps.router;
     this.#checkpoints = deps.checkpoints;
     this.#dispatches = deps.dispatches;
     this.#handoffDir = deps.handoffDir;
@@ -208,6 +213,8 @@ export class TakeoverEngine {
   async handoff(key: string, to: "human" | "pi", clientId: string, input?: HandoffInput): Promise<HandoffResult> {
     this.#leases.assertWriter(key, clientId);
     const ref = this.#requireSession(key);
+    // 0.5-B B01-b：接管命令由 driver 提供；没注册 driver 的旧调用保持 0.5-A 的 claude 口径。
+    const exit = await this.#handoffCommand(ref);
 
     // 2. quiesce：运行中先 cancel 并等回合结束（adapter 没有 waitForTurn 就跳过）
     // I4：cancel / close 失败必须留痕 —— 否则租约还指着 pi、状态还是 running，却一条事件都没有
@@ -239,13 +246,8 @@ export class TakeoverEngine {
     this.#registry.upsert(next);
     this.#appendState(next, { state: "handoff", driver: to, checkpointPath: path, to }, "handoff");
 
-    // 7. 接管命令：background 走 attach，interactive 走 --resume
-    const background = ref.kind === "background";
-    return {
-      checkpoint,
-      command: background ? ["claude", "attach", ref.nativeId] : ["claude", "--resume", ref.nativeId],
-      mode: background ? "attach" : "resume-tui",
-    };
+    // 7. 接管命令由 driver.handoff(ref) 决定（Claude：background 走 attach，interactive 走 --resume）
+    return { checkpoint, command: exit.command, mode: exit.mode };
   }
 
   /**
@@ -306,8 +308,16 @@ export class TakeoverEngine {
    *   新的 idempotencyKey 重新 dispatch 即可。
    */
   async dispatch(input: DispatchInput): Promise<SessionRef> {
-    if (input.agent !== "claude") {
+    // 0.5-B B01-b：传了注册表就按注册表判可用（未注册 → E_AGENT_UNAVAILABLE）；
+    // 不传 router 的旧调用保持 0.5-A 的 claude-only 口径（E_BAD_REQUEST），避免破坏既有调用方。
+    const driver = this.#router?.get(input.agent) ?? null;
+    if (this.#router === undefined && input.agent !== "claude") {
       throw new WorkbenchError("E_BAD_REQUEST", "v1 只支持 dispatch claude 会话：" + String(input.agent), {
+        agent: input.agent,
+      });
+    }
+    if (this.#router !== undefined && driver === null) {
+      throw new WorkbenchError("E_AGENT_UNAVAILABLE", "Agent 未注册或不可用：" + String(input.agent), {
         agent: input.agent,
       });
     }
@@ -341,15 +351,17 @@ export class TakeoverEngine {
     }
 
     const ref: SessionRef = {
-      key: "claude:" + sessionId,
-      agent: "claude",
+      key: input.agent + ":" + sessionId,
+      agent: input.agent,
       nativeId: sessionId,
       acpSessionId: sessionId,
       cwd: resolvedCwd,
-      transcriptPath: join(claudeProjectDir(resolvedCwd), sessionId + ".jsonl"),
+      // 只有 Claude 的会话文件路径能由 cwd 推导；Codex/Pi 由各自发现层补写
+      transcriptPath:
+        input.agent === "claude" ? join(claudeProjectDir(resolvedCwd), sessionId + ".jsonl") : undefined,
       status: "running",
       driver: "pi",
-      capabilities: CLAUDE_CAPABILITIES,
+      capabilities: driver === null ? CLAUDE_CAPABILITIES : driver.caps,
       kind: "interactive",
     };
 
@@ -414,6 +426,19 @@ export class TakeoverEngine {
     } catch {
       // turn timeout / adapter 已在关闭：close 仍要继续，否则会话就漏在 adapter 里
     }
+  }
+
+  /** handoff 命令：注册了 driver 就委托，否则保持 0.5-A 的 claude 口径 */
+  async #handoffCommand(ref: SessionRef): Promise<{ command: string[]; mode: "resume-tui" | "attach" }> {
+    const driver = this.#router?.get(ref.agent) ?? null;
+    if (driver !== null) {
+      return await driver.handoff(ref);
+    }
+    const background = ref.kind === "background";
+    return {
+      command: background ? ["claude", "attach", ref.nativeId] : ["claude", "--resume", ref.nativeId],
+      mode: background ? "attach" : "resume-tui",
+    };
   }
 
   /** 落 checkpoint 文件 + 落库，返回对象与文件路径（C3） */

@@ -23,6 +23,7 @@ import Fastify from "fastify";
 import type { FastifyError, FastifyInstance, FastifyRequest } from "fastify";
 
 import type { AgentAdapter } from "./adapters/types.ts";
+import type { AgentRouter } from "./agents/router.ts";
 import { CLAUDE_CAPABILITIES } from "./capabilities.ts";
 import type { CheckpointStore } from "./checkpoints.ts";
 import type { Config } from "./config.ts";
@@ -72,6 +73,8 @@ export type ServerDeps = {
   engine: TakeoverEngine;
   /** /agents 的可用性判定 + 上层优雅关闭（本层不 dispose 它） */
   adapter: AgentAdapter;
+  /** Agent 注册表（0.5-B B01-b）：传入时 /agents 与 dispatch 走注册表；缺省保持 0.5-A 行为 */
+  router?: AgentRouter;
   /** GET /sessions/:key/checkpoint 直接读它（R46，不经 engine） */
   checkpoints: CheckpointStore;
   /** 每读者未读游标（spec §6.5） */
@@ -136,6 +139,7 @@ export const STATUS_BY_CODE: Readonly<Record<WorkbenchErrorCode, number>> = {
   E_NO_LEASE: 409,
   E_IDEMPOTENCY_CONFLICT: 409,
   E_CAP_UNSUPPORTED: 422,
+  E_AGENT_UNAVAILABLE: 422,
   E_ADAPTER_DOWN: 503,
   E_RESUME_REJECTED: 503,
 };
@@ -266,7 +270,8 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
 
       api.get(HEALTH_PATH, health);
 
-      api.get("/agents", async () => [describeAgent(config, deps.adapter)]);
+      // 0.5-B B01-b：有注册表时由 router.list() 动态生成；缺省保留 0.5-A 的 claude-only 描述
+      api.get("/agents", async () => (deps.router === undefined ? [describeAgent(config, deps.adapter)] : deps.router.list()));
 
       api.get("/sessions", async (request) => {
         const query = queryOf(request);
@@ -452,14 +457,12 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
 
       api.post("/dispatch", async (request) => {
         const body = bodyOf(request.body, ROUTE_DISPATCH);
-        const agent = requireString(body, "agent", ROUTE_DISPATCH);
-        if (agent !== "claude") {
-          throw new WorkbenchError("E_BAD_REQUEST", "v1 只支持 dispatch claude 会话", { agent });
-        }
+        // 0.5-B B01-b：agent 缺省 claude（保持 0.5-A 调用方兼容），透传给引擎按注册表判可用
+        const agent = optionalString(body, "agent", ROUTE_DISPATCH) ?? "claude";
         const task = requireString(body, "task", ROUTE_DISPATCH);
         const idempotencyKey = requireString(body, "idempotencyKey", ROUTE_DISPATCH);
         const cwd = optionalString(body, "cwd", ROUTE_DISPATCH);
-        const ref = await deps.engine.dispatch({ agent: "claude", task, cwd, idempotencyKey });
+        const ref = await deps.engine.dispatch({ agent, task, cwd, idempotencyKey });
         // 新会话挂事件管线，后续 ACP update 才会被归一化成事件（R39 的 pipeline 接线落点）
         try {
           deps.pipeline?.attach(deps.adapter, ref.key);

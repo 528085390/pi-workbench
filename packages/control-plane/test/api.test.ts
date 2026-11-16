@@ -736,6 +736,7 @@ test("错误码 → 状态码映射覆盖 R35 全表", () => {
     E_NO_LEASE: 409,
     E_IDEMPOTENCY_CONFLICT: 409,
     E_CAP_UNSUPPORTED: 422,
+    E_AGENT_UNAVAILABLE: 422,
     E_ADAPTER_DOWN: 503,
     E_RESUME_REJECTED: 503,
   });
