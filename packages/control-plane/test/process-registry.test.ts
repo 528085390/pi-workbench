@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import test from "node:test";
 import type { DatabaseSync } from "node:sqlite";
@@ -26,7 +27,12 @@ function fakeChild(pid: number): EventEmitter & { pid: number } {
   return Object.assign(new EventEmitter(), { pid });
 }
 
-function makeRef(key: string, status: SessionRef["status"], driver: SessionRef["driver"]): SessionRef {
+function makeRef(
+  key: string,
+  status: SessionRef["status"],
+  driver: SessionRef["driver"],
+  transcriptPath?: string,
+): SessionRef {
   return {
     key,
     agent: "pi",
@@ -36,6 +42,7 @@ function makeRef(key: string, status: SessionRef["status"], driver: SessionRef["
     driver,
     capabilities: CAPS,
     kind: "interactive",
+    ...(transcriptPath === undefined ? {} : { transcriptPath }),
   };
 }
 
@@ -152,15 +159,153 @@ test("spawn 补丁登记子进程：label 取命令首项，并识别 adapter ag
     let nextPid = 555;
     const wrapped = wrapSpawnWithHiddenWindow((() => fakeChild(nextPid++)) as never);
     wrapped("C:\\Program Files\\nodejs\\node.exe", ["C:\\repo\\node_modules\\@agentclientprotocol\\claude-agent-acp\\dist\\index.js"], {});
-    wrapped("pi", ["--mode", "rpc"], {});
+    wrapped("pi", ["--mode", "rpc", "--session", "C:\\tmp\\s.jsonl"], {});
     assert.deepEqual(
-      registry.list().map((info) => ({ pid: info.pid, label: info.label, agent: info.agent, exited: info.exited })),
+      registry.list().map((info) => ({ pid: info.pid, label: info.label, agent: info.agent, exited: info.exited, sessionPath: info.sessionPath })),
       [
-        { pid: 555, label: "C:\\Program Files\\nodejs\\node.exe", agent: "claude", exited: false },
-        { pid: 556, label: "pi", agent: "pi", exited: false },
+        { pid: 555, label: "C:\\Program Files\\nodejs\\node.exe", agent: "claude", exited: false, sessionPath: undefined },
+        { pid: 556, label: "pi", agent: "pi", exited: false, sessionPath: "C:\\tmp\\s.jsonl" },
       ],
     );
   } finally {
     setProcessRegistry(null);
   }
 });
+
+test("已退出进程释放 child 句柄，历史按 historyLimit 有界", () => {
+  const registry = new ProcessRegistry({ kill: () => true, historyLimit: 2 });
+  for (let pid = 1; pid <= 4; pid += 1) {
+    const child = fakeChild(pid);
+    registry.track(child, "adapter:pi", "pi");
+    child.emit("exit");
+  }
+  assert.deepEqual(registry.list().map((info) => info.pid), [3, 4]);
+  assert.equal(registry.list().every((info) => info.exited), true);
+});
+
+test("adapter 退出只 reconcile 同 sessionKey 的 running 会话", () => {
+  const { db, sessions, events, leases } = fresh();
+  try {
+    sessions.upsert(makeRef("pi:a", "running", "pi"));
+    sessions.upsert(makeRef("pi:b", "running", "pi"));
+    createDriverExitHandler({ agent: "pi", sessions, events, leases })({
+      pid: 1,
+      label: "adapter:pi",
+      startedAt: "2026-11-17T00:00:00.000Z",
+      exited: true,
+      agent: "pi",
+      sessionKey: "pi:a",
+    });
+    assert.equal(sessions.get("pi:a")?.status, "exited");
+    assert.equal(sessions.get("pi:b")?.status, "running", "同 agent 的其它会话不能被误杀");
+  } finally {
+    db.close();
+  }
+});
+
+test("adapter 退出按 sessionPath 匹配 transcriptPath，只 reconcile 本会话", () => {
+  const { db, sessions, events, leases } = fresh();
+  try {
+    sessions.upsert(makeRef("pi:a", "running", "pi", "C:\\tmp\\a.jsonl"));
+    sessions.upsert(makeRef("pi:b", "running", "pi", "C:\\tmp\\b.jsonl"));
+    createDriverExitHandler({ agent: "pi", sessions, events, leases })({
+      pid: 2,
+      label: "adapter:pi",
+      startedAt: "2026-11-17T00:00:00.000Z",
+      exited: true,
+      agent: "pi",
+      sessionPath: "C:\\tmp\\a.jsonl",
+    });
+    assert.equal(sessions.get("pi:a")?.status, "exited");
+    assert.equal(sessions.get("pi:b")?.status, "running");
+  } finally {
+    db.close();
+  }
+});
+
+test("beginShutdown 后子进程 exit 不再触发 crash 回调", () => {
+  const seen: unknown[] = [];
+  const registry = new ProcessRegistry({ kill: () => true });
+  registry.setOnExit((info) => seen.push(info));
+  const child = fakeChild(900);
+  registry.track(child, "adapter:pi", "pi");
+  registry.beginShutdown();
+  child.emit("exit");
+  assert.equal(seen.length, 0);
+  assert.equal(registry.list()[0]?.exited, true);
+});
+
+test("killAll 优先使用 killTree 并杀整棵进程树", async () => {
+  const calls: string[] = [];
+  const registry = new ProcessRegistry({
+    killTree: (pid, signal) => {
+      calls.push(String(pid) + ":" + signal);
+      return true;
+    },
+    kill: () => {
+      throw new Error("killTree 成功时不应退回 direct kill");
+    },
+  });
+  const child = fakeChild(700);
+  registry.track(child, "adapter:pi", "pi");
+  await registry.killAll(0);
+  assert.deepEqual(calls, ["700:SIGTERM", "700:SIGKILL"]);
+  assert.equal(registry.list()[0]?.exited, true);
+});
+
+test("killAll 真杀子进程树（Windows taskkill /T）", { skip: process.platform !== "win32" }, async () => {
+  const script = "const {spawn}=require('node:child_process'); const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore',windowsHide:true}); console.log(c.pid); setInterval(()=>{},1000);";
+  const parent = spawn(process.execPath, ["-e", script], { stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+  const parentPid = parent.pid;
+  assert.equal(typeof parentPid, "number");
+  const grandPid = await new Promise<number>((resolve, reject) => {
+    let buffer = "";
+    const timer = setTimeout(() => reject(new Error("等待孙进程 pid 超时")), 3_000);
+    parent.stdout?.on("data", (chunk: Buffer) => {
+      buffer += chunk.toString("utf8");
+      const line = buffer.split(/\r?\n/)[0]?.trim() ?? "";
+      if (line.length > 0) {
+        clearTimeout(timer);
+        resolve(Number(line));
+      }
+    });
+    parent.once("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
+  try {
+    const registry = new ProcessRegistry();
+    registry.track(parent, "adapter:tree", "pi");
+    await registry.killAll(300);
+    assert.equal(await waitDead(parentPid as number, 3_000), true, "父进程应被杀死");
+    assert.equal(await waitDead(grandPid, 3_000), true, "孙进程应被 taskkill /T 一并杀死");
+  } finally {
+    if (parentPid !== undefined && isAlive(parentPid)) {
+      parent.kill("SIGKILL");
+    }
+    if (isAlive(grandPid)) {
+      process.kill(grandPid, "SIGKILL");
+    }
+  }
+});
+
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+async function waitDead(pid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isAlive(pid)) {
+      return true;
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+  }
+  return !isAlive(pid);
+}

@@ -38,7 +38,8 @@ export function createLogger(options: LoggerOptions): Logger {
   mkdirSync(dir, { recursive: true });
 
   const write = (level: "INFO" | "ERROR", message: string): void => {
-    const line = "[" + new Date(now()).toISOString() + "] [" + level + "] " + message + "\n";
+    const raw = "[" + new Date(now()).toISOString() + "] [" + level + "] " + message + "\n";
+    const line = truncateLine(raw, maxBytes);
     rotateIfNeeded(file, Buffer.byteLength(line), maxBytes, keep);
     appendFileSync(file, line);
   };
@@ -47,6 +48,22 @@ export function createLogger(options: LoggerOptions): Logger {
     info: (message: string): void => write("INFO", message),
     error: (message: string): void => write("ERROR", message),
   };
+}
+
+function truncateLine(line: string, maxBytes: number): string {
+  if (Buffer.byteLength(line) <= maxBytes) {
+    return line;
+  }
+  const marker = "…[truncated]\n";
+  const markerBytes = Buffer.byteLength(marker);
+  if (markerBytes >= maxBytes) {
+    return truncateUtf8(line, maxBytes);
+  }
+  return truncateUtf8(line, maxBytes - markerBytes) + marker;
+}
+
+function truncateUtf8(text: string, maxBytes: number): string {
+  return Buffer.from(text, "utf8").subarray(0, Math.max(0, maxBytes)).toString("utf8");
 }
 
 function positiveInteger(value: number, name: string): number {

@@ -167,6 +167,8 @@ function makeBundle(opts: BundleOptions = {}): Bundle {
     store,
     leases,
     registry,
+    instanceId: "test-instance",
+    db,
     engine,
     adapter: fake.adapter,
     checkpoints,
@@ -244,21 +246,51 @@ type ErrorEnvelope = { error: { code: string; message: string; details?: unknown
 
 // ---------------------------------------------------------------- 健康检查
 
-test("GET /health 与 /api/cp/health 都是 T1 健康形状（R31）", async () => {
+test("GET /health 与 /api/cp/health 都是 T1 健康形状 + C04 运行态摘要（R31 / §6.2）", async () => {
   const h = await makeHarness();
   try {
     for (const path of ["/health", API + "/health"]) {
       const res = await h.app.inject({ method: "GET", url: path });
       assert.equal(res.statusCode, 200, path + " 应 200");
-      const body = res.json<{ ok: boolean; name: string; version: string; pid: number; uptimeMs: number }>();
+      const body = res.json<{
+        ok: boolean;
+        name: string;
+        version: string;
+        pid: number;
+        uptimeMs: number;
+        instanceId: string;
+        db: { schemaVersion: number; ok: boolean };
+        adapters: { agent: string; available: boolean }[];
+      }>();
       assert.equal(body.ok, true);
       assert.equal(body.name, "pi-workbenchd");
       assert.equal(typeof body.version, "string");
       assert.equal(body.pid, process.pid);
       assert.ok(body.uptimeMs >= 0);
+      assert.equal(body.instanceId, "test-instance");
+      assert.deepEqual(body.db, { schemaVersion: 4, ok: true });
+      assert.ok(Array.isArray(body.adapters));
     }
   } finally {
     await h.close();
+  }
+});
+
+test("GET /health: db 关闭时 ok:false 且 503（spec §6.2 / §7.4）", async () => {
+  const h = await makeHarness({ seed: null });
+  try {
+    h.db.close();
+    for (const path of ["/health", API + "/health"]) {
+      const res = await h.app.inject({ method: "GET", url: path });
+      assert.equal(res.statusCode, 503, path + " 应 503");
+      const body = res.json<{ ok: boolean; db: { schemaVersion: number; ok: boolean } }>();
+      assert.equal(body.ok, false);
+      assert.equal(body.db.ok, false);
+      assert.equal(body.db.schemaVersion, 0);
+    }
+  } finally {
+    await h.app.close();
+    rmSync(h.dir, { recursive: true, force: true });
   }
 });
 

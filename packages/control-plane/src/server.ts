@@ -15,12 +15,13 @@
 import { timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
+import type { DatabaseSync } from "node:sqlite";
 
 import type { Checkpoint, Driver, SessionCaps, SessionEvent, SessionRef, UnifiedMessage, VersionResponse } from "@pi-workbench/shared";
 import { API_VERSION, WORKBENCH_VERSION } from "@pi-workbench/shared";
 import fastifyWebsocket from "@fastify/websocket";
 import Fastify from "fastify";
-import type { FastifyError, FastifyInstance, FastifyRequest } from "fastify";
+import type { FastifyError, FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { AdapterUpdate, AgentAdapter } from "./adapters/types.ts";
 import type { AgentRouter } from "./agents/router.ts";
@@ -70,8 +71,10 @@ export type PipelineLike = {
 /** createServer 的依赖（R38 / R46：比 brief 多 adapter 与 checkpoints） */
 export type ServerDeps = {
   config: Config;
-  /** daemon 实例 id（index.ts 取自 InstanceStore.begin()）；GET /api/cp/version 原样返回 */
+  /** daemon 实例 id（index.ts 取自 InstanceStore.begin()）；GET /api/cp/version 与 /health 原样返回 */
   instanceId?: string;
+  /** 只用于 /health 的只读 db 探活；缺省（单测 / 裁剪构建）视为 ok。 */
+  db?: DatabaseSync;
   store: EventStore;
   leases: LeaseManager;
   registry: SessionRegistry;
@@ -121,13 +124,17 @@ export type ServerHandle = {
 };
 
 type HealthBody = {
-  ok: true;
+  ok: boolean;
   name: string;
   version: string;
   pid: number;
   uptimeMs: number;
   /** C1：客户端（Pi 插件）据此拒绝连旧 daemon，别让插件跑在缺路由的版本上 */
   schemaVersion: number;
+  /** C04 / spec §6.2：实例身份与运行态摘要（additive） */
+  instanceId: string;
+  db: { schemaVersion: number; ok: boolean };
+  adapters: { agent: string; available: boolean }[];
 };
 
 type AgentDescriptor = {
@@ -322,14 +329,26 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
   };
   await app.register(fastifyWebsocket);
 
-  const health = async (): Promise<HealthBody> => ({
-    ok: true,
-    name: "pi-workbenchd",
-    version: WORKBENCH_VERSION,
-    pid: process.pid,
-    uptimeMs: Date.now() - startedAt,
-    schemaVersion: SCHEMA_VERSION,
-  });
+  const health = async (_request: FastifyRequest, reply: FastifyReply): Promise<HealthBody> => {
+    const db = healthDbState(deps.db);
+    if (!db.ok) {
+      void reply.code(503);
+    }
+    return {
+      ok: db.ok,
+      name: "pi-workbenchd",
+      version: WORKBENCH_VERSION,
+      pid: process.pid,
+      uptimeMs: Date.now() - startedAt,
+      schemaVersion: SCHEMA_VERSION,
+      instanceId: deps.instanceId ?? "",
+      db,
+      adapters: (deps.router?.list() ?? [describeAgent(deps.config, deps.adapter)]).map((status) => ({
+        agent: status.agent,
+        available: status.available,
+      })),
+    };
+  };
 
   // T1 兼容：裸 /health（CLI probeHealth 依赖 {ok,pid,version}）
   app.get(HEALTH_PATH, health);
@@ -829,6 +848,19 @@ export async function startServer(deps: ServerDeps): Promise<ServerHandle> {
       await app.close();
     },
   };
+}
+
+/** /health 的 db 探活：关闭 / 损坏的数据库返回 ok:false；未注入 db 的单测视为可用。 */
+function healthDbState(db: DatabaseSync | undefined): { schemaVersion: number; ok: boolean } {
+  if (db === undefined) {
+    return { schemaVersion: SCHEMA_VERSION, ok: true };
+  }
+  try {
+    const row = db.prepare("PRAGMA user_version").get() as { user_version?: number } | undefined;
+    return { schemaVersion: Number(row?.user_version ?? SCHEMA_VERSION), ok: true };
+  } catch {
+    return { schemaVersion: 0, ok: false };
+  }
 }
 
 /** 回环判定：127.0.0.0/8、::1、localhost（R32 的口径，含常见 IPv6 展开写法） */

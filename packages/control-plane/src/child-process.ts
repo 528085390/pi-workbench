@@ -43,6 +43,28 @@ export function detectSpawnAgent(command: unknown, args: unknown): AgentName | u
   return undefined;
 }
 
+/** 从 Pi RPC 的 --session 参数提取会话文件路径（也支持 --session=<path>）。 */
+export function detectSpawnSessionPath(args: unknown): string | undefined {
+  if (!Array.isArray(args)) {
+    return undefined;
+  }
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (typeof arg !== "string") {
+      continue;
+    }
+    if (arg === "--session") {
+      const next = args[index + 1];
+      return typeof next === "string" && next.length > 0 ? next : undefined;
+    }
+    if (arg.startsWith("--session=")) {
+      const value = arg.slice("--session=".length);
+      return value.length > 0 ? value : undefined;
+    }
+  }
+  return undefined;
+}
+
 /** label 按计划取命令行首项。 */
 function commandLabel(command: unknown): string {
   if (typeof command === "string") {
@@ -62,7 +84,14 @@ function registerSpawnedChild(child: unknown, command: unknown, args: unknown): 
   if (typeof tracked.once !== "function") {
     return;
   }
-  processRegistry.track(tracked as TrackedChild, commandLabel(command), detectSpawnAgent(command, args));
+  const agent = detectSpawnAgent(command, args);
+  processRegistry.track(
+    tracked as TrackedChild,
+    commandLabel(command),
+    agent,
+    undefined,
+    agent === "pi" ? detectSpawnSessionPath(args) : undefined,
+  );
 }
 
 /**
@@ -89,9 +118,9 @@ export function wrapSpawnWithHiddenWindow(spawnImpl: typeof import("node:child_p
   }) as typeof import("node:child_process").spawn;
 }
 
-/** 只在 Windows 上生效；重复调用是幂等的。必须在动态 import RpcClient 之前调用。 */
+/** 安装 spawn 登记补丁；Windows 上同时抑制控制台窗口。重复调用是幂等的。 */
 export function hideWindowsChildProcesses(sync = syncBuiltinESMExports): void {
-  if (installed || process.platform !== "win32") {
+  if (installed) {
     return;
   }
   const require = createRequire(import.meta.url);

@@ -518,6 +518,7 @@ export async function main(): Promise<void> {
       leases,
       registry,
       instanceId: instances.id ?? "",
+      db,
       engine,
       adapter,
       router,
@@ -534,6 +535,7 @@ export async function main(): Promise<void> {
     clearInterval(leaseSweep);
     clearInterval(dispatchSweep);
     pipeline.dispose();
+    processRegistry.beginShutdown();
     await processRegistry.killAll(3000);
     await disposeDriversQuietly([claudeDriver, codexDriver, piDriver]);
     await closeQuietly(db);
@@ -583,6 +585,7 @@ export async function main(): Promise<void> {
     await handle.close();
     // C04 / spec §7.4：先退订管线，再给子进程 3s 优雅退出；killAll 对存活者补 SIGKILL。
     pipeline.dispose();
+    processRegistry.beginShutdown();
     await processRegistry.killAll(3000);
     clearInterval(heartbeat);
     clearInterval(leaseSweep);
@@ -604,6 +607,9 @@ export async function main(): Promise<void> {
   });
   process.on("SIGTERM", () => {
     void shutdown("SIGTERM");
+  });
+  process.on("SIGBREAK", () => {
+    void shutdown("SIGBREAK");
   });
 }
 

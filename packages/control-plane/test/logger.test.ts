@@ -44,3 +44,13 @@ test("resolveLogDir: PI_WORKBENCH_LOG_DIR 覆盖默认 home/logs", () => {
   assert.equal(resolveLogDir({}, "C:\\home"), join("C:\\home", "logs"));
   assert.equal(resolveLogDir({ PI_WORKBENCH_LOG_DIR: "   " }, "C:\\home"), join("C:\\home", "logs"));
 });
+
+test("createLogger: 单行超过 maxBytes 时截断，不写出超限文件", () => {
+  const dir = tempDir();
+  const logger = createLogger({ dir, maxBytes: 80, keep: 2, now: () => 0 });
+  logger.info("x".repeat(500));
+  const file = join(dir, "daemon.log");
+  const content = readFileSync(file, "utf8");
+  assert.ok(statSync(file).size <= 80);
+  assert.ok(content.includes("[truncated]"));
+});
