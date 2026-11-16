@@ -19,6 +19,8 @@ import { SessionRegistry } from "../src/registry.ts";
 import { claudeProjectDir } from "../src/transcript/claude.ts";
 import type { UnifiedMessage } from "../src/transcript/claude.ts";
 import { CLAUDE_CAPABILITIES } from "../src/capabilities.ts";
+import { AgentRouter } from "../src/agents/router.ts";
+import type { AgentDriver } from "../src/agents/types.ts";
 import { TakeoverEngine } from "../src/takeover.ts";
 import type { TranscriptReader } from "../src/takeover.ts";
 
@@ -1053,6 +1055,144 @@ test("dispatch: 省略 cwd 与显式传同一个 cwd 等价（同 hash，不报 
     assert.deepEqual(second, first, "显式传同一个 cwd 必须命中同一会话");
     assert.equal(h.fake.count("newSession"), 1);
     assert.deepEqual(h.fake.argsOf("newSession"), [[here]]);
+  } finally {
+    h.close();
+  }
+});
+
+// ---------- r5：P2-1 transcriptPath 缓存的并发 / 时间窗语义 ----------
+
+function makeCodexRef(overrides: Partial<SessionRef> = {}): SessionRef {
+  return {
+    key: "codex:sess-1",
+    agent: "codex",
+    nativeId: "sess-1",
+    cwd: CWD,
+    status: "idle",
+    driver: "pi",
+    capabilities: { ...CLAUDE_CAPABILITIES, permissions: false },
+    kind: "interactive",
+    ...overrides,
+  };
+}
+
+type RefreshHarness = {
+  engine: TakeoverEngine;
+  registry: SessionRegistry;
+  clock: Clock;
+  driver: AgentDriver & { resolveTranscriptPath: (ref: SessionRef) => Promise<string | undefined> };
+  calls: () => number;
+  close: () => void;
+};
+
+/** 只构造 refreshTranscriptPath 所需的引擎；不启动任何 adapter 子进程。 */
+function makeRefreshHarness(): RefreshHarness {
+  const db = openDb(":memory:");
+  migrate(db);
+  const clock = makeClock();
+  const registry = new SessionRegistry(db);
+  const handoffDir = mkdtempSync(join(tmpdir(), "pi-refresh-"));
+  let calls = 0;
+
+  const driver: AgentDriver & { resolveTranscriptPath: (ref: SessionRef) => Promise<string | undefined> } = {
+    agent: "codex",
+    caps: { ...CLAUDE_CAPABILITIES, permissions: false },
+    discover: async () => [],
+    attach: async () => {},
+    inject: async () => ({ messageId: "msg-refresh", effective: "now" }),
+    interrupt: async () => ({ stopReason: "cancelled" }),
+    resume: async () => {},
+    handoff: async () => ({ command: ["codex"], mode: "attach" }),
+    onUpdate: (_cb: (update: AdapterUpdate) => void) => () => {},
+    dispose: async () => {},
+    resolveTranscriptPath: async () => {
+      calls += 1;
+      return undefined;
+    },
+  };
+
+  const router = new AgentRouter();
+  router.register(driver);
+  const engine = new TakeoverEngine({
+    store: new EventStore(db),
+    leases: new LeaseManager(db, { now: clock.now }),
+    registry,
+    adapter: makeFake().adapter,
+    router,
+    checkpoints: new CheckpointStore(db),
+    dispatches: new DispatchStore(db),
+    handoffDir,
+    now: clock.now,
+    readTranscript: emptyReader,
+  });
+
+  return {
+    engine,
+    registry,
+    clock,
+    driver,
+    calls: () => calls,
+    close: () => {
+      db.close();
+      rmSync(handoffDir, { recursive: true, force: true });
+    },
+  };
+}
+
+test("refreshTranscriptPath: 同一 key 并发解析只调用 driver 一次（single-flight）", async () => {
+  const h = makeRefreshHarness();
+  try {
+    h.registry.upsert(makeCodexRef());
+    let release!: (value: string) => void;
+    const gate = new Promise<string>((resolve) => {
+      release = resolve;
+    });
+    let calls = 0;
+    h.driver.resolveTranscriptPath = async () => {
+      calls += 1;
+      return gate;
+    };
+
+    const first = h.engine.refreshTranscriptPath("codex:sess-1");
+    const second = h.engine.refreshTranscriptPath("codex:sess-1");
+    assert.equal(calls, 1, "并发第二次应复用第一次的 Promise");
+    release("C:\\rollout.jsonl");
+    const [a, b] = await Promise.all([first, second]);
+    assert.equal(a, "C:\\rollout.jsonl");
+    assert.equal(b, "C:\\rollout.jsonl");
+    assert.equal(h.registry.get("codex:sess-1")?.transcriptPath, "C:\\rollout.jsonl");
+  } finally {
+    h.close();
+  }
+});
+
+test("refreshTranscriptPath: idle 解析失败负缓存 30s，过期后重试", async () => {
+  const h = makeRefreshHarness();
+  try {
+    h.registry.upsert(makeCodexRef({ status: "idle" }));
+
+    assert.equal(await h.engine.refreshTranscriptPath("codex:sess-1"), undefined);
+    assert.equal(h.calls(), 1);
+    assert.equal(await h.engine.refreshTranscriptPath("codex:sess-1"), undefined);
+    assert.equal(h.calls(), 1, "30s 窗口内不应再次扫描");
+
+    h.clock.advance(30_000);
+    assert.equal(await h.engine.refreshTranscriptPath("codex:sess-1"), undefined);
+    assert.equal(h.calls(), 2, "窗口过期后必须重新尝试");
+  } finally {
+    h.close();
+  }
+});
+
+test("refreshTranscriptPath: running 解析失败不缓存，下一次立即重试", async () => {
+  const h = makeRefreshHarness();
+  try {
+    h.registry.upsert(makeCodexRef({ status: "running" }));
+
+    assert.equal(await h.engine.refreshTranscriptPath("codex:sess-1"), undefined);
+    assert.equal(h.calls(), 1);
+    assert.equal(await h.engine.refreshTranscriptPath("codex:sess-1"), undefined);
+    assert.equal(h.calls(), 2, "running 的新 rollout 不能因一次 miss 被缓存");
   } finally {
     h.close();
   }
