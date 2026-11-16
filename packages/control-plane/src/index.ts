@@ -303,7 +303,9 @@ export async function main(): Promise<void> {
 
   let adapter: ClaudeAdapter;
   try {
-    adapter = await ClaudeAdapter.spawn(config);
+    adapter = await ClaudeAdapter.spawn(config, {
+      initialPermissionMode: config.claude.initialPermissionMode,
+    });
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     console.error("[pi-workbenchd] E_ADAPTER_DOWN：Claude ACP adapter 启动失败（" + reason + "）");

@@ -40,6 +40,7 @@ test("loadConfig: 空目录时写入默认值", () => {
     assert.equal(cfg.authToken, null);
     assert.equal(cfg.home, home);
     assert.equal(cfg.claude.permissionMode, "auto_allow");
+    assert.equal(cfg.claude.initialPermissionMode, "auto");
     assert.ok(Array.isArray(cfg.claude.adapterCmd));
     assert.ok(cfg.claude.adapterCmd.length > 0);
     assert.ok(cfg.claude.adapterCmd.every((part) => typeof part === "string"));
@@ -62,6 +63,8 @@ test("loadConfig: 缺省时在 home 下生成 config.yaml", () => {
     assert.equal(obj["host"], "127.0.0.1");
     assert.equal(obj["port"], DEFAULT_PORT);
     assert.equal(obj["leaseTtlMs"], 30000);
+    const claude = obj["claude"] as Record<string, unknown>;
+    assert.equal(claude["initialPermissionMode"], "auto");
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
@@ -325,6 +328,7 @@ test("loadConfig: 缺省生成 codex 与 pi 配置块并回写 config.yaml", () 
     assert.ok(cfg.codex.adapterCmd.length > 0);
     assert.ok(cfg.codex.adapterCmd.every((part) => typeof part === "string"));
     assert.equal(cfg.codex.permissionMode, "auto_allow");
+    assert.equal(cfg.codex.initialAgentMode, "workspace-write");
     assert.deepEqual(cfg.pi.rpcCmd, ["pi", "--mode", "rpc"]);
     assert.equal(cfg.pi.provider, undefined);
     assert.equal(cfg.pi.model, undefined);
@@ -334,6 +338,7 @@ test("loadConfig: 缺省生成 codex 与 pi 配置块并回写 config.yaml", () 
     const pi = written["pi"] as Record<string, unknown>;
     assert.deepEqual(codex["adapterCmd"], cfg.codex.adapterCmd);
     assert.equal(codex["permissionMode"], "auto_allow");
+    assert.equal(codex["initialAgentMode"], "workspace-write");
     assert.deepEqual(pi["rpcCmd"], cfg.pi.rpcCmd);
   } finally {
     rmSync(home, { recursive: true, force: true });
@@ -388,6 +393,102 @@ test("loadConfig: PI_WORKBENCH_PI_CMD 覆盖 pi.rpcCmd", () => {
   try {
     const cfg = loadConfig({ PI_WORKBENCH_HOME: home, PI_WORKBENCH_PI_CMD: "pi --mode rpc --debug" });
     assert.deepEqual(cfg.pi.rpcCmd, ["pi", "--mode", "rpc", "--debug"]);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("loadConfig: codex.initialAgentMode 可显式设为 agent-full-access 并回写", () => {
+  const home = freshHome();
+  try {
+    const cfgPath = join(home, "config.yaml");
+    writeFileSync(
+      cfgPath,
+      [
+        "codex:",
+        "  adapterCmd:",
+        "    - node",
+        "    - codex-acp.js",
+        "  permissionMode: auto_allow",
+        "  initialAgentMode: agent-full-access",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    const cfg = loadConfig({ PI_WORKBENCH_HOME: home });
+    assert.equal(cfg.codex.initialAgentMode, "agent-full-access");
+    const written = parseYaml(readFileSync(cfgPath, "utf8")) as Record<string, unknown>;
+    const codex = written["codex"] as Record<string, unknown>;
+    assert.equal(codex["initialAgentMode"], "agent-full-access");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("loadConfig: codex.initialAgentMode 非法值给出清晰错误", () => {
+  const home = freshHome();
+  try {
+    const cfgPath = join(home, "config.yaml");
+    writeFileSync(cfgPath, "codex:\n  initialAgentMode: yolo\n", "utf8");
+    assert.throws(
+      () => loadConfig({ PI_WORKBENCH_HOME: home }),
+      (err: unknown) => err instanceof Error && err.message.includes("codex.initialAgentMode"),
+    );
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("loadConfig: claude.initialPermissionMode 可显式设为 bypassPermissions 并回写", () => {
+  const home = freshHome();
+  try {
+    const cfgPath = join(home, "config.yaml");
+    writeFileSync(cfgPath, "claude:\n  permissionMode: auto_allow\n  initialPermissionMode: bypassPermissions\n", "utf8");
+    const cfg = loadConfig({ PI_WORKBENCH_HOME: home });
+    assert.equal(cfg.claude.initialPermissionMode, "bypassPermissions");
+    const written = parseYaml(readFileSync(cfgPath, "utf8")) as Record<string, unknown>;
+    const claude = written["claude"] as Record<string, unknown>;
+    assert.equal(claude["initialPermissionMode"], "bypassPermissions");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("loadConfig: claude.initialPermissionMode 非法值给出清晰错误", () => {
+  const home = freshHome();
+  try {
+    const cfgPath = join(home, "config.yaml");
+    writeFileSync(cfgPath, "claude:\n  initialPermissionMode: yolo\n", "utf8");
+    assert.throws(
+      () => loadConfig({ PI_WORKBENCH_HOME: home }),
+      (err: unknown) => err instanceof Error && err.message.includes("claude.initialPermissionMode"),
+    );
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("loadConfig: PI_WORKBENCH_CLAUDE_INITIAL_MODE 覆盖运行值，不写回文件", () => {
+  const home = freshHome();
+  try {
+    const cfg = loadConfig({ PI_WORKBENCH_HOME: home, PI_WORKBENCH_CLAUDE_INITIAL_MODE: "bypassPermissions" });
+    assert.equal(cfg.claude.initialPermissionMode, "bypassPermissions");
+    const written = parseYaml(readFileSync(join(home, "config.yaml"), "utf8")) as Record<string, unknown>;
+    const claude = written["claude"] as Record<string, unknown>;
+    assert.equal(claude["initialPermissionMode"], "auto");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("loadConfig: PI_WORKBENCH_CODEX_INITIAL_MODE 覆盖运行值，不写回文件", () => {
+  const home = freshHome();
+  try {
+    const cfg = loadConfig({ PI_WORKBENCH_HOME: home, PI_WORKBENCH_CODEX_INITIAL_MODE: "agent-full-access" });
+    assert.equal(cfg.codex.initialAgentMode, "agent-full-access");
+    const written = parseYaml(readFileSync(join(home, "config.yaml"), "utf8")) as Record<string, unknown>;
+    const codex = written["codex"] as Record<string, unknown>;
+    assert.equal(codex["initialAgentMode"], "workspace-write");
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

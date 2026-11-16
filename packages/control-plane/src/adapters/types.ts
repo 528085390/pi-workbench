@@ -8,6 +8,8 @@
  */
 import type { SessionStatus } from "@pi-workbench/shared";
 
+import type { ClaudeInitialPermissionMode } from "../config.ts";
+
 /** 归一化后的 update 种类（映射表见 claude.ts 的 mapSessionUpdate） */
 export type AdapterUpdateKind =
   | "text"
@@ -38,6 +40,8 @@ export type AdapterSpawnOptions = {
   env?: NodeJS.ProcessEnv;
   /** 子进程 cwd，默认继承当前进程 */
   cwd?: string;
+  /** 新会话建立后要设置的 Claude 权限模式；仅 Claude adapter 使用 */
+  initialPermissionMode?: ClaudeInitialPermissionMode;
 };
 
 /** 一个回合的结束信息 */

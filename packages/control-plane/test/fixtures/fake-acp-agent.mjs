@@ -16,6 +16,7 @@
  *   ERROR      → 先发 agent_message_chunk 再发 idle+stopReason:"error"（测回合失败，C1）
  * 普通 prompt：发 thought / text / tool_call / tool_result 更新，最后 idle + end_turn。
  */
+import { appendFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
 const PROTOCOL_VERSION = 2;
@@ -31,6 +32,9 @@ if (argv.includes("--fail-init")) {
 }
 /** --fail-resume：session/resume 回错误，测 E_RESUME_REJECTED */
 const FAIL_RESUME = argv.includes("--fail-resume");
+/** --record-config <path>：把 session/set_config_option 请求追加到文件，测权限模式设置 */
+const recordConfigIndex = argv.indexOf("--record-config");
+const RECORD_CONFIG = recordConfigIndex >= 0 ? argv[recordConfigIndex + 1] : undefined;
 
 let sessionSeq = 0;
 let msgSeq = 0;
@@ -214,6 +218,13 @@ async function handleMessage(message) {
     }
     respond(message.id, {});
     emitUpdate(params.sessionId, { sessionUpdate: "state_update", state: "idle" });
+    return;
+  }
+  if (method === "session/set_config_option") {
+    if (RECORD_CONFIG !== undefined) {
+      appendFileSync(RECORD_CONFIG, JSON.stringify(params) + "\n", "utf8");
+    }
+    respond(message.id, { configOptions: [] });
     return;
   }
   if (method === "session/close") {

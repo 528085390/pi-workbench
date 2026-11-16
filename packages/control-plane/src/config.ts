@@ -9,6 +9,18 @@ import { DEFAULT_PORT } from "@pi-workbench/shared";
 /** 权限模式：auto_allow = 自动 allow_once；deny = 一律拒绝，留给人工接管 */
 export type PermissionMode = "auto_allow" | "deny";
 
+/** codex-acp 的初始 Agent 模式（INITIAL_AGENT_MODE）；默认 workspace-write，避免触发 Codex Guardian。 */
+export type CodexInitialAgentMode = "read-only" | "workspace-write" | "agent" | "agent-full-access";
+
+/** Claude ACP 的初始权限模式（session/set_config_option 的 mode）；默认 auto，用户可显式开到 bypassPermissions。 */
+export type ClaudeInitialPermissionMode =
+  | "default"
+  | "acceptEdits"
+  | "auto"
+  | "bypassPermissions"
+  | "dontAsk"
+  | "plan";
+
 /** 控制面配置（后续任务消费：host / port / home / authToken / leaseTtlMs / claude.* / codex.* / pi.*） */
 export type Config = {
   host: string;
@@ -19,10 +31,12 @@ export type Config = {
   claude: {
     adapterCmd: string[];
     permissionMode: PermissionMode;
+    initialPermissionMode: ClaudeInitialPermissionMode;
   };
   codex: {
     adapterCmd: string[];
     permissionMode: PermissionMode;
+    initialAgentMode: CodexInitialAgentMode;
   };
   pi: {
     rpcCmd: string[];
@@ -35,6 +49,10 @@ export const DEFAULT_HOST = "127.0.0.1";
 /** 默认租约 TTL（毫秒）：唯一来源，`lease.ts` 直接 import 复用，勿另起同名常量。 */
 export const DEFAULT_LEASE_TTL_MS = 30_000;
 export const DEFAULT_PERMISSION_MODE: PermissionMode = "auto_allow";
+/** Claude 默认 auto（保持现有行为）；需要完全权限时显式改为 bypassPermissions。 */
+export const DEFAULT_CLAUDE_INITIAL_PERMISSION_MODE: ClaudeInitialPermissionMode = "auto";
+/** Codex 默认用 workspace-write：不跑 Guardian，保留工作区沙箱；需要全盘权限时显式改为 agent-full-access。 */
+export const DEFAULT_CODEX_INITIAL_AGENT_MODE: CodexInitialAgentMode = "workspace-write";
 /**
  * Claude ACP adapter 的回落启动命令：本地装不到 `@agentclientprotocol/claude-agent-acp` 时才用。
  * A00 实测入口见 docs/evidence/phase-0.5a-a00.md；优先走 `resolveDefaultAdapterCmd` 的本地入口。
@@ -174,6 +192,33 @@ function readPermissionMode(
   throw new Error(`配置错误：${configPath} 中 ${key} 必须是 "auto_allow" 或 "deny"，实际为 ${JSON.stringify(value)}`);
 }
 
+function readCodexInitialAgentMode(value: unknown, label: string): CodexInitialAgentMode | undefined {
+  if (value === undefined) return undefined;
+  if (value === "read-only" || value === "workspace-write" || value === "agent" || value === "agent-full-access") {
+    return value;
+  }
+  throw new Error(
+    `配置错误：${label} 中 codex.initialAgentMode 必须是 "read-only" | "workspace-write" | "agent" | "agent-full-access"，实际为 ${JSON.stringify(value)}`,
+  );
+}
+
+function readClaudeInitialPermissionMode(value: unknown, label: string): ClaudeInitialPermissionMode | undefined {
+  if (value === undefined) return undefined;
+  if (
+    value === "default" ||
+    value === "acceptEdits" ||
+    value === "auto" ||
+    value === "bypassPermissions" ||
+    value === "dontAsk" ||
+    value === "plan"
+  ) {
+    return value;
+  }
+  throw new Error(
+    `配置错误：${label} 中 claude.initialPermissionMode 必须是 "default" | "acceptEdits" | "auto" | "bypassPermissions" | "dontAsk" | "plan"，实际为 ${JSON.stringify(value)}`,
+  );
+}
+
 function readCommand(value: unknown, configPath: string, key: string): string[] | undefined {
   if (value === undefined) return undefined;
   if (Array.isArray(value) && value.length > 0 && value.every((part) => typeof part === "string" && part.length > 0)) {
@@ -253,10 +298,12 @@ function toFileShape(cfg: Config): Record<string, unknown> {
     claude: {
       adapterCmd: cfg.claude.adapterCmd,
       permissionMode: cfg.claude.permissionMode,
+      initialPermissionMode: cfg.claude.initialPermissionMode,
     },
     codex: {
       adapterCmd: cfg.codex.adapterCmd,
       permissionMode: cfg.codex.permissionMode,
+      initialAgentMode: cfg.codex.initialAgentMode,
     },
     pi,
   };
@@ -284,8 +331,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const fileToken = readToken(values["authToken"]);
   const fileAdapter = readAdapterCmd(claude["adapterCmd"], configPath);
   const fileMode = readPermissionMode(claude["permissionMode"], configPath, "claude.permissionMode");
+  const fileClaudeInitialMode = readClaudeInitialPermissionMode(claude["initialPermissionMode"], configPath);
   const fileCodexAdapter = readCommand(codex["adapterCmd"], configPath, "codex.adapterCmd");
   const fileCodexMode = readPermissionMode(codex["permissionMode"], configPath, "codex.permissionMode");
+  const fileCodexInitialMode = readCodexInitialAgentMode(codex["initialAgentMode"], configPath);
 
   // 先解析本地包，再判断文件里的旧 npx 回落命令是否需要迁到本地入口。
   const resolvedAdapter = resolveDefaultAdapterCmd();
@@ -306,10 +355,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     claude: {
       adapterCmd: chosenAdapter.command,
       permissionMode: fileMode ?? DEFAULT_PERMISSION_MODE,
+      initialPermissionMode: fileClaudeInitialMode ?? DEFAULT_CLAUDE_INITIAL_PERMISSION_MODE,
     },
     codex: {
       adapterCmd: chosenCodexAdapter.command,
       permissionMode: fileCodexMode ?? DEFAULT_PERMISSION_MODE,
+      initialAgentMode: fileCodexInitialMode ?? DEFAULT_CODEX_INITIAL_AGENT_MODE,
     },
     pi: {
       rpcCmd: filePiCmd ?? [...DEFAULT_PI_RPC_CMD],
@@ -323,7 +374,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   // 兼容两个名字：daemon 侧历史上用 PI_WORKBENCH_AUTH_TOKEN，客户端/CLI/e2e 用 PI_WORKBENCH_TOKEN。
   // 只认前者时，用后者启动的 daemon 会「静默无鉴权」——所以两个都认，AUTH_TOKEN 优先。
   const envToken = (env.PI_WORKBENCH_AUTH_TOKEN ?? env.PI_WORKBENCH_TOKEN)?.trim();
+  const envClaudeInitialMode = readClaudeInitialPermissionMode(
+    env.PI_WORKBENCH_CLAUDE_INITIAL_MODE,
+    "PI_WORKBENCH_CLAUDE_INITIAL_MODE",
+  );
   const envCodexCmd = parseCommandEnv(env.PI_WORKBENCH_CODEX_CMD, "PI_WORKBENCH_CODEX_CMD");
+  const envCodexInitialMode = readCodexInitialAgentMode(
+    env.PI_WORKBENCH_CODEX_INITIAL_MODE,
+    "PI_WORKBENCH_CODEX_INITIAL_MODE",
+  );
   const envPiCmd = parseCommandEnv(env.PI_WORKBENCH_PI_CMD, "PI_WORKBENCH_PI_CMD");
 
   const cfg: Config = {
@@ -334,9 +393,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
         ? assertPort(Number(envPortRaw), "PI_WORKBENCH_PORT")
         : persisted.port,
     authToken: envToken !== undefined && envToken.length > 0 ? envToken : persisted.authToken,
+    claude: {
+      ...persisted.claude,
+      initialPermissionMode: envClaudeInitialMode ?? persisted.claude.initialPermissionMode,
+    },
     codex: {
       ...persisted.codex,
       adapterCmd: envCodexCmd ?? persisted.codex.adapterCmd,
+      initialAgentMode: envCodexInitialMode ?? persisted.codex.initialAgentMode,
     },
     pi: {
       ...persisted.pi,
@@ -352,8 +416,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     fileToken === undefined ||
     fileAdapter === undefined ||
     fileMode === undefined ||
+    fileClaudeInitialMode === undefined ||
     fileCodexAdapter === undefined ||
     fileCodexMode === undefined ||
+    fileCodexInitialMode === undefined ||
     chosenAdapter.migrated ||
     chosenCodexAdapter.migrated ||
     filePiCmd === undefined;

@@ -102,9 +102,9 @@ function makeConfig(home: string, overrides: Partial<Config> = {}): Config {
     home,
     authToken: null,
     leaseTtlMs: 30_000,
-    claude: { adapterCmd: [process.execPath], permissionMode: "auto_allow" },
+    claude: { adapterCmd: [process.execPath], permissionMode: "auto_allow", initialPermissionMode: "auto" },
     ...overrides,
-    codex: overrides.codex ?? { adapterCmd: [process.execPath], permissionMode: "auto_allow" },
+    codex: overrides.codex ?? { adapterCmd: [process.execPath], permissionMode: "auto_allow", initialAgentMode: "workspace-write" },
     pi: overrides.pi ?? { rpcCmd: ["pi", "--mode", "rpc"] },
   };
 }
@@ -278,7 +278,7 @@ test("GET /agents 复用能力矩阵常量（R37）", async () => {
 
 test("GET /agents：adapter 命令解析不到 → available:false（R37）", async () => {
   const h = await makeHarness({
-    config: { claude: { adapterCmd: ["C:/nonexistent/pi-workbench-nope.exe"], permissionMode: "auto_allow" } },
+    config: { claude: { adapterCmd: ["C:/nonexistent/pi-workbench-nope.exe"], permissionMode: "auto_allow", initialPermissionMode: "auto" } },
   });
   try {
     const res = await h.app.inject({ method: "GET", url: API + "/agents" });

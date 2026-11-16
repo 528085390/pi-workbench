@@ -32,7 +32,7 @@ import type {
 import { WORKBENCH_VERSION } from "@pi-workbench/shared";
 import type { SessionStatus } from "@pi-workbench/shared";
 
-import type { Config, PermissionMode } from "../config.ts";
+import type { ClaudeInitialPermissionMode, Config, PermissionMode } from "../config.ts";
 import { isWorkbenchError, WorkbenchError } from "../errors.ts";
 import type { AdapterSpawnOptions, AdapterTurnResult, AdapterUpdate, AgentAdapter } from "./types.ts";
 
@@ -74,6 +74,7 @@ export class ClaudeAdapter implements AgentAdapter {
   readonly #child: ChildProcess;
   readonly #conn: ClientConnection;
   readonly #permissionMode: PermissionMode;
+  readonly #initialPermissionMode: ClaudeInitialPermissionMode | undefined;
   readonly #exit: Deferred<void>;
   readonly #stderr: string[];
   readonly #listeners = new Set<(update: AdapterUpdate) => void>();
@@ -85,9 +86,14 @@ export class ClaudeAdapter implements AgentAdapter {
   #downReason = PLACEHOLDER_DOWN_REASON;
   #disposed = false;
 
-  private constructor(child: ChildProcess, permissionMode: PermissionMode) {
+  private constructor(
+    child: ChildProcess,
+    permissionMode: PermissionMode,
+    initialPermissionMode?: ClaudeInitialPermissionMode,
+  ) {
     this.#child = child;
     this.#permissionMode = permissionMode;
+    this.#initialPermissionMode = initialPermissionMode;
     this.#exit = createDeferred<void>();
     this.#stderr = [];
 
@@ -160,7 +166,7 @@ export class ClaudeAdapter implements AgentAdapter {
       });
     }
 
-    const adapter = new ClaudeAdapter(child, cfg.claude.permissionMode);
+    const adapter = new ClaudeAdapter(child, cfg.claude.permissionMode, options.initialPermissionMode);
     try {
       await adapter.#handshake();
     } catch (error) {
@@ -177,6 +183,7 @@ export class ClaudeAdapter implements AgentAdapter {
       () => this.#conn.agent.request(methods.agent.session.new, { cwd }),
       SESSION_CALL_TIMEOUT_MS,
     );
+    await this.#applyInitialPermissionMode(response.sessionId);
     return { sessionId: response.sessionId };
   }
 
@@ -187,6 +194,7 @@ export class ClaudeAdapter implements AgentAdapter {
         () => this.#conn.agent.request(methods.agent.session.resume, { sessionId, cwd }),
         SESSION_CALL_TIMEOUT_MS,
       );
+      await this.#applyInitialPermissionMode(sessionId);
     } catch (error) {
       const adapted = this.#adaptError(error, "resume");
       if (adapted.code === "E_ADAPTER_DOWN") {
@@ -197,6 +205,24 @@ export class ClaudeAdapter implements AgentAdapter {
         cause: adapted.message,
       });
     }
+  }
+
+  /** 新会话/恢复会话后显式设置权限模式；不依赖 settings.defaultMode（可能被信任过滤器降级）。 */
+  async #applyInitialPermissionMode(sessionId: string): Promise<void> {
+    const mode = this.#initialPermissionMode;
+    if (mode === undefined) {
+      return;
+    }
+    await this.#await(
+      "setPermissionMode",
+      () => this.#conn.agent.request(methods.agent.session.setConfigOption, {
+        sessionId,
+        configId: "mode",
+        type: "id",
+        value: mode,
+      }),
+      SESSION_CALL_TIMEOUT_MS,
+    );
   }
 
   /**

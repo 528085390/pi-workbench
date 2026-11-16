@@ -38,12 +38,14 @@ export async function spawnCodexAcpAdapter(
     claude: {
       adapterCmd,
       permissionMode: config.codex.permissionMode,
+      initialPermissionMode: "auto",
     },
   };
   const spawnOptions: AdapterSpawnOptions = {
     adapterCmd,
     ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
-    ...(options.env === undefined ? {} : { env: options.env }),
+    // codex-acp 的默认模式是 agent（Auto review），会触发 Guardian；显式注入初始模式。
+    env: { ...options.env, INITIAL_AGENT_MODE: config.codex.initialAgentMode },
   };
   return await ClaudeAdapter.spawn(spawnConfig, spawnOptions);
 }

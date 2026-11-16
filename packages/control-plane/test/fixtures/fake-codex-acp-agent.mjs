@@ -12,7 +12,7 @@
  *          session/prompt / session/cancel / session/close。
  * prompt 的普通文本会回 codex-pong:<text>，并结束回合（idle + end_turn）。
  */
-import { appendFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
 const PROTOCOL_VERSION = 2;
@@ -24,9 +24,14 @@ function argValue(name) {
 }
 
 const recordPath = argValue("--record");
+const recordEnvPath = argValue("--record-env");
 const failInit = argv.includes("--fail-init");
 const failResume = argv.includes("--fail-resume");
 const hangCancel = argv.includes("--hang-cancel");
+
+if (recordEnvPath !== undefined) {
+  writeFileSync(recordEnvPath, process.env.INITIAL_AGENT_MODE ?? "", "utf8");
+}
 
 if (failInit) {
   process.stderr.write("fake-codex-acp: --fail-init，握手前退出\n");
