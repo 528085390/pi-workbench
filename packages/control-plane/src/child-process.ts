@@ -1,8 +1,69 @@
 import { createRequire, syncBuiltinESMExports } from "node:module";
 
+import type { AgentName } from "@pi-workbench/shared";
+
+import type { ProcessRegistry, TrackedChild } from "./process-registry.ts";
+
 type ChildProcessModule = typeof import("node:child_process");
 
 let installed = false;
+
+/** 当前进程的登记表；index.ts 在启动时注入，spawn 补丁据此登记 adapter / RPC 子进程。 */
+let processRegistry: ProcessRegistry | null = null;
+
+/** 注入 / 清除 ProcessRegistry。必须在 adapter / RPC 子进程启动前调用。 */
+export function setProcessRegistry(registry: ProcessRegistry | null): void {
+  processRegistry = registry;
+}
+
+/** 从 spawn 的 command + args 猜测所属 agent，仅用于退出治理筛选会话。 */
+export function detectSpawnAgent(command: unknown, args: unknown): AgentName | undefined {
+  const parts: string[] = [];
+  if (typeof command === "string") {
+    parts.push(command);
+  }
+  if (Array.isArray(args)) {
+    for (const arg of args) {
+      if (typeof arg === "string") {
+        parts.push(arg);
+      }
+    }
+  }
+  const text = parts.join(" ").toLowerCase();
+  if (text.includes("claude-agent-acp")) {
+    return "claude";
+  }
+  if (text.includes("codex-acp")) {
+    return "codex";
+  }
+  const leaf = String(command).toLowerCase().split(/[\\/]/).pop() ?? "";
+  if (text.includes("pi-coding-agent") || text.includes("--mode rpc") || leaf === "pi" || leaf === "pi.cmd" || leaf === "pi.exe") {
+    return "pi";
+  }
+  return undefined;
+}
+
+/** label 按计划取命令行首项。 */
+function commandLabel(command: unknown): string {
+  if (typeof command === "string") {
+    return command;
+  }
+  if (command instanceof URL) {
+    return command.href;
+  }
+  return String(command);
+}
+
+function registerSpawnedChild(child: unknown, command: unknown, args: unknown): void {
+  if (processRegistry === null || child === null || typeof child !== "object") {
+    return;
+  }
+  const tracked = child as Partial<TrackedChild>;
+  if (typeof tracked.once !== "function") {
+    return;
+  }
+  processRegistry.track(tracked as TrackedChild, commandLabel(command), detectSpawnAgent(command, args));
+}
 
 /**
  * 给 spawn 的结果补 windowsHide: true。
@@ -19,10 +80,12 @@ let installed = false;
 export function wrapSpawnWithHiddenWindow(spawnImpl: typeof import("node:child_process").spawn): typeof import("node:child_process").spawn {
   return ((...args: unknown[]) => {
     const [command, commandArgs, options] = args;
-    return (spawnImpl as (...callArgs: unknown[]) => unknown)(command, commandArgs, {
+    const child = (spawnImpl as (...callArgs: unknown[]) => unknown)(command, commandArgs, {
       windowsHide: true,
       ...(options as Record<string, unknown> | undefined ?? {}),
     });
+    registerSpawnedChild(child, command, commandArgs);
+    return child;
   }) as typeof import("node:child_process").spawn;
 }
 
