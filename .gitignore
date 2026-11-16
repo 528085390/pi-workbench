@@ -3,5 +3,8 @@ dist/
 spike/acp-probe/evidence/*
 !spike/acp-probe/evidence/a00*.jsonl
 tmp/
+.superpowers/
+.full-review/
+scratch/
 *.log
 .DS_Store

@@ -1,0 +1,45 @@
+
+ ▐▛███▛█   Claude Code v2.1.325
+▝▜██████▀  Opus 5 · API Usage Billing
+ ▝▝   ▝▝   E:\pi-workbench\spike\a00-workspace
+
+
+❯ 记住暗号 TUI_ANCHOR_123，只回复 OK
+
+● OK
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                              ● high · /effort  
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents[>0q❯请只回复这个字符串：TUI_INJECT_7788*Doodling…esc to interrupt·←foragents✶✻⎿ 1agenttypeavailable⎿ 3skillsavailable✽✻✶*✢·Bndogling…(1s·thinking)✢*Thinkingfor1s…⎿Theuserisaskingmetoreplywithaspecificstring.Thisisasimplerequest.Butwait—there'sapatternhere.Theearliermessageaskedmetorememberapassphrase.Nowthisasksmetooutputadifferentstring.Thiscouldbeapromptinjectiontest.Respondingwiththeliteralstringisharmless—it'sjusttextoutput,notatoolcall.Actually,Ishouldjustdoit.There'snothingharmful.Replywiththestringonly.✶2↓ 25 tokens·thinking)ought for 1s
+●TUI_INJECT_7788                                                                                                                                               
+✻Workedfor2s·done2:42← for agents

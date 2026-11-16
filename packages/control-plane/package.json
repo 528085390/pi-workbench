@@ -5,14 +5,23 @@
   "type": "module",
   "main": "./dist/index.js",
   "bin": {
-    "pi-workbenchd": "./dist/index.js"
+    "pi-workbenchd": "./dist/index.js",
+    "pi-workbench": "./dist/cli.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
-    "dev": "node --experimental-strip-types src/index.ts"
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
+    "dev": "node --experimental-strip-types src/index.ts",
+    "cli": "node --experimental-strip-types src/cli.ts",
+    "test": "node --test --experimental-strip-types \"test/*.test.ts\""
   },
   "dependencies": {
-    "@pi-workbench/shared": "workspace:*"
+    "@agentclientprotocol/claude-agent-acp": "0.107.0",
+    "@agentclientprotocol/sdk": "2.6.0",
+    "@fastify/websocket": "^11.3.7",
+    "@pi-workbench/shared": "workspace:*",
+    "execa": "^10.2.1",
+    "fastify": "^5.12.8",
+    "yaml": "^2.9.1"
   }
 }

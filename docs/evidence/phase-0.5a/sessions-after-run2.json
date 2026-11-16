@@ -1,0 +1,44 @@
+[
+  {
+    "key": "claude:19983001-3253-4a22-9bbb-350819eee2c8",
+    "agent": "claude",
+    "nativeId": "19983001-3253-4a22-9bbb-350819eee2c8",
+    "acpSessionId": "19983001-3253-4a22-9bbb-350819eee2c8",
+    "cwd": "E:\\pi-workbench\\spike\\a00-workspace",
+    "transcriptPath": "C:\\Users\\huang\\.claude\\projects\\E--pi-workbench-spike-a00-workspace\\19983001-3253-4a22-9bbb-350819eee2c8.jsonl",
+    "status": "idle",
+    "driver": "pi",
+    "capabilities": {
+      "stream": true,
+      "inject": true,
+      "interrupt": true,
+      "attach": false,
+      "resume": true,
+      "transcript": true,
+      "permissions": true,
+      "background": false
+    },
+    "kind": "interactive"
+  },
+  {
+    "key": "claude:3569f43e-173d-44ef-ab7d-12a8e249613b",
+    "agent": "claude",
+    "nativeId": "3569f43e-173d-44ef-ab7d-12a8e249613b",
+    "acpSessionId": "3569f43e-173d-44ef-ab7d-12a8e249613b",
+    "cwd": "E:\\pi-workbench\\spike\\a00-workspace",
+    "transcriptPath": "C:\\Users\\huang\\.claude\\projects\\E--pi-workbench-spike-a00-workspace\\3569f43e-173d-44ef-ab7d-12a8e249613b.jsonl",
+    "status": "idle",
+    "driver": "pi",
+    "capabilities": {
+      "stream": true,
+      "inject": true,
+      "interrupt": true,
+      "attach": false,
+      "resume": true,
+      "transcript": true,
+      "permissions": true,
+      "background": false
+    },
+    "kind": "interactive"
+  }
+]

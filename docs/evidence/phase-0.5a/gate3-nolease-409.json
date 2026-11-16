@@ -1,0 +1,54 @@
+{
+  "at": "2026-11-14T18:49:16.637Z",
+  "nonce": "69a0fecb",
+  "dispatch": {
+    "status": 200,
+    "json": {
+      "key": "claude:9325ca39-cd0e-4594-9e94-55eeaadefbe5",
+      "agent": "claude",
+      "nativeId": "9325ca39-cd0e-4594-9e94-55eeaadefbe5",
+      "acpSessionId": "9325ca39-cd0e-4594-9e94-55eeaadefbe5",
+      "cwd": "E:\\pi-workbench\\spike\\a00-workspace",
+      "transcriptPath": "C:\\Users\\huang\\.claude\\projects\\E--pi-workbench-spike-a00-workspace\\9325ca39-cd0e-4594-9e94-55eeaadefbe5.jsonl",
+      "status": "running",
+      "driver": "pi",
+      "capabilities": {
+        "stream": true,
+        "inject": true,
+        "interrupt": true,
+        "attach": false,
+        "resume": true,
+        "transcript": true,
+        "permissions": true,
+        "background": false
+      },
+      "kind": "interactive"
+    }
+  },
+  "injectWithoutLease": {
+    "status": 409,
+    "json": {
+      "error": {
+        "code": "E_NO_LEASE",
+        "message": "无有效租约：claude:9325ca39-cd0e-4594-9e94-55eeaadefbe5",
+        "details": {
+          "sessionKey": "claude:9325ca39-cd0e-4594-9e94-55eeaadefbe5",
+          "clientId": "t10-rogue"
+        }
+      }
+    }
+  },
+  "checkpointWithoutLease": {
+    "status": 409,
+    "json": {
+      "error": {
+        "code": "E_NO_LEASE",
+        "message": "无有效租约：claude:9325ca39-cd0e-4594-9e94-55eeaadefbe5",
+        "details": {
+          "sessionKey": "claude:9325ca39-cd0e-4594-9e94-55eeaadefbe5",
+          "clientId": "t10-rogue"
+        }
+      }
+    }
+  }
+}

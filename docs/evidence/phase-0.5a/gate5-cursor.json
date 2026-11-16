@@ -1,0 +1,44 @@
+{
+  "at": "2026-11-14T18:49:39.430Z",
+  "sessionKey": "claude:422c46b8-948a-4f87-8574-07e507561ada",
+  "page1": {
+    "after": "0",
+    "limit": 3,
+    "ids": [
+      "04da3a73-88b9-4838-a021-cf2e9cf92be5:0",
+      "f2ef0bf3-8a2d-42a8-830b-5747f68b0999:0",
+      "43c3f43c-d112-42d0-a007-25219d2f9ce1:0"
+    ],
+    "nextCursor": "188545",
+    "previews": [
+      {
+        "role": "user",
+        "text": "请只回答这一行，不要加任何别的内容：T10_READY_82421d61"
+      },
+      {
+        "role": "assistant",
+        "text": "T10_READY_82421d61"
+      },
+      {
+        "role": "user",
+        "text": "请只回答这一行，不要加任何别的内容：T10_INJ_82421d61"
+      }
+    ]
+  },
+  "page2": {
+    "after": "188545",
+    "limit": 3,
+    "ids": [
+      "4d521871-2973-41e0-aeaa-4ab0212a6d83:0"
+    ],
+    "nextCursor": "191072",
+    "previews": [
+      {
+        "role": "assistant",
+        "text": "T10_INJ_82421d61"
+      }
+    ]
+  },
+  "duplicates": [],
+  "cursorAdvanced": true
+}

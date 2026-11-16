@@ -1,0 +1,44 @@
+{
+  "at": "2026-11-14T18:50:02.593Z",
+  "nonce": "37f65616",
+  "sessionKey": "claude:96b22896-d67b-4f90-be9e-976f78b0e327",
+  "clientId": "t10-g4-37f65616",
+  "dispatchStatus": "running",
+  "statusBeforeInterrupt": "running",
+  "statusAfterInterrupt": "idle",
+  "interrupt": {
+    "status": 200,
+    "response": {
+      "stopReason": "cancelled"
+    }
+  },
+  "assistantCharsBeforeInterrupt": 578,
+  "assistantTextBeforeInterrupt": "The user wants me to count from 1 to 400, one number per line, no omissions, no summary. This is a simple task but long output. I should just do it.\n\nLet me gen",
+  "eventsAfterInterrupt": [
+    {
+      "seq": 1018,
+      "sessionKey": "claude:96b22896-d67b-4f90-be9e-976f78b0e327",
+      "type": "state_update",
+      "source": "claude",
+      "ts": "2026-11-14T18:50:01.568Z",
+      "payload": {
+        "state": "idle",
+        "stopReason": "cancelled"
+      }
+    },
+    {
+      "seq": 1019,
+      "sessionKey": "claude:96b22896-d67b-4f90-be9e-976f78b0e327",
+      "type": "state_update",
+      "source": "claude",
+      "ts": "2026-11-14T18:50:01.577Z",
+      "payload": {
+        "state": "idle",
+        "stopReason": "cancelled",
+        "clientId": "t10-g4-37f65616"
+      }
+    }
+  ],
+  "totalEventsCaptured": 45,
+  "seqMonotonic": true
+}

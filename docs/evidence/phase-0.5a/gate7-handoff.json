@@ -1,0 +1,27 @@
+{
+  "at": "2026-11-14T18:50:58.180Z",
+  "nonce": "e3fbdcbb",
+  "sessionKey": "claude:2937f287-81d2-4ac2-a08c-7c9b6c59570b",
+  "nativeId": "2937f287-81d2-4ac2-a08c-7c9b6c59570b",
+  "clientId": "t10-g7-e3fbdcbb",
+  "handoff": {
+    "status": 200,
+    "response": {
+      "checkpoint": {
+        "sessionKey": "claude:2937f287-81d2-4ac2-a08c-7c9b6c59570b",
+        "summary": "T10 handoff e3fbdcbb：交给人工在原生 TUI 里回一轮",
+        "touchedFiles": [],
+        "nextStep": "claude --resume 2937f287-81d2-4ac2-a08c-7c9b6c59570b 后回答 T10_NATIVE_e3fbdcbb",
+        "transcriptCursor": "187534",
+        "createdAt": "2026-11-14T18:50:58.159Z",
+        "path": "E:\\pi-workbench\\tmp\\t10-home\\handoffs\\claude-2937f287-81d2-4ac2-a08c-7c9b6c59570b-2026-11-14T18-50-58.159Z.md"
+      },
+      "command": [
+        "claude",
+        "--resume",
+        "2937f287-81d2-4ac2-a08c-7c9b6c59570b"
+      ],
+      "mode": "resume-tui"
+    }
+  }
+}

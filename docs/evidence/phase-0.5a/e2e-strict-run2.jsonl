@@ -1,0 +1,14 @@
+{"ts":"2026-11-14T18:57:57.412Z","step":"start","ok":true,"detail":"{\"baseUrl\":\"http://127.0.0.1:7336\",\"clientId\":\"e2e-8d9c911e\",\"nonce\":\"8d9c911e\",\"logPath\":\"E:\\\\pi-workbench\\\\tmp\\\\e2e-2026-11-14T18-57-57-410Z.jsonl\"}"}
+{"ts":"2026-11-14T18:57:57.425Z","step":"health","ok":true,"detail":"{\"ok\":true,\"name\":\"pi-workbenchd\",\"version\":\"0.0.1\",\"pid\":59576,\"uptimeMs\":52916}"}
+{"ts":"2026-11-14T18:57:59.640Z","step":"dispatch","ok":true,"detail":"{\"key\":\"claude:64cae24a-274e-43a1-a2a9-fe7f9578ebc7\",\"status\":\"running\",\"nativeId\":\"64cae24a-274e-43a1-a2a9-fe7f9578ebc7\"}"}
+{"ts":"2026-11-14T18:57:59.661Z","step":"lease","ok":true,"detail":"{\"clientId\":\"e2e-8d9c911e\",\"expiresAt\":\"2026-11-14T19:27:59.657Z\"}"}
+{"ts":"2026-11-14T18:58:01.900Z","step":"see-ready","ok":true,"detail":"{\"waitedMs\":2238,\"status\":\"running\",\"messages\":3,\"preview\":[\"The user asks: respond in one sentence with E2E_READY_8d9c911e. Simple.\",\"E2E_READY_8d9c911e\"]}"}
+{"ts":"2026-11-14T18:58:01.949Z","step":"inject","ok":true,"detail":"{\"messageId\":\"ffe450cd-6c8e-4b23-94c3-f7a75a01e6eb\",\"effective\":\"now\"}"}
+{"ts":"2026-11-14T18:58:02.460Z","step":"see-inject","ok":true,"detail":"{\"waitedMs\":511,\"messages\":1}"}
+{"ts":"2026-11-14T18:58:02.515Z","step":"interrupt","ok":true,"detail":"{\"stopReason\":\"cancelled\"}"}
+{"ts":"2026-11-14T18:58:02.523Z","step":"checkpoint","ok":true,"detail":"{\"sessionKey\":\"claude:64cae24a-274e-43a1-a2a9-fe7f9578ebc7\",\"summary\":\"E2E 8d9c911e：已跑通 dispatch / see / inject / interrupt\",\"touchedFiles\":[],\"nextStep\":\"人工接管确认一轮，再 handback 回 Pi\",\"transcriptCursor\":\"192308\",\"createdAt\":\"2026-11-14T18:58:02.517Z\",\"path\":\"E:\\\\pi-workbench\\\\tmp\\\\t10-e2e\\\\handoffs\\\\claude-64cae24a-274e-43a1-a2a9-fe7f9578ebc7-2026-11-14T18-58-02.517Z.md\"}"}
+{"ts":"2026-11-14T18:58:02.538Z","step":"handoff","ok":true,"detail":"{\"mode\":\"resume-tui\",\"command\":\"claude --resume 64cae24a-274e-43a1-a2a9-fe7f9578ebc7\"}"}
+{"ts":"2026-11-14T18:58:07.861Z","step":"human-turn","ok":true,"detail":"{\"status\":0,\"sample\":\"E2E_HUMAN_8d9c911e\"}"}
+{"ts":"2026-11-14T18:58:07.863Z","step":"lease-handback","ok":true,"detail":"{\"clientId\":\"handoff-e2e-8d9c911e\"}"}
+{"ts":"2026-11-14T18:58:08.759Z","step":"handback","ok":true,"detail":"{\"resumed\":true,\"deltaSummary\":\"assistant: No response requested.\\nuser: 回答E2E_HUMAN_8d9c911e\\nassistant: The user asks to answer \\\"E2E_HUMAN_8d9c911e\\\". Just one line.\\nassistant: E2E_HUMAN_8d9c911e\"}"}
+{"ts":"2026-11-14T18:58:08.759Z","step":"summary","ok":true,"detail":"{\"result\":\"PASS\",\"sessionKey\":\"claude:64cae24a-274e-43a1-a2a9-fe7f9578ebc7\",\"nonce\":\"8d9c911e\",\"logPath\":\"E:\\\\pi-workbench\\\\tmp\\\\e2e-2026-11-14T18-57-57-410Z.jsonl\",\"error\":null}"}
