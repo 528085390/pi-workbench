@@ -16,10 +16,11 @@ import { createHash } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import type { AgentName, Checkpoint, SessionRef } from "@pi-workbench/shared";
+import type { AgentName, Checkpoint, SessionRef, UnifiedMessage } from "@pi-workbench/shared";
 
 import type { AgentAdapter } from "./adapters/types.ts";
 import type { AgentRouter } from "./agents/router.ts";
+import type { AdapterCapability, AgentDriver } from "./agents/types.ts";
 import { CLAUDE_CAPABILITIES } from "./capabilities.ts";
 import type { CheckpointStore, StoredCheckpoint } from "./checkpoints.ts";
 import type { DispatchRecord, DispatchStore } from "./dispatch-store.ts";
@@ -28,8 +29,8 @@ import type { EventStore } from "./events.ts";
 import { DEFAULT_LEASE_TTL_MS } from "./lease.ts";
 import type { LeaseManager } from "./lease.ts";
 import type { SessionRegistry } from "./registry.ts";
-import { claudeProjectDir, readClaudeTranscript } from "./transcript/claude.ts";
-import type { UnifiedMessage } from "./transcript/claude.ts";
+import { claudeProjectDir } from "./transcript/claude.ts";
+import { readTranscript } from "./transcript/index.ts";
 
 /** handoff 后人类接管的租约窗口（R7 / R26：30 分钟，CLI 心跳续期） */
 export const HUMAN_HANDOFF_TTL_MS = 30 * 60 * 1000;
@@ -54,7 +55,7 @@ const DELTA_MAX_CHARS = 120;
 /** checkpoint 游标推进的最大页数（防止异常 reader 造成死循环） */
 const MAX_CURSOR_PAGES = 200;
 
-/** 归一化后的 transcript 读物（默认实现是 readClaudeTranscript，测试可注入） */
+/** 归一化后的 transcript 读物（路径语义；测试可注入，生产由统一 readTranscript 按 agent 分派） */
 export type TranscriptReader = (
   path: string,
   cursor?: string,
@@ -79,6 +80,14 @@ export type DispatchInput = {
   idempotencyKey: string;
 };
 
+/** 驱动层的扩展入口（不属于 AgentDriver 六方法，Codex/Pi 的 dispatch/handoff 用） */
+type DriverRuntime = AgentDriver & {
+  newSession?: (cwd: string) => Promise<{ sessionId: string }>;
+  waitForTurn?: (ref: SessionRef, timeoutMs?: number) => Promise<{ stopReason: string }>;
+  close?: (ref: SessionRef) => Promise<void>;
+  resolveTranscriptPath?: (ref: SessionRef) => Promise<string | undefined>;
+};
+
 export type TakeoverDeps = {
   store: EventStore;
   leases: LeaseManager;
@@ -94,8 +103,15 @@ export type TakeoverDeps = {
   handoffDir: string;
   /** 注入时钟（测试用），默认 Date.now */
   now?: () => number;
-  /** 注入 transcript 读取器，默认 readClaudeTranscript */
+  /** 注入 transcript 读取器（仅 Claude 旧签名；非 Claude 一律走统一 readTranscript） */
   readTranscript?: TranscriptReader;
+  /**
+   * PiDriver 的写者身份。必须与 index.ts 构造 PiDriver 时传的 clientId 一致；
+   * 缺省 "pi"（与扩展默认 clientId 不同：扩展是 pi:<pid>，引擎在写操作期间临时换租约）。
+   */
+  piClientId?: string;
+  /** 临时换租约时使用的 TTL；缺省 LeaseManager 默认值 */
+  piLeaseTtlMs?: number;
 };
 
 export type SeeResult = { messages: UnifiedMessage[]; cursor: string; pending: boolean };
@@ -134,7 +150,9 @@ export class TakeoverEngine {
   readonly #dispatches: DispatchStore;
   readonly #handoffDir: string;
   readonly #now: () => number;
-  readonly #readTranscript: TranscriptReader;
+  readonly #readTranscript: TranscriptReader | undefined;
+  readonly #piClientId: string;
+  readonly #piLeaseTtlMs: number | undefined;
   /**
    * 事件幂等键的进程内序号（round 2 的 Minor）：只做同毫秒去重，不重置。
    * 重置会让同一毫秒内的两条同类事件拿到同一个幂等键，被 EventStore 合并成一条 —— 代价比
@@ -154,7 +172,9 @@ export class TakeoverEngine {
     this.#dispatches = deps.dispatches;
     this.#handoffDir = deps.handoffDir;
     this.#now = deps.now ?? Date.now;
-    this.#readTranscript = deps.readTranscript ?? defaultTranscriptReader;
+    this.#readTranscript = deps.readTranscript;
+    this.#piClientId = deps.piClientId ?? "pi";
+    this.#piLeaseTtlMs = deps.piLeaseTtlMs;
   }
 
   /**
@@ -168,7 +188,7 @@ export class TakeoverEngine {
     if (path === undefined || path.length === 0) {
       return { messages: [], cursor, pending: true };
     }
-    const page = this.#readTranscript(path, cursor);
+    const page = this.#readPage(ref, cursor);
     // M5：reader 报 pending 且一条消息都没有时，游标停在调用方给的位置，绝不倒退成 "0"
     const next = page.pending && page.messages.length === 0 ? cursor : page.nextCursor;
     return { messages: page.messages, cursor: next, pending: page.pending };
@@ -181,6 +201,11 @@ export class TakeoverEngine {
   async inject(key: string, text: string, clientId: string): Promise<InjectResult> {
     this.#leases.assertWriter(key, clientId);
     const ref = this.#requireSession(key);
+    const driver = this.#driverOf(ref);
+    if (driver !== null) {
+      this.#assertDriverCap(driver, "inject");
+      return await this.#driverWrite(ref, clientId, () => driver.inject(ref, text));
+    }
     const { messageId } = await this.#adapter.prompt(ref.nativeId, text);
     return { messageId, effective: ref.status === "running" ? "next_turn" : "now" };
   }
@@ -189,8 +214,15 @@ export class TakeoverEngine {
   async interrupt(key: string, clientId: string): Promise<InterruptResult> {
     this.#leases.assertWriter(key, clientId);
     const ref = this.#requireSession(key);
+    const driver = this.#driverOf(ref);
 
-    const { stopReason } = await this.#adapter.cancel(ref.nativeId);
+    let stopReason: string;
+    if (driver !== null) {
+      this.#assertDriverCap(driver, "interrupt");
+      ({ stopReason } = await this.#driverWrite(ref, clientId, () => driver.interrupt(ref)));
+    } else {
+      ({ stopReason } = await this.#adapter.cancel(ref.nativeId));
+    }
     this.#registry.updateStatus(key, "idle");
     this.#appendState(ref, { state: "idle", stopReason, clientId }, "interrupt");
     return { stopReason };
@@ -213,15 +245,19 @@ export class TakeoverEngine {
   async handoff(key: string, to: "human" | "pi", clientId: string, input?: HandoffInput): Promise<HandoffResult> {
     this.#leases.assertWriter(key, clientId);
     const ref = this.#requireSession(key);
-    // 0.5-B B01-b：接管命令由 driver 提供；没注册 driver 的旧调用保持 0.5-A 的 claude 口径。
-    const exit = await this.#handoffCommand(ref);
+    const driver = this.#driverOf(ref);
 
     // 2. quiesce：运行中先 cancel 并等回合结束（adapter 没有 waitForTurn 就跳过）
     // I4：cancel / close 失败必须留痕 —— 否则租约还指着 pi、状态还是 running，却一条事件都没有
     try {
       if (ref.status === "running") {
-        await this.#adapter.cancel(ref.nativeId);
-        await this.#waitForTurn(ref.nativeId);
+        if (driver !== null) {
+          this.#assertDriverCap(driver, "interrupt");
+          await this.#driverWrite(ref, clientId, () => driver.interrupt(ref));
+        } else {
+          await this.#adapter.cancel(ref.nativeId);
+        }
+        await this.#waitForTurn(ref, driver);
       }
     } catch (err) {
       throw this.#handoffAborted(ref, "cancel", err);
@@ -230,23 +266,40 @@ export class TakeoverEngine {
     // 3. checkpoint（文件 + checkpoints 表）
     const { checkpoint, path } = this.#writeCheckpoint(ref, input ?? defaultHandoffInput(to));
 
-    // 4. 释放 adapter 里的会话，交给原生终端
+    // 4. 释放控制通道里的会话，交给原生终端（没有 close 的 driver，如 Pi，保持原生会话不动）
     try {
-      await this.#adapter.close(ref.nativeId);
+      if (driver !== null) {
+        await this.#closeDriverRef(ref, driver, clientId);
+      } else {
+        await this.#adapter.close(ref.nativeId);
+      }
     } catch (err) {
       throw this.#handoffAborted(ref, "close", err);
     }
 
-    // 5. 租约转给接管的 driver，人类窗口固定 30 分钟
+    // 5. 接管命令由 driver.handoff(ref) 决定（Claude：background attach / interactive --resume；
+    //    Codex：codex resume <id> --no-alt-screen；Pi：pi --session <file>）。
+    //    放在 checkpoint / close 之后：handoff 只拼命令，不执行，也不依赖 adapter 仍存活。
+    let exit: { command: string[]; mode: "resume-tui" | "attach" };
+    try {
+      exit = await this.#handoffCommand(ref, driver, clientId);
+    } catch (err) {
+      // 能力门禁 / Agent 不可用是请求级 422，不能被 handoff 的止损包装成 503
+      if (isWorkbenchError(err) && (err.code === "E_CAP_UNSUPPORTED" || err.code === "E_AGENT_UNAVAILABLE")) {
+        throw err;
+      }
+      throw this.#handoffAborted(ref, "handoff", err);
+    }
+
+    // 6. 租约转给接管的 driver，人类窗口固定 30 分钟
     this.#leases.release(key, clientId);
     this.#leases.acquire(key, to, HANDOFF_CLIENT_PREFIX + clientId, HUMAN_HANDOFF_TTL_MS);
 
-    // 6. 注册表 + 事件
+    // 7. 注册表 + 事件
     const next: SessionRef = { ...ref, driver: to, status: "handoff" };
     this.#registry.upsert(next);
     this.#appendState(next, { state: "handoff", driver: to, checkpointPath: path, to }, "handoff");
 
-    // 7. 接管命令由 driver.handoff(ref) 决定（Claude：background 走 attach，interactive 走 --resume）
     return { checkpoint, command: exit.command, mode: exit.mode };
   }
 
@@ -266,9 +319,15 @@ export class TakeoverEngine {
       holder !== null && holder.clientId === HANDOFF_CLIENT_PREFIX + piClientId ? holder.clientId : clientId;
     this.#leases.assertWriter(key, writerId);
     const ref = this.#requireSession(key);
+    const driver = this.#driverOf(ref);
 
     try {
-      await this.#adapter.resume(ref.nativeId, ref.cwd);
+      if (driver !== null) {
+        this.#assertDriverCap(driver, "resume");
+        await this.#driverWrite(ref, writerId, () => driver.resume(ref));
+      } else {
+        await this.#adapter.resume(ref.nativeId, ref.cwd);
+      }
     } catch (err) {
       throw new WorkbenchError("E_RESUME_REJECTED", "恢复会话被拒绝：" + key, {
         sessionKey: key,
@@ -321,6 +380,24 @@ export class TakeoverEngine {
         agent: input.agent,
       });
     }
+    if (this.#router !== undefined && driver !== null) {
+      const status = this.#router.list().find((item) => item.agent === input.agent);
+      if (status !== undefined && !status.available) {
+        throw new WorkbenchError(
+          "E_AGENT_UNAVAILABLE",
+          "Agent 不可用：" + String(input.agent) + (status.reason === undefined ? "" : "（" + status.reason + "）"),
+          { agent: input.agent, reason: status.reason ?? null },
+        );
+      }
+      // 能力门禁在 reserve 之前：能力不足时绝不写幂等记录、绝不拉起 ACP/RPC 子进程
+      this.#assertDriverCap(driver, "inject");
+      if (input.agent !== "claude" && (driver as DriverRuntime).newSession === undefined) {
+        throw new WorkbenchError("E_CAP_UNSUPPORTED", "Agent " + String(input.agent) + " 不支持新建会话", {
+          agent: input.agent,
+          cap: "inject",
+        });
+      }
+    }
     const task = input.task.trim();
     if (task.length === 0) {
       throw new WorkbenchError("E_BAD_REQUEST", "dispatch 的 task 不能为空", { agent: input.agent });
@@ -344,8 +421,18 @@ export class TakeoverEngine {
 
     let sessionId: string;
     try {
-      const opened = await this.#adapter.newSession(resolvedCwd);
-      sessionId = opened.sessionId;
+      if (driver !== null && input.agent !== "claude") {
+        const opener = (driver as DriverRuntime).newSession;
+        if (opener === undefined) {
+          throw new WorkbenchError("E_CAP_UNSUPPORTED", "Agent " + String(input.agent) + " 不支持新建会话", {
+            agent: input.agent,
+          });
+        }
+        sessionId = (await opener.call(driver, resolvedCwd)).sessionId;
+      } else {
+        const opened = await this.#adapter.newSession(resolvedCwd);
+        sessionId = opened.sessionId;
+      }
     } catch (err) {
       throw this.#dispatchFailed(idempotencyKey, "newSession", err);
     }
@@ -365,6 +452,21 @@ export class TakeoverEngine {
       kind: "interactive",
     };
 
+    // Codex 的 rollout 路径在 newSession 后可能已落盘：尽力解析一次并写进 ref（失败保持 pending）
+    if (driver !== null) {
+      const resolve = (driver as DriverRuntime).resolveTranscriptPath;
+      if (resolve !== undefined) {
+        try {
+          const resolvedPath = await resolve.call(driver, ref);
+          if (resolvedPath !== undefined && resolvedPath.length > 0) {
+            ref.transcriptPath = resolvedPath;
+          }
+        } catch {
+          // rollout 未落盘：transcriptPath 保持 undefined，see 返回 pending
+        }
+      }
+    }
+
     // Minor（round 2）：newSession 已经成功，之后任一步失败都必须先回收 adapter 侧会话，
     // 再把幂等键标成 failed —— 否则会话泄漏在 adapter 里，且这个 key 永远停在 reserved。
     try {
@@ -376,13 +478,13 @@ export class TakeoverEngine {
         sessionKey: ref.key,
         type: "notice",
         payload: { kind: "dispatch", idempotencyKey, hash, task, cwd: resolvedCwd },
-        source: "claude",
+        source: ref.agent,
         idempotencyKey: DISPATCH_KEY_PREFIX + idempotencyKey,
       });
       // M6：dispatch 让会话进入 running，除 notice 外再发一条 state_update，按状态分发的消费者才看得到
       this.#appendState(ref, { state: "running", driver: "pi", kind: "dispatch", idempotencyKey }, "dispatch");
     } catch (err) {
-      await this.#discardSession(sessionId);
+      await this.#discardRef(ref, driver);
       // Minor（round 3 / N1）：adapter 会话已经关掉，会话行不能继续停在 running 指向它 ——
       // dispatches.fail 只把 session_key 置空，不碰 sessions 表，于是留下僵尸行。
       // 尽力而为：upsert 本身就是失败点时内存里没有这行（updateStatus 对未知 key 返回 null），
@@ -396,49 +498,149 @@ export class TakeoverEngine {
     }
 
     try {
-      await this.#adapter.prompt(sessionId, task);
+      if (driver !== null && input.agent !== "claude") {
+        await this.#driverWrite(ref, this.#piClientId, () => driver.inject(ref, task));
+      } else {
+        await this.#adapter.prompt(sessionId, task);
+      }
     } catch {
       // R28：投递失败不影响 dispatch 返回；回合结果通过事件流观察
     }
     return ref;
   }
 
-  /**
-   * 尽力关闭 adapter 侧会话（round 2：newSession 成功但后续落库失败时的回收）。
-   * close 自己失败也不抛出 —— 原始失败原因更重要，回收只是止损。
-   */
-  async #discardSession(sessionId: string): Promise<void> {
-    try {
-      await this.#adapter.close(sessionId);
-    } catch {
-      // adapter 已断（shared 进程退出 / IPC 断开）时 close 也会失败，忽略即可
+  #driverOf(ref: SessionRef): AgentDriver | null {
+    return this.#router?.get(ref.agent) ?? null;
+  }
+
+  /** 能力门禁：读 driver.caps 的实时值（router.list() 是注册时快照，不能用于运行时降级） */
+  #assertDriverCap(driver: AgentDriver, cap: AdapterCapability): void {
+    const supported = cap === "see" ? driver.caps.transcript : driver.caps[cap];
+    if (!supported) {
+      throw new WorkbenchError(
+        "E_CAP_UNSUPPORTED",
+        "Agent " + String(driver.agent) + " 不支持能力 " + cap,
+        { agent: driver.agent, cap },
+      );
     }
   }
 
-  /** 等回合结束；adapter 未实现 waitForTurn 或超时都不阻断 handoff（quiesce 尽力而为） */
-  async #waitForTurn(nativeId: string): Promise<void> {
+  /**
+   * PiDriver 写操作的租约身份适配：扩展的 clientId 是 pi:<pid>，而 PiDriver 内部固定用
+   * 构造时的 clientId（index.ts 传 "pi"）。写操作期间把租约临时换成 driver 身份，
+   * 完成后原样还给调用方 —— 同一个 LeaseManager，不会出现 E_LEASE_CONFLICT。
+   * 非 Pi / 无租约 / 租约本来就在 driver 名下时直接执行。
+   */
+  async #driverWrite<T>(ref: SessionRef, clientId: string, fn: () => Promise<T> | T): Promise<T> {
+    const driver = this.#driverOf(ref);
+    if (driver === null || driver.agent !== "pi") {
+      return await fn();
+    }
+    const holder = this.#leases.current(ref.key);
+    if (holder === null || holder.clientId === this.#piClientId || holder.clientId !== clientId) {
+      return await fn();
+    }
+    this.#leases.release(ref.key, clientId);
+    this.#leases.acquire(ref.key, "pi", this.#piClientId, this.#piLeaseTtlMs);
+    try {
+      return await fn();
+    } finally {
+      this.#leases.release(ref.key, this.#piClientId);
+      this.#leases.acquire(ref.key, "pi", clientId, this.#piLeaseTtlMs);
+    }
+  }
+
+  /** 尽力关闭 driver 侧会话（dispatch 落库失败回收 / handoff 第 4 步） */
+  async #discardRef(ref: SessionRef, driver: AgentDriver | null): Promise<void> {
+    try {
+      if (driver !== null) {
+        await this.#closeDriverRef(ref, driver, this.#piClientId);
+      } else {
+        await this.#adapter.close(ref.nativeId);
+      }
+    } catch {
+      // 回收只是止损：adapter / driver 已断时忽略，不覆盖原始失败原因
+    }
+  }
+
+  /**
+   * 关闭控制通道：Claude 走既有 adapter.close；Codex 有扩展 close；Pi 没有 close
+   * （RPC 子进程随 driver.dispose 回收，原生 session 文件不归控制面关）。
+   */
+  async #closeDriverRef(ref: SessionRef, driver: AgentDriver, clientId: string): Promise<void> {
+    if (driver.agent === "claude") {
+      await this.#adapter.close(ref.nativeId);
+      return;
+    }
+    const close = (driver as DriverRuntime).close;
+    if (close === undefined) {
+      return;
+    }
+    await this.#driverWrite(ref, clientId, () => close.call(driver, ref));
+  }
+
+  /** 等回合结束；driver/adapter 未实现 waitForTurn 或超时都不阻断 handoff（quiesce 尽力而为） */
+  async #waitForTurn(ref: SessionRef, driver: AgentDriver | null): Promise<void> {
+    if (driver !== null) {
+      const wait = (driver as DriverRuntime).waitForTurn;
+      if (wait === undefined) {
+        return;
+      }
+      try {
+        await wait.call(driver, ref);
+      } catch {
+        // turn timeout / driver 已在关闭：close 仍要继续
+      }
+      return;
+    }
     const wait = this.#adapter.waitForTurn;
     if (wait === undefined) {
       return;
     }
     try {
-      await wait.call(this.#adapter, nativeId);
+      await wait.call(this.#adapter, ref.nativeId);
     } catch {
       // turn timeout / adapter 已在关闭：close 仍要继续，否则会话就漏在 adapter 里
     }
   }
 
   /** handoff 命令：注册了 driver 就委托，否则保持 0.5-A 的 claude 口径 */
-  async #handoffCommand(ref: SessionRef): Promise<{ command: string[]; mode: "resume-tui" | "attach" }> {
-    const driver = this.#router?.get(ref.agent) ?? null;
+  async #handoffCommand(
+    ref: SessionRef,
+    driver: AgentDriver | null,
+    clientId: string,
+  ): Promise<{ command: string[]; mode: "resume-tui" | "attach" }> {
     if (driver !== null) {
-      return await driver.handoff(ref);
+      const exit = await this.#driverWrite(ref, clientId, () => driver.handoff(ref));
+      // handoff 本身是分流（resume-tui 可用），但若 driver 实际要求 attach 语义，
+      // 仍必须过 caps.attach。Claude 后台会话的 attach 能力按 kind 存在 ref.capabilities，
+      // 且 0.5-A 的 fallback 路径保持原行为，故这里只拦非 Claude driver。
+      if (exit.mode === "attach" && driver.agent !== "claude" && !driver.caps.attach) {
+        throw new WorkbenchError(
+          "E_CAP_UNSUPPORTED",
+          "Agent " + String(driver.agent) + " 不支持 attach 语义",
+          { agent: driver.agent, cap: "attach" },
+        );
+      }
+      return exit;
     }
     const background = ref.kind === "background";
     return {
       command: background ? ["claude", "attach", ref.nativeId] : ["claude", "--resume", ref.nativeId],
       mode: background ? "attach" : "resume-tui",
     };
+  }
+
+  /** 统一读路径：Claude 保留注入 reader（0.5-A 测试的字节游标口径），其余走 readTranscript(agent, ...) */
+  #readPage(ref: SessionRef, cursor: string): { messages: UnifiedMessage[]; nextCursor: string; pending: boolean } {
+    const path = ref.transcriptPath;
+    if (path === undefined || path.length === 0) {
+      return { messages: [], nextCursor: cursor, pending: true };
+    }
+    if (this.#readTranscript !== undefined && ref.agent === "claude") {
+      return this.#readTranscript(path, cursor);
+    }
+    return readTranscript(ref.agent, path, cursor);
   }
 
   /** 落 checkpoint 文件 + 落库，返回对象与文件路径（C3） */
@@ -449,7 +651,7 @@ export class TakeoverEngine {
       summary: input.summary,
       touchedFiles: [...input.touchedFiles],
       nextStep: input.nextStep,
-      transcriptCursor: ref.transcriptPath === undefined ? CURSOR_ZERO : this.#cursorAtEnd(ref.transcriptPath),
+      transcriptCursor: ref.transcriptPath === undefined ? CURSOR_ZERO : this.#cursorAtEnd(ref),
       createdAt: new Date(nowMs).toISOString(),
     };
 
@@ -464,12 +666,12 @@ export class TakeoverEngine {
   }
 
   /** 把 transcript 游标推进到当前末尾（handback 从该偏移读人类接管期间的增量） */
-  #cursorAtEnd(path: string): string {
+  #cursorAtEnd(ref: SessionRef): string {
     let cursor = CURSOR_ZERO;
     for (let page = 0; page < MAX_CURSOR_PAGES; page += 1) {
       let result: { messages: UnifiedMessage[]; nextCursor: string; pending: boolean };
       try {
-        result = this.#readTranscript(path, cursor);
+        result = this.#readPage(ref, cursor);
       } catch {
         return cursor;
       }
@@ -489,7 +691,7 @@ export class TakeoverEngine {
       return "";
     }
     try {
-      return buildDeltaSummary(this.#readTranscript(path, cursor).messages);
+      return buildDeltaSummary(this.#readPage(ref, cursor).messages);
     } catch {
       return "";
     }
@@ -618,9 +820,6 @@ export class TakeoverEngine {
     });
   }
 }
-const defaultTranscriptReader: TranscriptReader = (path, cursor) =>
-  readClaudeTranscript(path, cursor ?? CURSOR_ZERO);
-
 function defaultHandoffInput(to: "human" | "pi"): CheckpointInput {
   return { summary: "handoff to " + to, touchedFiles: [], nextStep: "" };
 }

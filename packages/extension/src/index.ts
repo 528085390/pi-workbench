@@ -102,6 +102,8 @@ export type AgentDescriptor = {
   agent: AgentName;
   available?: boolean;
   version?: string;
+  /** available=false 时的机器可读原因（与控制面 AgentStatus.reason 同源） */
+  reason?: string;
   caps: SessionCaps;
 };
 
@@ -414,6 +416,19 @@ class ToolInputError extends Error {
   }
 }
 
+/** 扩展侧按 /agents 预检失败：不产生任何 dispatch HTTP 请求，只把结构化错误交给 LLM */
+class ToolGateError extends Error {
+  readonly code: string;
+  readonly details?: unknown;
+
+  constructor(code: string, message: string, details?: unknown) {
+    super(message);
+    this.name = "ToolGateError";
+    this.code = code;
+    this.details = details;
+  }
+}
+
 /**
  * 错误 → 一行文本（R42）：HTTP 错误保留 daemon 的 code，其余给 `E_INTERNAL`。
  * handler 返回文本而不是抛错：LLM 从工具结果里读到码就够了，抛错会把栈糊进上下文。
@@ -482,13 +497,47 @@ export function registerWorkbenchTools(
 ): WorkbenchClient {
   const client = isClient(clientOrOptions) ? clientOrOptions : createWorkbenchClient(clientOrOptions);
 
+  /** spec §11.1：/agents 的 30s 缓存（探测器可能跑子进程，不能每次工具调用都打一遍） */
+  const AGENT_STATUS_CACHE_MS = 30_000;
+  let agentStatusCache: { at: number; statuses: AgentDescriptor[] } | null = null;
+  const statusesForPrecheck = async (): Promise<AgentDescriptor[]> => {
+    const at = Date.now();
+    if (agentStatusCache !== null && at - agentStatusCache.at < AGENT_STATUS_CACHE_MS) {
+      return agentStatusCache.statuses;
+    }
+    const statuses = await client.agents();
+    agentStatusCache = { at, statuses };
+    return statuses;
+  };
+
+  /** caps.inject 是 cp_dispatch 的最低能力；不满足时在本地拒绝，绝不空跑一次 /dispatch */
+  const assertAgentInjectable = async (agent: string): Promise<void> => {
+    const statuses = await statusesForPrecheck();
+    const status = statuses.find((item) => item.agent === agent);
+    if (status === undefined || status.available === false) {
+      const reason = status?.reason;
+      throw new ToolGateError(
+        "E_AGENT_UNAVAILABLE",
+        "Agent 未注册或不可用：" + agent + (reason === undefined ? "" : "（" + reason + "）"),
+        { agent, reason: reason ?? null },
+      );
+    }
+    if (status.caps.inject !== true) {
+      throw new ToolGateError("E_CAP_UNSUPPORTED", "Agent " + agent + " 不支持能力 inject", {
+        agent,
+        cap: "inject",
+      });
+    }
+  };
+
   api.registerTool("cp_dispatch", {
     description:
-      "在控制面新起一个 Claude 会话并立刻投递任务。返回会话 key（claude:<nativeId>）、状态与 cwd。",
+      "在控制面新起一个 agent 会话（缺省 claude）并立刻投递任务。显式 agent 会先按 /agents 的 caps 预检；返回会话 key、状态与 cwd。",
     inputSchema: {
       type: "object",
       properties: {
-        task: { type: "string", description: "要交给 Claude 的完整任务描述（必填）" },
+        task: { type: "string", description: "要交给 agent 的完整任务描述（必填）" },
+        agent: { type: "string", description: "目标 agent：claude|codex|pi；显式传入时先按 /agents 的 caps 预检，缺省 claude" },
         cwd: { type: "string", description: "会话工作目录；缺省用 daemon 的 cwd" },
         idempotencyKey: { type: "string", description: "幂等键；同键同任务只会起一个会话" },
       },
@@ -496,8 +545,12 @@ export function registerWorkbenchTools(
     },
     handler: async (input: unknown): Promise<string> => {
       try {
+        const agent = fieldOf(input, "agent");
+        if (agent !== undefined) {
+          await assertAgentInjectable(agent);
+        }
         const ref = await client.dispatch({
-          agent: "claude",
+          agent: agent ?? "claude",
           task: requireField(input, "task"),
           cwd: fieldOf(input, "cwd"),
           idempotencyKey: fieldOf(input, "idempotencyKey"),

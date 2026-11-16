@@ -16,7 +16,7 @@ import { timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
 
-import type { Checkpoint, Driver, SessionCaps, SessionEvent, SessionRef } from "@pi-workbench/shared";
+import type { Checkpoint, Driver, SessionCaps, SessionEvent, SessionRef, UnifiedMessage } from "@pi-workbench/shared";
 import { WORKBENCH_VERSION } from "@pi-workbench/shared";
 import fastifyWebsocket from "@fastify/websocket";
 import Fastify from "fastify";
@@ -24,6 +24,7 @@ import type { FastifyError, FastifyInstance, FastifyRequest } from "fastify";
 
 import type { AgentAdapter } from "./adapters/types.ts";
 import type { AgentRouter } from "./agents/router.ts";
+import type { AgentStatus } from "./agents/types.ts";
 import { CLAUDE_CAPABILITIES } from "./capabilities.ts";
 import type { CheckpointStore } from "./checkpoints.ts";
 import type { Config } from "./config.ts";
@@ -34,8 +35,7 @@ import type { WorkbenchErrorCode } from "./errors.ts";
 import type { EventStore } from "./events.ts";
 import type { LeaseManager } from "./lease.ts";
 import type { SessionFilter, SessionRegistry } from "./registry.ts";
-import { readClaudeTranscript } from "./transcript/claude.ts";
-import type { UnifiedMessage } from "./transcript/claude.ts";
+import { readTranscript } from "./transcript/index.ts";
 import type { TakeoverEngine } from "./takeover.ts";
 
 /** 路由前缀（spec §6：统一 /api/cp；T1 的裸 /health 保留为别名） */
@@ -80,6 +80,13 @@ export type ServerDeps = {
   /** 每读者未读游标（spec §6.5） */
   cursors: ReadCursorStore;
   readTranscript?: ServerTranscriptReader;
+  /**
+   * GET /agents 的动态数据源（启动探测 / 周期刷新）。
+   * 传入时按 30s 缓存；缺省直接用 router.list()（或 0.5-A 的单行描述）。
+   */
+  agentStatuses?: () => Promise<AgentStatus[]>;
+  /** 注入时钟（测试缓存过期），默认 Date.now */
+  now?: () => number;
   pipeline?: PipelineLike;
   /**
    * 内部错误（500）的落点。Fastify 以 logger:false 建实例，`app.log.error` 是 no-op，
@@ -165,8 +172,12 @@ const ROUTE_DISPATCH = "POST /dispatch";
 const ROUTE_UNREAD = "GET /sessions/:key/unread";
 const ROUTE_READ = "POST /sessions/:key/read";
 
+/** GET /agents 的缓存窗口（spec §11.1：30s 内不重复探测） */
+export const AGENT_STATUS_CACHE_MS = 30_000;
+
+/** 默认读取器：按会话 agent 走统一的 transcript 路由器，缺省参数保持 0.5-A 的 Claude 语义 */
 const defaultReader: ServerTranscriptReader = (path, cursor, limit) =>
-  readClaudeTranscript(path, cursor ?? "0", limit);
+  readTranscript("claude", path, cursor ?? "0", limit);
 
 /**
  * 装配 Fastify 实例：不 listen（R38）。
@@ -177,15 +188,54 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
   assertAuthConfig(deps.config);
 
   const { config } = deps;
-  const readTranscript = deps.readTranscript ?? defaultReader;
+  /**
+   * 统一读路径（0.5-B B06）：按会话 agent 选择 transcript parser。
+   * 0.5-A 注入的 ServerTranscriptReader 仍是 path-only 旧签名，优先调用它，
+   * 保证既有 Claude 测试与字节游标语义逐字不变。
+   */
+  const readPage = (
+    agent: SessionRef["agent"],
+    path: string,
+    cursor: string,
+    limit?: number,
+  ): { messages: UnifiedMessage[]; nextCursor: string; pending: boolean } => {
+    if (deps.readTranscript !== undefined) {
+      return deps.readTranscript(path, cursor, limit);
+    }
+    return readTranscript(agent, path, cursor, limit);
+  };
   /**
    * "还剩几条"专用读取（B1）：limit=Infinity，读到 EOF。
    * viewOf / POST /read 过去漏传 limit，被生产默认 200 截断 → unread 封顶、/read 读不完。
    * 走注入的 reader，测试里的假 reader 也要按"读到底"返回。
    */
-  const readToEnd = (path: string, cursor: string): { messages: UnifiedMessage[]; nextCursor: string } =>
-    readTranscript(path, cursor, Number.POSITIVE_INFINITY);
+  const readToEnd = (
+    agent: SessionRef["agent"],
+    path: string,
+    cursor: string,
+  ): { messages: UnifiedMessage[]; nextCursor: string } =>
+    readPage(agent, path, cursor, Number.POSITIVE_INFINITY);
   const startedAt = Date.now();
+  const now = deps.now ?? Date.now;
+  /** GET /agents 的 30s 缓存（spec §11.1）：探测器可能跑子进程，不能每个请求都打一遍 */
+  let agentCache: { at: number; statuses: AgentStatus[] } | null = null;
+  const currentAgents = async (): Promise<AgentStatus[] | AgentDescriptor[]> => {
+    if (deps.agentStatuses === undefined) {
+      return deps.router === undefined ? [describeAgent(config, deps.adapter)] : deps.router.list();
+    }
+    const at = now();
+    if (agentCache !== null && at - agentCache.at < AGENT_STATUS_CACHE_MS) {
+      return agentCache.statuses;
+    }
+    try {
+      const statuses = await deps.agentStatuses();
+      agentCache = { at, statuses };
+      return statuses;
+    } catch {
+      // 探测层异常不能把 /agents 拖成 500：回退到注册表最后一次快照
+      return deps.router?.list() ?? [describeAgent(config, deps.adapter)];
+    }
+  };
 
   const app = Fastify({ logger: false });
   const logError = deps.logError ?? ((error: unknown): void => { console.error("[pi-workbenchd] 未处理异常", error); });
@@ -202,7 +252,7 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
     if (path !== undefined && path.length > 0) {
       try {
         // B1：必须是"读到 EOF 的消息数"，不能受分页默认上限影响
-        unread = readToEnd(path, lastReadCursor).messages.length;
+        unread = readToEnd(session.agent, path, lastReadCursor).messages.length;
       } catch {
         unread = 0;
       }
@@ -271,7 +321,7 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
       api.get(HEALTH_PATH, health);
 
       // 0.5-B B01-b：有注册表时由 router.list() 动态生成；缺省保留 0.5-A 的 claude-only 描述
-      api.get("/agents", async () => (deps.router === undefined ? [describeAgent(config, deps.adapter)] : deps.router.list()));
+      api.get("/agents", async () => await currentAgents());
 
       api.get("/sessions", async (request) => {
         const query = queryOf(request);
@@ -311,7 +361,7 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
           // 没有 transcript 路径（会话刚建 / 非 Claude）→ 空页，游标停在调用方给的位置
           return { messages: [] as UnifiedMessage[], nextCursor: after };
         }
-        const page = readTranscript(path, after, limit);
+        const page = readPage(session.agent, path, after, limit);
         return { messages: page.messages, nextCursor: page.nextCursor };
       });
 
@@ -328,7 +378,7 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         const page =
           path === undefined || path.length === 0
             ? { messages: [] as UnifiedMessage[], nextCursor: lastReadCursor, pending: true }
-            : readTranscript(path, lastReadCursor, limit);
+            : readPage(session.agent, path, lastReadCursor, limit);
         if (ack) {
           deps.cursors.set(key, clientId, page.nextCursor);
         }
@@ -336,7 +386,9 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         // peek（ack=0）游标没动 → 必须从 lastReadCursor 数；只有真推进了才从 nextCursor 数。
         const baseCursor = ack ? page.nextCursor : lastReadCursor;
         const remaining =
-          path === undefined || path.length === 0 ? 0 : readToEnd(path, baseCursor).messages.length;
+          path === undefined || path.length === 0
+            ? 0
+            : readToEnd(session.agent, path, baseCursor).messages.length;
         return {
           messages: page.messages,
           nextCursor: page.nextCursor,
@@ -362,7 +414,7 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
           target =
             path === undefined || path.length === 0
               ? deps.cursors.cursorOf(key, clientId)
-              : readToEnd(path, deps.cursors.cursorOf(key, clientId)).nextCursor;
+              : readToEnd(session.agent, path, deps.cursors.cursorOf(key, clientId)).nextCursor;
         }
         const cursor = deps.cursors.set(key, clientId, target);
         return { sessionKey: key, clientId: cursor.clientId, lastReadCursor: cursor.lastReadCursor, updatedAt: cursor.updatedAt };
@@ -465,7 +517,10 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         const ref = await deps.engine.dispatch({ agent, task, cwd, idempotencyKey });
         // 新会话挂事件管线，后续 ACP update 才会被归一化成事件（R39 的 pipeline 接线落点）
         try {
-          deps.pipeline?.attach(deps.adapter, ref.key);
+          // 事件管线当前只挂 Claude ACP adapter；codex/pi 的 update 由各自 driver 负责
+          if (ref.agent === "claude") {
+            deps.pipeline?.attach(deps.adapter, ref.key);
+          }
         } catch (err) {
           process.stderr.write("[pi-workbench] 挂事件管线失败（不影响 dispatch 返回）：" + String(err) + "\n");
         }
