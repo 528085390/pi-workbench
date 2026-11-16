@@ -375,3 +375,5 @@ $ git check-ignore -v spike/acp-probe/evidence/claude-full.jsonl          → .g
 已全部修复并补回归用例；另补显式游标校验。全量：control-plane 229（228 pass / 1 skip）、extension 47 全绿；`pnpm -r build` 三包 Done。
 复审 r2（`review-branch-2026-11-16-r2.md`）再补 5 项：R1 无 `schemaVersion` 的旧 daemon 也判过旧、R2 peek 的 unread 不再按本页之后计、R3 token 双名优先级两侧统一、R4 `cp_handback` 支持指定 clientId、R5 清死代码。
 逐项清单与验证输出：`docs/evidence/phase-0.5a/review-fixes-2026-11-16.md`。九条 Gate 结论不变（修复只加强未读/通知路径）。
+
+**合并**：2026-11-16 经用户确认，`feat/phase-0.5a`（40 commits）以 `--no-ff` 合并入 `master`（`e22304f`）；合并后在 master 复跑 `pnpm -r build`（三包 Done）与两包测试（control-plane 229/228 pass/1 skip、extension 49 pass），工作树干净。
