@@ -21,6 +21,18 @@ export type SessionStatus =
 
 export type Driver = "pi" | "human" | "none";
 
+/** 统一消息模型（Phase 0.5-B D4：从 transcript/claude.ts 上移，三解析器共用） */
+export type UnifiedRole = "user" | "assistant" | "system";
+export type UnifiedKind = "text" | "thinking" | "tool_call" | "tool_result";
+export interface UnifiedMessage {
+  id: string;
+  role: UnifiedRole;
+  kind: UnifiedKind;
+  text: string;
+  ts: string;
+  toolName?: string;
+}
+
 /**
  * 能力矩阵按实测声明，未实现的能力不注册工具、不显示按钮（PRD FR-0.6）。
  * attach 与 resume 必须分开：Claude 的 ACP 会话 attach=false、resume=true。

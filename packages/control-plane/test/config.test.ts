@@ -316,3 +316,49 @@ test("acquireInstanceLock: 两个并发进程抢同一 pid 文件，只有一个
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+test("loadConfig: 缺省生成 codex 与 pi 配置块并回写 config.yaml", () => {
+  const home = freshHome();
+  try {
+    const cfg = loadConfig({ PI_WORKBENCH_HOME: home });
+    assert.ok(Array.isArray(cfg.codex.adapterCmd));
+    assert.ok(cfg.codex.adapterCmd.length > 0);
+    assert.ok(cfg.codex.adapterCmd.every((part) => typeof part === "string"));
+    assert.equal(cfg.codex.permissionMode, "auto_allow");
+    assert.deepEqual(cfg.pi.rpcCmd, ["pi", "--mode", "rpc"]);
+    assert.equal(cfg.pi.provider, undefined);
+    assert.equal(cfg.pi.model, undefined);
+
+    const written = parseYaml(readFileSync(join(home, "config.yaml"), "utf8")) as Record<string, unknown>;
+    const codex = written["codex"] as Record<string, unknown>;
+    const pi = written["pi"] as Record<string, unknown>;
+    assert.deepEqual(codex["adapterCmd"], cfg.codex.adapterCmd);
+    assert.equal(codex["permissionMode"], "auto_allow");
+    assert.deepEqual(pi["rpcCmd"], cfg.pi.rpcCmd);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("loadConfig: PI_WORKBENCH_CODEX_CMD 覆盖 codex.adapterCmd（只覆盖运行值，不写回文件）", () => {
+  const home = freshHome();
+  try {
+    const cfg = loadConfig({ PI_WORKBENCH_HOME: home, PI_WORKBENCH_CODEX_CMD: "codex-acp --stdio" });
+    assert.deepEqual(cfg.codex.adapterCmd, ["codex-acp", "--stdio"]);
+    const written = parseYaml(readFileSync(join(home, "config.yaml"), "utf8")) as Record<string, unknown>;
+    const codex = written["codex"] as Record<string, unknown>;
+    assert.notDeepEqual(codex["adapterCmd"], cfg.codex.adapterCmd, "env 覆盖不得写回文件");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("loadConfig: PI_WORKBENCH_PI_CMD 覆盖 pi.rpcCmd", () => {
+  const home = freshHome();
+  try {
+    const cfg = loadConfig({ PI_WORKBENCH_HOME: home, PI_WORKBENCH_PI_CMD: "pi --mode rpc --debug" });
+    assert.deepEqual(cfg.pi.rpcCmd, ["pi", "--mode", "rpc", "--debug"]);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});

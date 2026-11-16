@@ -15,17 +15,10 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { execa } from "execa";
-import type { SessionCaps, SessionRef, SessionStatus } from "@pi-workbench/shared";
+import type { SessionCaps, SessionRef, SessionStatus, UnifiedMessage } from "@pi-workbench/shared";
 
-/** 归一化后的单条消息片段（一条 Claude 记录可能拆成多条） */
-export type UnifiedMessage = {
-  id: string;
-  role: "user" | "assistant" | "system";
-  kind: "text" | "thinking" | "tool_call" | "tool_result";
-  text: string;
-  ts: string;
-  toolName?: string;
-};
+// 0.5-B D4：UnifiedMessage 上移到 @pi-workbench/shared；这里 re-export 保持旧 import 路径兼容。
+export type { UnifiedMessage } from "@pi-workbench/shared";
 
 /** 一次增量读取的结果；nextCursor 可直接作为下次的 cursor */
 export type ClaudeTranscriptPage = {
