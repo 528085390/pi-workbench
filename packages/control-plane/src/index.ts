@@ -317,15 +317,16 @@ export async function main(): Promise<void> {
   }
   const { db, store, leases, registry, restored, recovery, checkpoints, dispatches, cursors, instances } = boot;
 
-  // C03 / spec §7.4：审计只追加；启动先按 30 天保留期清一次，失败只告警不阻断启动。
+  // C03 / spec §7.4：审计只追加；启动按配置的保留期清一次，失败只告警不阻断启动。
   const audit = new AuditStore(db, { instanceId: instances.id ?? "unknown" });
+  const auditRetentionDays = config.auditRetentionDays ?? AUDIT_RETENTION_DAYS;
   try {
-    const pruned = audit.prune(AUDIT_RETENTION_DAYS);
+    const pruned = audit.prune(auditRetentionDays);
     console.log(
       "[pi-workbenchd] 审计日志清理完成：删除 " +
         String(pruned) +
         " 条（保留 " +
-        String(AUDIT_RETENTION_DAYS) +
+        String(auditRetentionDays) +
         " 天）",
     );
   } catch (err) {
@@ -470,6 +471,7 @@ export async function main(): Promise<void> {
     router,
     checkpoints,
     dispatches,
+    audit,
     dispatchReservedTtlMs: config.dispatchReservedTtlMs,
     handoffDir: paths.handoffs,
     piClientId: PI_AGENT_CLIENT_ID,

@@ -44,6 +44,8 @@ export type AuditListFilter = {
   sessionKey?: string;
   /** ISO8601；按 ts >= since 过滤 */
   since?: string;
+  /** 游标：只返回 id > afterId 的行（同 ts 多条时避免重复回放） */
+  afterId?: number;
   /** 默认 100，超过 1000 按 1000 截断 */
   limit?: number;
 };
@@ -140,6 +142,10 @@ export class AuditStore {
     if (filter.since !== undefined && filter.since.length > 0) {
       where.push("ts >= ?");
       params.push(filter.since);
+    }
+    if (filter.afterId !== undefined && Number.isInteger(filter.afterId) && filter.afterId > 0) {
+      where.push("id > ?");
+      params.push(filter.afterId);
     }
     const sql =
       "SELECT " +

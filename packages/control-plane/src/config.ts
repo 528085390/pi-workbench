@@ -30,6 +30,8 @@ export type Config = {
   leaseTtlMs: number;
   /** dispatch reserved 预留窗口 TTL（毫秒）；超时才允许回收，与幂等记录 24h 保留期无关 */
   dispatchReservedTtlMs: number;
+  /** 审计保留天数（spec §7.4）；缺省 30，未配置时由 loadConfig 填默认值 */
+  auditRetentionDays?: number;
   claude: {
     adapterCmd: string[];
     permissionMode: PermissionMode;
@@ -52,6 +54,8 @@ export const DEFAULT_HOST = "127.0.0.1";
 export const DEFAULT_LEASE_TTL_MS = 30_000;
 /** dispatch 预留窗口默认 TTL（spec §7.2：120s，按 updated_at 续约）。 */
 export const DEFAULT_DISPATCH_RESERVED_TTL_MS = 120_000;
+/** 审计保留天数默认值（spec §7.4）；与 audit.ts 的 AUDIT_RETENTION_DAYS 保持一致。 */
+export const DEFAULT_AUDIT_RETENTION_DAYS = 30;
 export const DEFAULT_PERMISSION_MODE: PermissionMode = "auto_allow";
 /** Claude 默认 auto（保持现有行为）；需要完全权限时显式改为 bypassPermissions。 */
 export const DEFAULT_CLAUDE_INITIAL_PERMISSION_MODE: ClaudeInitialPermissionMode = "auto";
@@ -280,6 +284,13 @@ function assertDispatchReservedTtl(ttl: number, configPath: string): number {
   return ttl;
 }
 
+function assertAuditRetentionDays(days: number, origin: string): number {
+  if (!Number.isInteger(days) || days <= 0) {
+    throw new Error(`配置错误：${origin} 中 auditRetentionDays 必须是正整数，实际为 ${String(days)}`);
+  }
+  return days;
+}
+
 function readConfigFile(configPath: string): Record<string, unknown> | null {
   if (!existsSync(configPath)) return null;
   const text = readFileSync(configPath, "utf8");
@@ -306,6 +317,7 @@ function toFileShape(cfg: Config): Record<string, unknown> {
     port: cfg.port,
     leaseTtlMs: cfg.leaseTtlMs,
     dispatchReservedTtlMs: cfg.dispatchReservedTtlMs,
+    auditRetentionDays: cfg.auditRetentionDays ?? DEFAULT_AUDIT_RETENTION_DAYS,
     authToken: cfg.authToken,
     claude: {
       adapterCmd: cfg.claude.adapterCmd,
@@ -323,7 +335,8 @@ function toFileShape(cfg: Config): Record<string, unknown> {
 
 /**
  * 读配置：$PI_WORKBENCH_HOME/config.yaml（缺省创建默认文件）。
- * env 覆盖 host / port / authToken / codex.adapterCmd / pi.rpcCmd（不写回文件）；
+ * env 覆盖 host / port / authToken / auditRetentionDays / codex.adapterCmd / pi.rpcCmd（不写回文件）；
+ * auditRetentionDays 也可用 PI_WORKBENCH_AUDIT_RETENTION_DAYS 覆盖（正整数天）。
  * 文件缺字段时回填默认值并回写。
  */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -341,6 +354,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const filePort = readInt(values, "port");
   const fileTtl = readInt(values, "leaseTtlMs");
   const fileDispatchTtl = readInt(values, "dispatchReservedTtlMs");
+  const fileAuditRetention = readInt(values, "auditRetentionDays");
   const fileToken = readToken(values["authToken"]);
   const fileAdapter = readAdapterCmd(claude["adapterCmd"], configPath);
   const fileMode = readPermissionMode(claude["permissionMode"], configPath, "claude.permissionMode");
@@ -369,6 +383,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       fileDispatchTtl ?? DEFAULT_DISPATCH_RESERVED_TTL_MS,
       configPath,
     ),
+    auditRetentionDays: assertAuditRetentionDays(fileAuditRetention ?? DEFAULT_AUDIT_RETENTION_DAYS, configPath),
     claude: {
       adapterCmd: chosenAdapter.command,
       permissionMode: fileMode ?? DEFAULT_PERMISSION_MODE,
@@ -391,6 +406,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   // 兼容两个名字：daemon 侧历史上用 PI_WORKBENCH_AUTH_TOKEN，客户端/CLI/e2e 用 PI_WORKBENCH_TOKEN。
   // 只认前者时，用后者启动的 daemon 会「静默无鉴权」——所以两个都认，AUTH_TOKEN 优先。
   const envToken = (env.PI_WORKBENCH_AUTH_TOKEN ?? env.PI_WORKBENCH_TOKEN)?.trim();
+  const envAuditRetentionRaw = env.PI_WORKBENCH_AUDIT_RETENTION_DAYS?.trim();
   const envClaudeInitialMode = readClaudeInitialPermissionMode(
     env.PI_WORKBENCH_CLAUDE_INITIAL_MODE,
     "PI_WORKBENCH_CLAUDE_INITIAL_MODE",
@@ -410,6 +426,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
         ? assertPort(Number(envPortRaw), "PI_WORKBENCH_PORT")
         : persisted.port,
     authToken: envToken !== undefined && envToken.length > 0 ? envToken : persisted.authToken,
+    auditRetentionDays:
+      envAuditRetentionRaw !== undefined && envAuditRetentionRaw.length > 0
+        ? assertAuditRetentionDays(Number(envAuditRetentionRaw), "PI_WORKBENCH_AUDIT_RETENTION_DAYS")
+        : persisted.auditRetentionDays,
     claude: {
       ...persisted.claude,
       initialPermissionMode: envClaudeInitialMode ?? persisted.claude.initialPermissionMode,
@@ -431,6 +451,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     filePort === undefined ||
     fileTtl === undefined ||
     fileDispatchTtl === undefined ||
+    fileAuditRetention === undefined ||
     fileToken === undefined ||
     fileAdapter === undefined ||
     fileMode === undefined ||

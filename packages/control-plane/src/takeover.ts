@@ -21,6 +21,7 @@ import type { AgentName, Checkpoint, SessionRef, UnifiedMessage } from "@pi-work
 import type { AgentAdapter } from "./adapters/types.ts";
 import type { AgentRouter } from "./agents/router.ts";
 import type { AdapterCapability, AgentDriver } from "./agents/types.ts";
+import type { AuditStore } from "./audit.ts";
 import { CLAUDE_CAPABILITIES } from "./capabilities.ts";
 import { CHECKPOINT_VERSION } from "./checkpoints.ts";
 import type { CheckpointStore, StoredCheckpoint } from "./checkpoints.ts";
@@ -104,6 +105,8 @@ export type TakeoverDeps = {
   checkpoints: CheckpointStore;
   /** dispatches 表（C1/C2：原子占位保证并发与跨进程幂等） */
   dispatches: DispatchStore;
+  /** C03 审计：handoff / handback / checkpoint 每一步都写一条（可选；缺省不审计） */
+  audit?: AuditStore;
   /** reserved 预留窗口 TTL（毫秒）；缺省 DEFAULT_DISPATCH_RESERVED_TTL_MS（120s） */
   dispatchReservedTtlMs?: number;
   /** checkpoint 文件目录，通常是 <home>/handoffs */
@@ -155,6 +158,7 @@ export class TakeoverEngine {
   readonly #router: AgentRouter | undefined;
   readonly #checkpoints: CheckpointStore;
   readonly #dispatches: DispatchStore;
+  readonly #audit: AuditStore | undefined;
   readonly #dispatchTtlMs: number;
   readonly #handoffDir: string;
   readonly #now: () => number;
@@ -182,6 +186,7 @@ export class TakeoverEngine {
     this.#router = deps.router;
     this.#checkpoints = deps.checkpoints;
     this.#dispatches = deps.dispatches;
+    this.#audit = deps.audit;
     this.#dispatchTtlMs = deps.dispatchReservedTtlMs ?? DEFAULT_DISPATCH_RESERVED_TTL_MS;
     this.#handoffDir = deps.handoffDir;
     this.#now = deps.now ?? Date.now;
@@ -314,7 +319,17 @@ export class TakeoverEngine {
   checkpoint(key: string, input: CheckpointInput, clientId: string): Checkpoint {
     this.#leases.assertWriter(key, clientId);
     const ref = this.#requireSession(key);
-    return this.#writeCheckpoint(ref, input).checkpoint;
+    const startedAt = this.#now();
+    try {
+      const checkpoint = this.#writeCheckpoint(ref, input).checkpoint;
+      this.#auditStep(clientId, "checkpoint", ref, "checkpoint", startedAt, "ok", null, {
+        cursor: checkpoint.transcriptCursor,
+      });
+      return checkpoint;
+    } catch (err) {
+      this.#auditStep(clientId, "checkpoint", ref, "checkpoint", startedAt, "error", this.#errorCodeOf(err));
+      throw err;
+    }
   }
 
   /**
@@ -328,6 +343,7 @@ export class TakeoverEngine {
 
     // 2. quiesce：运行中先 cancel 并等回合结束（adapter 没有 waitForTurn 就跳过）
     // I4：cancel / close 失败必须留痕 —— 否则租约还指着 pi、状态还是 running，却一条事件都没有
+    const quiesceStartedAt = this.#now();
     try {
       if (ref.status === "running") {
         if (driver !== null) {
@@ -339,14 +355,30 @@ export class TakeoverEngine {
         await this.#waitForTurn(ref, driver);
       }
     } catch (err) {
+      this.#auditStep(clientId, "handoff", ref, "cancel", quiesceStartedAt, "error", "E_HANDOFF_FAILED");
       // spec §7.3 补偿表：cancel 失败 → 会话状态不变、租约归还调用方
       throw this.#handoffFailed(ref, "cancel", err);
     }
+    this.#auditStep(clientId, "handoff", ref, "cancel", quiesceStartedAt, "ok", null, {
+      skipped: ref.status !== "running",
+    });
 
     // 3. checkpoint（文件 + checkpoints 表）。写失败抛 E_CHECKPOINT_FAILED：状态不变、租约不动。
-    const { checkpoint, path } = this.#writeCheckpoint(ref, input ?? defaultHandoffInput(to));
+    const checkpointStartedAt = this.#now();
+    let checkpoint: Checkpoint;
+    let path: string;
+    try {
+      ({ checkpoint, path } = this.#writeCheckpoint(ref, input ?? defaultHandoffInput(to)));
+    } catch (err) {
+      this.#auditStep(clientId, "handoff", ref, "checkpoint", checkpointStartedAt, "error", this.#errorCodeOf(err));
+      throw err;
+    }
+    this.#auditStep(clientId, "handoff", ref, "checkpoint", checkpointStartedAt, "ok", null, {
+      cursor: checkpoint.transcriptCursor,
+    });
 
     // 4. 释放控制通道里的会话，交给原生终端（没有 close 的 driver，如 Pi，保持原生会话不动）
+    const closeStartedAt = this.#now();
     try {
       if (driver !== null) {
         await this.#closeDriverRef(ref, driver, clientId);
@@ -354,19 +386,33 @@ export class TakeoverEngine {
         await this.#adapter.close(ref.nativeId);
       }
     } catch (err) {
+      this.#auditStep(clientId, "handoff", ref, "close", closeStartedAt, "error", "E_HANDOFF_FAILED");
       // spec §7.3 补偿表：close 失败 → 回滚为原状态（此前未改注册表）、租约归还调用方
       throw this.#handoffFailed(ref, "close", err);
     }
+    this.#auditStep(clientId, "handoff", ref, "close", closeStartedAt, "ok", null);
 
     // 5. 接管命令由 driver.handoff(ref) 决定（Claude：background attach / interactive --resume；
     //    Codex：codex resume <id> --no-alt-screen；Pi：pi --session <file>）。
     //    放在 checkpoint / close 之后：handoff 只拼命令，不执行，也不依赖 adapter 仍存活。
     let exit: { command: string[]; mode: "resume-tui" | "attach" };
+    const commandStartedAt = this.#now();
     try {
       exit = await this.#handoffCommand(ref, driver, clientId);
     } catch (err) {
+      const capabilityError =
+        isWorkbenchError(err) && (err.code === "E_CAP_UNSUPPORTED" || err.code === "E_AGENT_UNAVAILABLE");
+      this.#auditStep(
+        clientId,
+        "handoff",
+        ref,
+        "handoff",
+        commandStartedAt,
+        "error",
+        capabilityError && isWorkbenchError(err) ? err.code : "E_HANDOFF_FAILED",
+      );
       // 能力门禁 / Agent 不可用是请求级 422，不能被 handoff 的止损包装成 503
-      if (isWorkbenchError(err) && (err.code === "E_CAP_UNSUPPORTED" || err.code === "E_AGENT_UNAVAILABLE")) {
+      if (capabilityError) {
         throw err;
       }
       // spec §7.3：命令拼接失败 → 会话 exited、租约释放，detail 带 checkpointPath
@@ -377,6 +423,7 @@ export class TakeoverEngine {
       }
       throw this.#handoffFailed(ref, "handoff", err, { checkpointPath: path });
     }
+    this.#auditStep(clientId, "handoff", ref, "handoff", commandStartedAt, "ok", null, { mode: exit.mode });
 
     // 6. 租约转给接管的 driver，人类窗口固定 30 分钟
     this.#leases.release(key, clientId);
@@ -408,6 +455,7 @@ export class TakeoverEngine {
     const ref = this.#requireSession(key);
     const driver = this.#driverOf(ref);
 
+    const resumeStartedAt = this.#now();
     try {
       if (driver !== null) {
         this.#assertDriverCap(driver, "resume");
@@ -416,6 +464,7 @@ export class TakeoverEngine {
         await this.#adapter.resume(ref.nativeId, ref.cwd);
       }
     } catch (err) {
+      this.#auditStep(clientId, "handback", ref, "resume", resumeStartedAt, "error", "E_RESUME_REJECTED");
       throw new WorkbenchError("E_RESUME_REJECTED", "恢复会话被拒绝：" + key, {
         sessionKey: key,
         nativeId: ref.nativeId,
@@ -423,6 +472,7 @@ export class TakeoverEngine {
         reason: err instanceof Error ? err.message : String(err),
       });
     }
+    this.#auditStep(clientId, "handback", ref, "resume", resumeStartedAt, "ok", null);
 
     // C3：游标以库里的最新 checkpoint 为准 —— 进程重启后 handback 仍从正确位置读增量
     const latest = this.#checkpoints.latest(key);
@@ -845,6 +895,7 @@ export class TakeoverEngine {
       nativeId: ref.nativeId,
       path,
       step: "checkpoint",
+      action: "checkpoint",
       cause: message,
     });
   }
@@ -1059,6 +1110,40 @@ export class TakeoverEngine {
       idempotencyKey,
       cause: message,
     });
+  }
+
+  /** C03：每一步审计（成功/失败都写；durationMs 由注入时钟测量）。审计失败绝不阻断主流程。 */
+  #auditStep(
+    actor: string,
+    action: "handoff" | "handback" | "checkpoint",
+    ref: SessionRef,
+    step: string,
+    startedAt: number,
+    outcome: "ok" | "error",
+    errorCode: string | null,
+    extra: Record<string, unknown> = {},
+  ): void {
+    try {
+      this.#audit?.record({
+        actor,
+        action,
+        sessionKey: ref.key,
+        outcome,
+        errorCode,
+        detail: {
+          step,
+          durationMs: Math.max(0, this.#now() - startedAt),
+          ...(errorCode === null ? {} : { errorCode }),
+          ...extra,
+        },
+      });
+    } catch {
+      // AuditStore.record 已内部吞异常；这里再兜一层，防止替代实现把审计故障传回业务
+    }
+  }
+
+  #errorCodeOf(err: unknown): string {
+    return isWorkbenchError(err) ? err.code : "E_INTERNAL";
   }
 
   /**

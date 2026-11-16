@@ -38,6 +38,7 @@ test("loadConfig: 空目录时写入默认值", () => {
     assert.equal(cfg.port, DEFAULT_PORT);
     assert.equal(cfg.leaseTtlMs, 30000);
     assert.equal(cfg.dispatchReservedTtlMs, 120000);
+    assert.equal(cfg.auditRetentionDays, 30);
     assert.equal(cfg.authToken, null);
     assert.equal(cfg.home, home);
     assert.equal(cfg.claude.permissionMode, "auto_allow");
@@ -65,8 +66,27 @@ test("loadConfig: 缺省时在 home 下生成 config.yaml", () => {
     assert.equal(obj["port"], DEFAULT_PORT);
     assert.equal(obj["leaseTtlMs"], 30000);
     assert.equal(obj["dispatchReservedTtlMs"], 120000);
+    assert.equal(obj["auditRetentionDays"], 30);
     const claude = obj["claude"] as Record<string, unknown>;
     assert.equal(claude["initialPermissionMode"], "auto");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("loadConfig: auditRetentionDays 默认 30，文件 / 环境变量可覆盖", () => {
+  const home = freshHome();
+  try {
+    const defaults = loadConfig({ PI_WORKBENCH_HOME: home });
+    assert.equal(defaults.auditRetentionDays, 30);
+
+    const cfgPath = join(home, "config.yaml");
+    writeFileSync(cfgPath, "auditRetentionDays: 7\n", "utf8");
+    const fromFile = loadConfig({ PI_WORKBENCH_HOME: home });
+    assert.equal(fromFile.auditRetentionDays, 7);
+
+    const fromEnv = loadConfig({ PI_WORKBENCH_HOME: home, PI_WORKBENCH_AUDIT_RETENTION_DAYS: "3" });
+    assert.equal(fromEnv.auditRetentionDays, 3);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

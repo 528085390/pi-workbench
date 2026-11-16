@@ -212,25 +212,6 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
   /** C02：同一 sessionKey 的写操作串行；不同 sessionKey 各自并行。 */
   const writeQueue = deps.writeQueue ?? new SessionWriteQueue();
   const runWrite = <T>(key: string, fn: () => Promise<T>): Promise<T> => writeQueue.run(key, fn);
-  /** C03：审计是旁路 —— 未注入或写入失败都不影响业务（AuditStore.record 自身吞异常）。 */
-  const recordAudit = (entry: Parameters<AuditStore["record"]>[0]): void => {
-    deps.audit?.record(entry);
-  };
-  const errorCodeOf = (err: unknown): string => (isWorkbenchError(err) ? err.code : INTERNAL_ERROR_CODE);
-  /** handoff 的止损错误在 details.action 里带 cancel / close / handoff；其它错误按 fallback 记。 */
-  const auditStepOf = (err: unknown, fallback: string): string => {
-    if (!isWorkbenchError(err)) {
-      return fallback;
-    }
-    const details = err.details;
-    if (typeof details === "object" && details !== null && "action" in details) {
-      const action = (details as { action?: unknown }).action;
-      if (typeof action === "string" && action.length > 0) {
-        return action;
-      }
-    }
-    return fallback;
-  };
   /**
    * 统一读路径（0.5-B B06）：按会话 agent 选择 transcript parser。
    * 0.5-A 注入的 ServerTranscriptReader 仍是 path-only 旧签名，优先调用它，
@@ -398,15 +379,24 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
       api.get("/agents", async () => await currentAgents());
 
       /**
-       * C03 审计查询：GET /audit?sessionKey=&since=&limit=
+       * C03 审计查询：GET /audit?sessionKey=&since=&limit=&afterId=
        * 按 id 升序返回 { items }；limit 默认 100、上限 1000（截断由 AuditStore 负责）。
+       * afterId 是增量游标：只返回 id 更大的行，避免同 ts 多条时重复回放。
        */
       api.get("/audit", async (request) => {
         const query = queryOf(request);
         const sessionKey = optionalString(query, "sessionKey", ROUTE_AUDIT);
         const since = optionalString(query, "since", ROUTE_AUDIT);
-        const rawLimit = query["limit"];
+        let afterId: number | undefined;
+        const rawAfterId = query["afterId"];
+        if (rawAfterId !== undefined) {
+          if (typeof rawAfterId !== "string" || !/^\d+$/.test(rawAfterId.trim())) {
+            throw new WorkbenchError("E_BAD_REQUEST", ROUTE_AUDIT + " 的 afterId 必须是非负整数", { afterId: rawAfterId });
+          }
+          afterId = Number(rawAfterId);
+        }
         let limit: number | undefined;
+        const rawLimit = query["limit"];
         if (rawLimit !== undefined) {
           if (typeof rawLimit !== "string" || !/^\d+$/.test(rawLimit.trim()) || Number(rawLimit) <= 0) {
             throw new WorkbenchError("E_BAD_REQUEST", ROUTE_AUDIT + " 的 limit 必须是正整数", { limit: rawLimit });
@@ -418,6 +408,7 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
             deps.audit?.list({
               ...(sessionKey === undefined ? {} : { sessionKey }),
               ...(since === undefined ? {} : { since }),
+              ...(afterId === undefined ? {} : { afterId }),
               ...(limit === undefined ? {} : { limit }),
             }) ?? [],
         };
@@ -681,30 +672,7 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         const summary = requireString(body, "summary", ROUTE_CHECKPOINT);
         const nextStep = optionalString(body, "nextStep", ROUTE_CHECKPOINT) ?? "";
         const touchedFiles = optionalStringArray(body, "touchedFiles", ROUTE_CHECKPOINT) ?? [];
-        return await runWrite(key, async () => {
-          try {
-            const checkpoint = await deps.engine.checkpoint(key, { summary, touchedFiles, nextStep }, clientId);
-            recordAudit({
-              actor: clientId,
-              action: "checkpoint",
-              sessionKey: key,
-              outcome: "ok",
-              errorCode: null,
-              detail: { cursor: checkpoint?.transcriptCursor ?? null, createdAt: checkpoint?.createdAt ?? null },
-            });
-            return checkpoint;
-          } catch (err) {
-            recordAudit({
-              actor: clientId,
-              action: "checkpoint",
-              sessionKey: key,
-              outcome: "error",
-              errorCode: errorCodeOf(err),
-              detail: { step: "checkpoint" },
-            });
-            throw err;
-          }
-        });
+        return await runWrite(key, async () => deps.engine.checkpoint(key, { summary, touchedFiles, nextStep }, clientId));
       });
 
       api.get("/sessions/:key/checkpoint", async (request) => {
@@ -731,30 +699,7 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
           summary === undefined && nextStep === undefined && touchedFiles === undefined
             ? undefined
             : { summary: summary ?? "", touchedFiles: touchedFiles ?? [], nextStep: nextStep ?? "" };
-        return await runWrite(key, async () => {
-          try {
-            const result = await deps.engine.handoff(key, to, clientId, input);
-            recordAudit({
-              actor: clientId,
-              action: "handoff",
-              sessionKey: key,
-              outcome: "ok",
-              errorCode: null,
-              detail: { to, mode: result.mode, cursor: result.checkpoint?.transcriptCursor ?? null },
-            });
-            return result;
-          } catch (err) {
-            recordAudit({
-              actor: clientId,
-              action: "handoff",
-              sessionKey: key,
-              outcome: "error",
-              errorCode: errorCodeOf(err),
-              detail: { to, step: auditStepOf(err, "handoff") },
-            });
-            throw err;
-          }
-        });
+        return await runWrite(key, () => deps.engine.handoff(key, to, clientId, input));
       });
 
       api.post("/sessions/:key/handback", async (request) => {
@@ -762,30 +707,7 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         requireSession(deps.registry, key);
         const body = bodyOf(request.body, ROUTE_HANDBACK);
         const clientId = requireString(body, "clientId", ROUTE_HANDBACK);
-        const result = await runWrite(key, async () => {
-          try {
-            const resumed = await deps.engine.handback(key, clientId);
-            recordAudit({
-              actor: clientId,
-              action: "handback",
-              sessionKey: key,
-              outcome: "ok",
-              errorCode: null,
-              detail: { resumed: resumed.resumed, deltaSummaryLength: resumed.deltaSummary?.length ?? 0 },
-            });
-            return resumed;
-          } catch (err) {
-            recordAudit({
-              actor: clientId,
-              action: "handback",
-              sessionKey: key,
-              outcome: "error",
-              errorCode: errorCodeOf(err),
-              detail: { step: "resume" },
-            });
-            throw err;
-          }
-        });
+        const result = await runWrite(key, () => deps.engine.handback(key, clientId));
         const session = deps.registry.get(key);
         if (session !== null) {
           attachPipeline(session);

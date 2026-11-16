@@ -30,6 +30,7 @@
 |---|---|
 | `sessionKey` | 精确匹配会话键，如 `claude:abc` |
 | `since` | ISO8601 下界，按 `ts >= since` 过滤 |
+| `afterId` | 增量游标：只返回 `id > afterId` 的行；同 `ts` 多条时避免重复回放 |
 | `limit` | 正整数；默认 100，上限 1000（超过按 1000 截断） |
 
 成功返回 `200`，按 `id` 升序（写入顺序）：
@@ -46,12 +47,17 @@
       "sessionKey": "claude:abc",
       "outcome": "ok",
       "errorCode": null,
-      "detail": { "to": "human", "mode": "resume-tui", "cursor": "12345" }
+      "detail": { "step": "cancel", "durationMs": 12, "skipped": false }
     }
   ]
 }
 ```
 
-- `audit_log` 只追加；daemon 启动时删除超过 30 天的记录。
-- 当前留痕的动作：`checkpoint` / `handoff` / `handback`。成功 `outcome="ok"`；失败 `outcome="error"`，带 `errorCode`，并在 `detail.step` 标明失败步骤（`checkpoint` / `cancel` / `close` / `handoff` / `resume`）。
-- 错误：`400 E_BAD_REQUEST`（`limit` 不是正整数）、`401 E_UNAUTHORIZED`、`500 E_INTERNAL`。
+- `audit_log` 只追加；daemon 启动时删除超过 `auditRetentionDays` 的记录（默认 30，可配置；env：`PI_WORKBENCH_AUDIT_RETENTION_DAYS`）。
+- **每个内部步骤一条记录**，`action` 表示操作，`detail.step` 表示步骤：
+  - `checkpoint`：`step=checkpoint`
+  - `handoff`：`step=cancel`（idle 会话记 `skipped=true`）→ `checkpoint` → `close` → `handoff`（命令拼接）
+  - `handback`：`step=resume`
+- 每条 `detail` 都带 `durationMs`（该步骤实测耗时，毫秒）；失败行 `outcome="error"`，顶层和 `detail` 都带 `errorCode`。
+- `handoff` 内 checkpoint 写失败返回 `500 E_CHECKPOINT_FAILED`，`error.details.action="checkpoint"`。
+- 错误：`400 E_BAD_REQUEST`（`limit` 不是正整数 / `afterId` 不是非负整数）、`401 E_UNAUTHORIZED`、`500 E_INTERNAL`。
