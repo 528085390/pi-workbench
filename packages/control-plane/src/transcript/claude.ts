@@ -10,12 +10,13 @@
  * - 末尾半行（写入中、不以 `\n` 结尾）不消费，下次从它的起点继续读；
  * - 文件缺失 / 为空时返回 pending 空页，**绝不抛异常**（刚发 prompt 时 transcript 还没落盘）。
  */
-import { closeSync, fstatSync, openSync, readSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { execa } from "execa";
 import type { SessionCaps, SessionRef, SessionStatus, UnifiedMessage } from "@pi-workbench/shared";
+
+import { asString, isJsonObject, readJsonlPage, stringifyUnknown } from "./jsonl.ts";
 
 // 0.5-B D4：UnifiedMessage 上移到 @pi-workbench/shared；这里 re-export 保持旧 import 路径兼容。
 export type { UnifiedMessage } from "@pi-workbench/shared";
@@ -32,9 +33,6 @@ export type ClaudeRunner = (cmd: string, args: string[]) => Promise<{ stdout: st
 
 /** 单次读取默认上限（条消息，不是行） */
 export const DEFAULT_TRANSCRIPT_LIMIT = 200;
-
-const NEWLINE = 0x0a;
-const CURSOR_ZERO = "0";
 
 /** 键为 `claude agents --json` 的字段名（探针实测） */
 type AgentEntry = Record<string, unknown>;
@@ -59,71 +57,19 @@ export function readClaudeTranscript(
   cursor: string,
   limit: number = DEFAULT_TRANSCRIPT_LIMIT,
 ): ClaudeTranscriptPage {
-  const start = parseCursor(cursor);
-  const maxMessages = normalizeLimit(limit);
-
-  let fd: number;
-  try {
-    fd = openSync(jsonlPath, "r");
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-      return emptyPage(CURSOR_ZERO);
-    }
-    throw err;
-  }
-
-  try {
-    const size = fstatSync(fd).size;
-    if (size === 0) {
-      return emptyPage(CURSOR_ZERO);
-    }
-    // 游标越过文件末尾说明文件被截断/轮转，回退到 0 重新读，并给出 notice（规格 §10.4）
-    const reset = start > size;
-    const from = reset ? 0 : start;
-    if (from === size) {
-      return emptyPage(String(from));
-    }
-
-    const chunk = readBytes(fd, from, size - from);
-    const messages: UnifiedMessage[] = [];
-    if (reset) {
-      messages.push({
-        id: "claude:cursor-reset:" + String(start),
-        kind: "notice",
-        role: "system",
-        text: "transcript 文件比游标短（可能被截断或轮转），已从头重读",
-        ts: new Date().toISOString(),
-      });
-    }
-    let consumed = 0;
-    let pos = 0;
-    let lineNumber = 0;
-
-    while (pos < chunk.length && messages.length < maxMessages) {
-      const newlineAt = chunk.indexOf(NEWLINE, pos);
-      if (newlineAt === -1) {
-        break; // 末尾半行：不消费，游标停在这里
-      }
-      const raw = chunk.subarray(pos, newlineAt).toString("utf8");
-      consumed = newlineAt + 1;
-      pos = newlineAt + 1;
-      lineNumber += 1;
-
-      const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
-      if (line.trim().length === 0) {
-        continue;
-      }
-      messages.push(...normalizeLine(line, lineNumber));
-    }
-
-    return {
-      messages,
-      nextCursor: String(from + consumed),
-      pending: messages.length === 0,
-    };
-  } finally {
-    closeSync(fd);
-  }
+  const page = readJsonlPage({
+    path: jsonlPath,
+    cursor,
+    limit,
+    defaultLimit: DEFAULT_TRANSCRIPT_LIMIT,
+    noticePrefix: "claude",
+    createState: () => undefined,
+    normalizeLine: (record, lineNumber) => ({
+      messages: normalizeLine(record, lineNumber),
+      skipped: 0,
+    }),
+  });
+  return { messages: page.messages, nextCursor: page.nextCursor, pending: page.pending };
 }
 
 /**
@@ -217,57 +163,15 @@ function normalizeCwd(cwd: string): string {
   return process.platform === "win32" ? absolute.toLowerCase() : absolute;
 }
 
-/** 按字节读完 [from, from+length)；read 可能短读，循环补齐 */
-function readBytes(fd: number, from: number, length: number): Buffer {
-  const buffer = Buffer.allocUnsafe(length);
-  let read = 0;
-  while (read < length) {
-    const n = readSync(fd, buffer, read, length - read, from + read);
-    if (n <= 0) {
-      break;
-    }
-    read += n;
-  }
-  return buffer.subarray(0, read);
-}
-
-function emptyPage(nextCursor: string): ClaudeTranscriptPage {
-  return { messages: [], nextCursor, pending: true };
-}
-
-function parseCursor(cursor: string): number {
-  const value = Number(cursor);
-  if (!Number.isFinite(value) || value < 0) {
-    return 0;
-  }
-  return Math.trunc(value);
-}
-
-function normalizeLimit(limit: number): number {
-  // Infinity 是"读到底"的合法表达（B1：未读计数 / POST /read 必须能跨过默认 200 上限）
-  if (limit === Number.POSITIVE_INFINITY) {
-    return Number.MAX_SAFE_INTEGER;
-  }
-  if (!Number.isFinite(limit)) {
-    return DEFAULT_TRANSCRIPT_LIMIT;
-  }
-  return Math.max(0, Math.trunc(limit));
-}
-
 /**
  * 一行 JSONL → 0..n 条 UnifiedMessage。
  * 只处理 type=user / assistant；其余（queue-operation、summary、system 初始化等）全部跳过。
  */
-function normalizeLine(line: string, lineNumber: number): UnifiedMessage[] {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(line);
-  } catch {
+function normalizeLine(record: unknown, lineNumber: number): UnifiedMessage[] {
+  if (!isJsonObject(record)) {
     return []; // 损坏行：跳过，不影响后续
   }
-  if (!isJsonObject(parsed)) {
-    return [];
-  }
+  const parsed = record;
   const type = parsed.type;
   if (type !== "user" && type !== "assistant") {
     return [];
@@ -350,26 +254,4 @@ function flattenToolResult(content: unknown): string {
       .join("\n");
   }
   return stringifyUnknown(content);
-}
-
-function stringifyUnknown(value: unknown): string {
-  if (value === undefined || value === null) {
-    return "";
-  }
-  if (typeof value === "string") {
-    return value;
-  }
-  try {
-    return JSON.stringify(value) ?? "";
-  } catch {
-    return String(value);
-  }
-}
-
-function isJsonObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function asString(value: unknown): string | undefined {
-  return typeof value === "string" ? value : undefined;
 }
