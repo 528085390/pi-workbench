@@ -1265,7 +1265,7 @@ class RaceReplayStore extends EventStore {
   }
 }
 
-test("WS：连接后 append 的事件以 {seq,sessionKey,type,payload,source,ts} 下发（R33）", async () => {
+test("WS：连接后 append 的事件以 {seq,sessionKey,type,source,ts,payload,idempotencyKey} 下发（R33 / §6.3）", async () => {
   const h = await makeHarness({ listen: true, seed: null });
   const received: string[] = [];
   let socket: MinimalSocket | null = null;
@@ -1286,7 +1286,7 @@ test("WS：连接后 append 的事件以 {seq,sessionKey,type,payload,source,ts}
     assert.deepEqual(wire["payload"], { text: "hello" });
     assert.equal(wire["source"], "claude");
     assert.equal(typeof wire["ts"], "string");
-    assert.equal(wire["idempotencyKey"], undefined, "线格式不暴露 idempotencyKey");
+    assert.equal(wire["idempotencyKey"], "ws-1", "线格式保留 idempotencyKey（spec §6.3）");
   } finally {
     socket?.close();
     await h.close();

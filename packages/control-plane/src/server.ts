@@ -1050,15 +1050,16 @@ function parseAfterSeq(value: unknown): number {
   return 0;
 }
 
-/** WS 线格式（R33）：不含 idempotencyKey 等内部字段 */
+/** WS 线格式（R33 / spec §6.3）：保留 idempotencyKey（缺失时显式 null），客户端可据此幂等去重 */
 function wireOf(event: SessionEvent): string {
   return JSON.stringify({
     seq: event.seq,
     sessionKey: event.sessionKey,
     type: event.type,
-    payload: event.payload,
     source: event.source,
     ts: event.ts,
+    payload: event.payload,
+    idempotencyKey: event.idempotencyKey ?? null,
   });
 }
 

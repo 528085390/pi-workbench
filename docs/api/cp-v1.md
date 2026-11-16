@@ -79,10 +79,23 @@
 免鉴权。返回：
 
 ```json
-{ "ok": true, "name": "pi-workbenchd", "version": "0.0.1", "pid": 12345, "uptimeMs": 34567, "schemaVersion": 4 }
+{
+  "ok": true,
+  "name": "pi-workbenchd",
+  "version": "0.0.1",
+  "pid": 12345,
+  "uptimeMs": 34567,
+  "schemaVersion": 4,
+  "instanceId": "0b0e6f1a-0000-4000-8000-000000000000",
+  "db": { "schemaVersion": 4, "ok": true },
+  "adapters": [ { "agent": "claude", "available": true } ]
+}
 ```
 
-- `version` 是 daemon 版本；`schemaVersion` 是当前库 schema（v1 契约承诺为 4）。
+- `version` 是 daemon 版本；`schemaVersion` 是契约当前的库 schema（v1 承诺为 4）。
+- `instanceId` 同 `GET /api/cp/version`，未登记时为空串。
+- `db.ok=false` 时 HTTP 返回 **503**（body 仍是完整健康摘要：`ok=false`、`db.schemaVersion=0`）；表示 daemon 存活但库不可用。
+- `adapters` 是各 Agent 的 `{ agent, available }` 订阅，数据源与 `GET /api/cp/agents` 同源。
 - 客户端必须忽略未知字段：v1 内只会 additive。
 
 ### GET /api/cp/version
@@ -275,10 +288,9 @@
 
 #### 落定语义
 
-- `200` 只表示取消请求已被控制面受理，**不等于** agent 的回合已经停止。
-- `interrupt` 返回后，agent 的状态投影可能延迟 0.5–1s 才落 `idle`；控制面在返回前会同步追加一条 `state_update` 兜底事件。
-- 状态落定以 `GET /api/cp/ws` 的 `state_update` 事件为准：`payload.state === "idle"`，并携带 `stopReason`；同一回合若有多条，以最后一条为准。
-- 客户端不得用 interrupt 响应推断会话已进入 `idle`；必须等 `state_update`，或轮询 `GET /api/cp/sessions` 观察 `status`。
+- `200` 表示取消请求已被控制面受理；`interrupt` 返回时控制面已**同步**把会话状态置为 `idle`，并在返回前追加 `state_update`（不存在 0.5–1s 的投影延迟）。
+- 状态落定仍以 `GET /api/cp/ws` 的 `state_update` 事件为准：`payload.state === "idle"`，并携带 `stopReason`；同一回合若有多条，以最后一条为准，也可轮询 `GET /api/cp/sessions` 观察 `status`。
+- 原生 adapter 侧的进程停止可能略晚于响应；控制面状态以 `state_update` / `sessions.status` 为准。
 
 错误：`400`、`401`、`404`、`409 E_NO_LEASE`、`422 E_CAP_UNSUPPORTED`、`503 E_ADAPTER_DOWN`、`500 E_INTERNAL`。
 
@@ -382,9 +394,10 @@
 - 每帧为 JSON：
 
 ```json
-{ "seq": 42, "sessionKey": "claude:abc", "type": "state_update", "payload": { "state": "idle" }, "source": "claude", "ts": "2026-11-17T03:00:00.000Z" }
+{ "seq": 42, "sessionKey": "claude:abc", "type": "state_update", "source": "claude", "ts": "2026-11-17T03:00:00.000Z", "payload": { "state": "idle" }, "idempotencyKey": "interrupt:claude:abc:3" }
 ```
 
+- 每帧固定包含 `seq` / `sessionKey` / `type` / `source` / `ts` / `payload` / `idempotencyKey`；`idempotencyKey` 缺失时显式下发 `null`。
 - `type` ∈ `token` / `thought` / `tool_call` / `tool_result` / `permission_request` / `plan` / `state_update` / `session_status` / `needs_input` / `lease_changed` / `error` / `notice`。
 - 回放跨重启：seq 由库分配并继续递增；客户端保存最后收到的 seq，重连时作为 `after`，不会丢事件也不会重复。
 

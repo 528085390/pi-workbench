@@ -97,8 +97,9 @@ function makeDeps(db: DatabaseSync, dir: string, overrides: Partial<Config> = {}
 }
 
 /**
- * Fastify printRoutes({commonPrefix:false}) 的行 → "METHOD /path"；忽略自动补的 HEAD。
- * 输出仍是缩进树（子路由相对父路径），按 4 字符一层的缩进重建完整路径。
+ * Fastify printRoutes({commonPrefix:false}) 的行 → "METHOD /path"。
+ * 输出仍是缩进树（子路由相对父路径），按 4 字符一层的缩进重建完整路径；
+ * 只跳过 Fastify 为 GET 自动补的 HEAD，其余方法（含误加的 PUT/DELETE）都进集合。
  */
 function parsedRoutes(app: FastifyInstance): string[] {
   const routes: string[] = [];
@@ -115,7 +116,7 @@ function parsedRoutes(app: FastifyInstance): string[] {
     stack.length = depth + 1;
     stack[depth] = full;
     for (const method of (match[3] ?? "").split(",").map((item) => item.trim())) {
-      if (method === "GET" || method === "POST") {
+      if (method.length > 0 && method !== "HEAD") {
         routes.push(method + " " + full);
       }
     }
@@ -194,14 +195,25 @@ type GoldenEvent = {
   source: string;
   idempotencyKey: string;
 };
+/** WS 线格式（spec §6.3）：golden fixture 按完整帧逐字段比对 */
+type WireEvent = {
+  seq: number;
+  sessionKey: string;
+  type: string;
+  source: string;
+  ts: string;
+  payload: unknown;
+  idempotencyKey: string | null;
+};
 type GoldenFixture = {
   apiVersion: string;
   schemaVersion: number;
   events: GoldenEvent[];
   resumeAfterSeq: number;
-  expectedReplay: Array<{ seq: number; sessionKey: string; type: string }>;
+  expectedReplay: WireEvent[];
 };
-type WsMessage = { seq: number; sessionKey: string; type: string };
+/** ts 由事件写入时刻决定；比对前把实际 ts 归一成该占位符，同时断言它是合法 ISO8601 */
+const TS_PLACEHOLDER = "<iso8601>";
 
 function readFixture(): GoldenFixture {
   return JSON.parse(readFileSync(new URL("./fixtures/event-v1.json", import.meta.url), "utf8")) as GoldenFixture;
@@ -238,7 +250,7 @@ async function openWs(url: string, received: string[]): Promise<MinimalSocket> {
   return socket;
 }
 
-async function waitFor(received: string[], count: number, timeoutMs = 4000): Promise<WsMessage[]> {
+async function waitFor(received: string[], count: number, timeoutMs = 4000): Promise<WireEvent[]> {
   const deadline = Date.now() + timeoutMs;
   while (received.length < count) {
     if (Date.now() > deadline) {
@@ -246,7 +258,7 @@ async function waitFor(received: string[], count: number, timeoutMs = 4000): Pro
     }
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
-  return received.map((raw) => JSON.parse(raw) as WsMessage);
+  return received.map((raw) => JSON.parse(raw) as WireEvent);
 }
 
 test("WS：同一 db 重建 server 后 after 回放不重复、不断档（golden fixture）", async () => {
@@ -279,10 +291,15 @@ test("WS：同一 db 重建 server 后 after 回放不重复、不断档（golde
       const base = second.url.replace("http://", "ws://");
       socket = await openWs(base + API_PREFIX + "/ws?after=" + String(fixture.resumeAfterSeq), received);
       const replayed = await waitFor(received, fixture.expectedReplay.length);
+      const normalizedReplay = replayed.map((event) => {
+        assert.equal(typeof event.ts, "string");
+        assert.ok(!Number.isNaN(Date.parse(event.ts)), "WS ts 必须是合法 ISO8601：" + event.ts);
+        return { ...event, ts: TS_PLACEHOLDER };
+      });
       assert.deepEqual(
-        replayed.map((event) => ({ seq: event.seq, sessionKey: event.sessionKey, type: event.type })),
+        normalizedReplay,
         fixture.expectedReplay,
-        "回放必须恰好是 after 之后的存量：不重复、不断档",
+        "回放必须逐字段等于 golden 完整帧（seq/sessionKey/type/source/ts/payload/idempotencyKey）：不重复、不断档",
       );
       assert.equal(new Set(replayed.map((event) => event.seq)).size, replayed.length, "seq 不得重复");
 
@@ -296,7 +313,21 @@ test("WS：同一 db 重建 server 后 after 回放不重复、不断档（golde
       });
       assert.equal(live.seq, 6, "重启后 seq 应继续递增");
       const all = await waitFor(received, fixture.expectedReplay.length + 1);
-      assert.equal(all.at(-1)?.seq, 6);
+      const last = all.at(-1);
+      assert.ok(last !== undefined);
+      assert.deepEqual(
+        { ...last, ts: TS_PLACEHOLDER },
+        {
+          seq: 6,
+          sessionKey: "claude:sess-a",
+          type: "token",
+          source: "claude",
+          ts: TS_PLACEHOLDER,
+          payload: { text: "after-restart" },
+          idempotencyKey: "golden-6",
+        },
+        "重启后的 live 帧也必须带 idempotencyKey",
+      );
     } finally {
       socket?.close();
       await second.close();
