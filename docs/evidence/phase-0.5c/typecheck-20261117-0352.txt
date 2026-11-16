@@ -1,0 +1,6 @@
+packages/shared typecheck$ tsc -p tsconfig.json --noEmit
+packages/shared typecheck: Done
+packages/control-plane typecheck$ tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json
+packages/extension typecheck$ tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json && tsc -p tsconfig.plugin.json
+packages/extension typecheck: Done
+packages/control-plane typecheck: Done

@@ -1,0 +1,6 @@
+packages/shared build$ tsc -p tsconfig.json
+packages/shared build: Done
+packages/control-plane build$ tsc -p tsconfig.json
+packages/extension build$ tsc -p tsconfig.json
+packages/extension build: Done
+packages/control-plane build: Done
