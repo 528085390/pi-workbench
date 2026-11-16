@@ -37,6 +37,7 @@ import type { LeaseManager } from "./lease.ts";
 import type { SessionFilter, SessionRegistry } from "./registry.ts";
 import { readTranscript } from "./transcript/index.ts";
 import type { TakeoverEngine } from "./takeover.ts";
+import { SessionWriteQueue } from "./write-queue.ts";
 
 /** 路由前缀（spec §6：统一 /api/cp；T1 的裸 /health 保留为别名） */
 export const API_PREFIX = "/api/cp";
@@ -79,6 +80,11 @@ export type ServerDeps = {
   checkpoints: CheckpointStore;
   /** 每读者未读游标（spec §6.5） */
   cursors: ReadCursorStore;
+  /**
+   * per-session 写队列（C02）。缺省时由 createServer 自建（单实例一个）；
+   * 生产装配可显式注入以便共享 / 观测。
+   */
+  writeQueue?: SessionWriteQueue;
   readTranscript?: ServerTranscriptReader;
   /**
    * GET /agents 的动态数据源（启动探测 / 周期刷新）。
@@ -146,6 +152,7 @@ export const STATUS_BY_CODE: Readonly<Record<WorkbenchErrorCode, number>> = {
   E_NO_LEASE: 409,
   E_IDEMPOTENCY_CONFLICT: 409,
   E_DISPATCH_IN_PROGRESS: 409,
+  E_SESSION_BUSY: 429,
   E_CAP_UNSUPPORTED: 422,
   E_AGENT_UNAVAILABLE: 422,
   E_ADAPTER_DOWN: 503,
@@ -193,6 +200,9 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
   assertAuthConfig(deps.config);
 
   const { config } = deps;
+  /** C02：同一 sessionKey 的写操作串行；不同 sessionKey 各自并行。 */
+  const writeQueue = deps.writeQueue ?? new SessionWriteQueue();
+  const runWrite = <T>(key: string, fn: () => Promise<T>): Promise<T> => writeQueue.run(key, fn);
   /**
    * 统一读路径（0.5-B B06）：按会话 agent 选择 transcript parser。
    * 0.5-A 注入的 ServerTranscriptReader 仍是 path-only 旧签名，优先调用它，
@@ -597,7 +607,7 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         const body = bodyOf(request.body, ROUTE_INJECT);
         const clientId = requireString(body, "clientId", ROUTE_INJECT);
         const text = requireString(body, "text", ROUTE_INJECT);
-        return await deps.engine.inject(key, text, clientId);
+        return await runWrite(key, () => deps.engine.inject(key, text, clientId));
       });
 
       api.post("/sessions/:key/interrupt", async (request) => {
@@ -605,7 +615,7 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         requireSession(deps.registry, key);
         const body = bodyOf(request.body, ROUTE_INTERRUPT);
         const clientId = requireString(body, "clientId", ROUTE_INTERRUPT);
-        return await deps.engine.interrupt(key, clientId);
+        return await runWrite(key, () => deps.engine.interrupt(key, clientId));
       });
 
       api.post("/sessions/:key/checkpoint", async (request) => {
@@ -617,7 +627,7 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         const summary = requireString(body, "summary", ROUTE_CHECKPOINT);
         const nextStep = optionalString(body, "nextStep", ROUTE_CHECKPOINT) ?? "";
         const touchedFiles = optionalStringArray(body, "touchedFiles", ROUTE_CHECKPOINT) ?? [];
-        return deps.engine.checkpoint(key, { summary, touchedFiles, nextStep }, clientId);
+        return runWrite(key, async () => deps.engine.checkpoint(key, { summary, touchedFiles, nextStep }, clientId));
       });
 
       api.get("/sessions/:key/checkpoint", async (request) => {
@@ -644,7 +654,7 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
           summary === undefined && nextStep === undefined && touchedFiles === undefined
             ? undefined
             : { summary: summary ?? "", touchedFiles: touchedFiles ?? [], nextStep: nextStep ?? "" };
-        return await deps.engine.handoff(key, to, clientId, input);
+        return await runWrite(key, () => deps.engine.handoff(key, to, clientId, input));
       });
 
       api.post("/sessions/:key/handback", async (request) => {
@@ -652,7 +662,7 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         requireSession(deps.registry, key);
         const body = bodyOf(request.body, ROUTE_HANDBACK);
         const clientId = requireString(body, "clientId", ROUTE_HANDBACK);
-        const result = await deps.engine.handback(key, clientId);
+        const result = await runWrite(key, () => deps.engine.handback(key, clientId));
         const session = deps.registry.get(key);
         if (session !== null) {
           attachPipeline(session);

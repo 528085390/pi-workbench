@@ -15,7 +15,8 @@ export type WorkbenchErrorCode =
   | "E_RESUME_REJECTED"
   | "E_IDEMPOTENCY_CONFLICT"
   | "E_AGENT_UNAVAILABLE"
-  | "E_DISPATCH_IN_PROGRESS";
+  | "E_DISPATCH_IN_PROGRESS"
+  | "E_SESSION_BUSY";
 
 /**
  * 带错误码的控制面异常。
