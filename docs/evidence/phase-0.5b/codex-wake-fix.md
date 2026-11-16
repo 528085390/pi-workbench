@@ -69,6 +69,21 @@ codex:01a1e45e-83a4-7da2-8afc-c387240fd4d2  unread=27
 
 说明“路径补解析 → unread > 0 → TurnNotifier 投递”链路已打通。
 
+### 实际 Pi 现场（最终确认）
+
+2026-11-16 21:27 通过 live daemon（127.0.0.1:7331）执行了一条无害 Codex 验证任务：
+
+`POST /api/cp/dispatch {agent:"codex", task:"Reply with exactly WAKE_...", cwd:"E:\\pi-workbench"}`
+→ `codex:01a1e48a-bcaf-78a2-893e-1ecac9516f09`
+
+用户当前 Pi 会话文件 `C:\\Users\\huang\\.pi\\agent\\sessions\\--C--Users-huang--\\2026-11-16T11-39-04-032Z_01a1e427-4fdf-7426-a3ee-3d9d1a96e908.jsonl` 第 176 行出现：
+
+```text
+{"type":"custom_message","customType":"pi-workbench","content":"[pi-workbench] 1 个会话有更新（未读共 3 条）：\\n- codex:01a1e48a-bcaf-78a2-893e-1ecac9516f09 本轮结束，游标 0 之后有 3 条...","display":true}
+```
+
+下一行 Pi assistant 已自动调用 `cp_see` 读取该会话。说明真实插件链路（daemon WS → TurnNotifier → pi.sendMessage）已完成唤醒，而不只是单元测试层的假 sink。
+
 ## 已知后续
 
 - 这次修复只解决 Codex transcript 路径持久化与唤醒判定；Codex/Claude 的 ACP `session/update` 没有携带 sessionId 到 `AdapterUpdate`，当同一 driver 同时 attach 多个会话时事件可能串流，属 0.5-C 事件管线范围。
