@@ -19,7 +19,7 @@ import { CheckpointStore } from "./checkpoints.ts";
 import type { Config } from "./config.ts";
 import { loadConfig } from "./config.ts";
 import { ReadCursorStore } from "./cursors.ts";
-import { migrate, openDb } from "./db.ts";
+import { SCHEMA_VERSION, backupDbFile, migrate, openDb, schemaVersion } from "./db.ts";
 import { DispatchStore } from "./dispatch-store.ts";
 import { isWorkbenchError, WorkbenchError } from "./errors.ts";
 import { EventStore } from "./events.ts";
@@ -474,6 +474,19 @@ function bootStores(config: Config, paths: WorkbenchPaths, lock: InstanceLock): 
   let db: DatabaseSync | null = null;
   try {
     db = openDb(paths.db);
+    const currentVersion = schemaVersion(db);
+    // 只有真正要升级旧库时才备份：否则每次启动都会新增备份，两次重启就把升级前的备份轮换掉。
+    if (currentVersion > 0 && currentVersion < SCHEMA_VERSION) {
+      try {
+        backupDbFile(paths.db, join(dirname(paths.db), "db-backup"), currentVersion);
+      } catch (err) {
+        // 备份失败只告警不阻断：升级仍可继续，不能让备份故障挡住 daemon 启动（spec §5 约束 6）。
+        console.error(
+          "[pi-workbenchd] 迁移前备份数据库失败（继续启动）：" +
+            (err instanceof Error ? err.message : String(err)),
+        );
+      }
+    }
     migrate(db);
     const store = new EventStore(db);
     const leases = new LeaseManager(db, { ttlMs: config.leaseTtlMs });
