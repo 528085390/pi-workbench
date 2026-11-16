@@ -281,6 +281,11 @@ export class ClaudeAdapter implements AgentAdapter {
     }
   }
 
+  /** 子进程存活且未 markDown / dispose。 */
+  isAlive(): boolean {
+    return !this.#disposed && !this.#down && this.#child.exitCode === null && this.#child.signalCode === null;
+  }
+
   onUpdate(cb: (update: AdapterUpdate) => void): () => void {
     this.#listeners.add(cb);
     return () => {

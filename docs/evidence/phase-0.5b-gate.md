@@ -2,7 +2,7 @@
 
 - 日期：2026-11-16
 - 阶段：Phase 0.5-B / B08（三 Agent 统一接入）
-- 分支 / commit：`feat/phase-0.5b-codex-pi`（Gate 证据采于 `92edc27`；本文档在其后补写）
+- 分支 / commit：`feat/phase-0.5b-codex-pi`（Gate 证据采于 2026-11-16 17:14 工作树；含评审修复 B08）
 - 执行者：控制者（T1–T9 由子代理实施，控制者逐任务复验并补做 E2E）
 - 结论：**七条全部 ✅ 通过** → Gate 0.5-B **通过**
 - 原始产物目录：`docs/evidence/phase-0.5b/`
@@ -23,11 +23,11 @@
 | @agentclientprotocol/claude-agent-acp | 0.107.0 |
 | @agentclientprotocol/sdk | 2.6.0 |
 | fastify / @fastify/websocket | 5.12.8 / 11.3.7 |
-| commit | `92edc27`（branch `feat/phase-0.5b-codex-pi`） |
+| commit | `59ab314` + 评审修复工作树（branch `feat/phase-0.5b-codex-pi`，2026-11-16 17:14） |
 
 复现环境：
 
-- 三 Agent E2E：`node scripts/e2e-three-agents.mjs`，脚本自起 daemon（随机端口，本次 127.0.0.1:38848），`PI_WORKBENCH_HOME=E:\pi-workbench\tmp\t9-e2e`，会话 cwd `tmp/t9-workspace`。
+- 三 Agent E2E：`node scripts/e2e-three-agents.mjs`，脚本自起 daemon（随机端口，本次 127.0.0.1:27805），`PI_WORKBENCH_HOME=E:\pi-workbench\tmp\t9-e2e`，会话 cwd `tmp/t9-workspace`。
 - Claude 回归：daemon 跑在 `127.0.0.1:8407`，`PI_WORKBENCH_HOME=E:\pi-workbench\tmp\t9-claude-home`，e2e 会话 cwd `tmp/t9-claude-workspace`。
 - 单测/构建：`pnpm -r build` + `pnpm -C packages/control-plane test` + `pnpm -C packages/extension test`，日志 `tmp/final-verify.log`（EXIT=0）。
 
@@ -35,13 +35,13 @@
 
 | # | 条目 | 结论 | 证据文件（行号） | 关键观测值 |
 |---|---|---|---|---|
-| 1 | Claude 0.5-A Gate 无回归 | ✅ | `claude-regression-run1.jsonl` 1–14；`claude-regression-run2.jsonl` 1–14；`tmp/final-verify.log` 341–408 | 两轮各 14 步全 ok、exit 0、PASS；control-plane 332 tests / 331 pass / 1 skip / 0 fail；extension 53 pass |
-| 2 | Codex rollout 发现 + 原生 id resume | ✅ | `e2e-three-agents.jsonl` L3、L5、L44–L47 | discover 15 条（`codex:01a1e34b-8a8c-74c2-8567-f5645d2a22d9`）；resume-by-native-id 1510ms；inject → end_turn；see 6 条含 `T9_CODEX_RESUME_dac57517` |
-| 3 | Pi 经 RPC 打开；lease 拦第二写者 | ✅ | `e2e-three-agents.jsonl` L50–L53；`pi-rpc.md` §4 | RPC attach 1720ms；inject/see 5 条；第二客户端 409 `E_LEASE_CONFLICT`，`newProcesses=0`、`before=after=2` |
-| 4 | 三 Agent caps 正确；不支持能力不暴露 | ✅ | `e2e-three-agents.jsonl` L11–L13、L32、L36、L41 | `/agents` 三行 caps；`/attach` 对 codex/pi/claude(interactive) 均 422 `E_CAP_UNSUPPORTED`；handoff 对 codex/pi 200 返回 resume-tui |
-| 5 | 每 Agent 至少一条 handoff 或 resume 实测 | ✅ | `e2e-three-agents.jsonl` L27、L44、L48、L54 | Claude handoff → `claude --resume <id>`；Codex resume-by-native-id + handoff；Pi handoff → `pi --session <abs file>` |
-| 6 | 事件统一渲染；未知事件不崩 | ✅ | `e2e-three-agents.jsonl` L14–L16、L31 | 三 Agent shape 均为 `id,kind,role,text,ts`；未知 type fixture 正常返回 2 条 |
-| 7 | 四类结构化错误 | ✅ | `e2e-three-agents.jsonl` L40、L56–L58 | E_AGENT_UNAVAILABLE 422 / E_SESSION_NOT_FOUND 404 / E_LEASE_CONFLICT 409 / E_RESUME_REJECTED（cause: Internal error） |
+| 1 | Claude 0.5-A Gate 无回归 | ✅ | `claude-regression-run1.jsonl` 1–14；`claude-regression-run2.jsonl` 1–14；`tmp/final-verify.log` | 两轮各 14 步全 ok、exit 0、PASS；control-plane 341 tests / 340 pass / 1 skip / 0 fail；extension 53 pass |
+| 2 | Codex rollout 发现 + 原生 id resume | ✅ | `e2e-three-agents.jsonl` L3、L8、L49–L53 | discover 25 条（`codex:01a1e3a8-316d-7ec1-a03c-d0f2a6df75af`）；resume-by-native-id 1401ms；inject → end_turn；see 6 条含 `T9_CODEX_RESUME_31dccd2f` |
+| 3 | Pi 经 RPC 打开；lease 拦第二写者 | ✅（provider 可用性条件已满足） | `e2e-three-agents.jsonl` L55–L59、L46；`pi-rpc.md` §4 | RPC attach 1716ms；inject/see 5 条；第二客户端 409 `E_LEASE_CONFLICT`，`newProcesses=0`、`before=after=2`；`POST /dispatch agent=pi` 实测成功（L46） |
+| 4 | 三 Agent caps 正确；不支持能力不暴露 | ✅ | `e2e-three-agents.jsonl` L12–L14、L33、L38–L39、L43–L44 | `/agents` 三行 caps；`/attach` 对 codex/pi/claude(interactive) 均 422 `E_CAP_UNSUPPORTED`；handoff 对 codex/pi 200 返回 resume-tui |
+| 5 | 每 Agent 至少一条 handoff 或 resume 实测 | ✅（Pi 条件同上） | `e2e-three-agents.jsonl` L28、L49、L53、L59 | Claude handoff → `claude --resume <id>`；Codex resume-by-native-id + handoff；Pi handoff → `pi --session <abs file>`（handoff 前关闭 RPC，进程 2→1） |
+| 6 | 事件统一渲染；未知事件不崩 | ✅（transcript 与事件流分别取证） | transcript：L15–L17、L32；事件流：L31（Claude）、L37（Codex）、L47（Pi） | 三 Agent shape 均为 `id,kind,role,text,ts`；未知 type fixture 正常返回 2 条；WS 事件流 codex `thought/token` 2 条、pi `token` 14 条、claude 12 条 |
+| 7 | 四类结构化错误 | ✅ | `e2e-three-agents.jsonl` L42、L61–L63 | E_AGENT_UNAVAILABLE 422 / E_SESSION_NOT_FOUND 404 / E_LEASE_CONFLICT 409 / E_RESUME_REJECTED（cause: Internal error） |
 
 ## 3. 逐条细节
 
@@ -50,8 +50,8 @@
 0.5-A 的九条闭环路径用**严格版 e2e**（`scripts/e2e-claude.mjs`）连续两轮复跑：
 
 ```text
-round 1: exit 0 · PASS · 证据 tmp/e2e-2026-11-16T07-41-26-719Z.jsonl
-round 2: exit 0 · PASS · 证据 tmp/e2e-2026-11-16T07-41-35-485Z.jsonl
+round 1: exit 0 · PASS · 证据 tmp/e2e-2026-11-16T09-22-01-334Z.jsonl
+round 2: exit 0 · PASS · 证据 tmp/e2e-2026-11-16T09-22-15-064Z.jsonl
 ```
 
 两轮逐步骤结果（`docs/evidence/phase-0.5b/claude-regression-run1.jsonl` / `run2.jsonl`，各 14 行）：`start, health, dispatch, lease, see-ready, inject, see-inject, interrupt, checkpoint, handoff, human-turn, lease-handback, handback, summary` 全 `ok:true`；summary 行 `result:"PASS"`，handback 的 `deltaSummary` 含 `E2E_HUMAN_<nonce>` 回显，证明原生接管期间增量被接回。
@@ -59,7 +59,7 @@ round 2: exit 0 · PASS · 证据 tmp/e2e-2026-11-16T07-41-35-485Z.jsonl
 单测与构建（`tmp/final-verify.log`）：
 
 ```text
-control-plane: tests 332 / pass 331 / fail 0 / skipped 1
+control-plane: tests 341 / pass 340 / fail 0 / skipped 1
 extension:     tests 53  / pass 53  / fail 0
 pnpm -r build: 三包 Done（EXIT=0）
 ```
@@ -78,20 +78,22 @@ node scripts/e2e-claude.mjs   # 连续执行两次
 ### Gate #2 · Codex 发现 + 原生 id resume
 
 1. 造会话：`codex exec` 种子（`e2e-three-agents.jsonl` L3，status 0）。
-2. 发现：L5 `{"count":15,"key":"codex:01a1e34b-8a8c-74c2-8567-f5645d2a22d9"}`——只读 rollout 首行 `session_meta`，cwd 取 `payload.cwd`。
-3. 原生 id resume（driver 级）：L44 `{"nativeId":"01a1e34b-8a8c-74c2-8567-f5645d2a22d9","ms":1510}`；L45 inject `effective:"now"`；L46 `stopReason:"end_turn"`；L47 see 6 条且最后一条为 `T9_CODEX_RESUME_dac57517`。
+2. 发现：L8 `{"count":25,"key":"codex:01a1e3a8-316d-7ec1-a03c-d0f2a6df75af"}`——**经 HTTP `GET /api/cp/sessions/discover?agent=codex` 发现并登记**，不直接写库；只读 rollout 首行 `session_meta`，cwd 取 `payload.cwd`，默认只列 `thread_source=user`（缺失字段保留）。
+3. 原生 id resume（driver 级）：L49 `{"nativeId":"01a1e3a8-316d-7ec1-a03c-d0f2a6df75af","ms":1401}`；L50 inject `effective:"now"`；L51 `stopReason:"end_turn"`；L52 see 6 条且最后一条为 `T9_CODEX_RESUME_31dccd2f`。
 4. 协议层细节（含 `session/resume` 请求/响应原始帧、`session/load` 在 ACP v2 返回 `-32601 Method not found` 的裁定）见 `codex-acp.md` §2–§3；`probe-findings.md` §5 证明 ACP `session/new` 会落 rollout，故新建会话的 `transcriptPath` 允许为空、由 `see` 懒解析。
 
 ### Gate #3 · Pi RPC 打开 + lease 双写拦截
 
-- RPC attach：L50 `{"ms":1720,"session":"C:\\Users\\huang\\.pi\\agent\\sessions\\--E--pi-workbench-tmp-t9-workspace--\\2026-11-16T07-39-08-531Z_01a1e34b-a773-76e2-99fc-3abcafd3f127.jsonl"}`。
-- 注入与读回：L51 `effective:"now"`；L52 see 5 条，最后一条 `T9_PI_ATTACH_dac57517`。
-- 第二写者：L53 `{"conflict":{"code":"E_LEASE_CONFLICT"},"before":2,"after":2,"newProcesses":0}`——冲突发生在**拉起客户端之前**，进程数与 prompt 计数均未变；HTTP 侧同样 409（L40，`heldBy":"t9-dac57517"`）。
+- RPC attach：L55 `{"ms":1716,"session":"C:\\Users\\huang\\.pi\\agent\\sessions\\--E--pi-workbench-tmp-t9-workspace--\\2026-11-16T09-13-45-084Z_01a1e3a8-5745-7524-9744-1b38a39e7468.jsonl"}`。
+- 注入与读回：L56 `effective:"now"`；L57 see 5 条，最后一条 `T9_PI_ATTACH_31dccd2f`。
+- 第二写者：L58 `{"conflict":{"code":"E_LEASE_CONFLICT"},"before":2,"after":2,"newProcesses":0}`——冲突发生在**拉起客户端之前**，进程数与 prompt 计数均未变；HTTP 侧同样 409（L42，`heldBy":"t9-31dccd2f"`）。
+- 产品出口：L46 `POST /dispatch agent=pi` 200，返回 `pi:01a1e3a8-cb0e-711d-ada0-657fed714c96`，transcript 回显 `T9_PI_DISPATCH_31dccd2f`（B08 M3 修复前该路径 422）。
+- handoff 单写者：L59 `rpcProcessesBefore:2 / After:1`，PiDriver.close 先断开自己的 RPC 子进程再交原生终端（B08 M1）。
 - 驱动与 lease 细则见 `pi-rpc.md` §4（lease 硬约束：inject/interrupt/resume/handoff 触碰客户端前先 `LeaseManager.acquire` + `assertWriter`）。
 
 ### Gate #4 · caps 矩阵与能力门
 
-`GET /api/cp/agents`（L11）三行：
+`GET /api/cp/agents`（L12）三行：
 
 | agent | available | version | stream | inject | interrupt | attach | resume | transcript | permissions | background |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -101,8 +103,8 @@ node scripts/e2e-claude.mjs   # 连续执行两次
 
 能力门实测：
 
-- `POST /api/cp/sessions/:key/attach`：codex 422（L12，`details:{agent:"codex",cap:"attach"}`，4ms）、pi 422（L13，1ms）、claude 交互式 422（L32）——**未调用 driver**。
-- `POST /api/cp/sessions/:key/handoff`：codex 200 `["codex","resume","01a1e34b-fc6d-7dd3-b5fa-bab1cdefa974","--no-alt-screen"]`（L36）；pi 200 `["pi","--session",<abs jsonl>]`（L41）。
+- `POST /api/cp/sessions/:key/attach`：codex 422（L13，`details:{agent:"codex",cap:"attach"}`，4ms）、pi 422（L14，3ms）、claude 交互式 422（L33）——**未调用 driver**。
+- `POST /api/cp/sessions/:key/handoff`：codex 200 `["codex","resume","01a1e3a8-b619-70d0-b5bd-a99f1f880381","--no-alt-screen"]`（L38）；pi 200 `["pi","--session",<abs jsonl>]`（L43）。
 
 > 说明：spec §14 Gate #4 原措辞「对 attach 调 handoff 期望 422」与 §13「handoff 是分流」冲突，已按 §13 修正为**独立的 /attach 能力门**，并同步改了 spec 原文；handoff 对 codex/pi 是正常出口，不返回 422。
 
@@ -110,33 +112,35 @@ node scripts/e2e-claude.mjs   # 连续执行两次
 
 | Agent | 实测 | 证据 |
 |---|---|---|
-| Claude | handoff → `["claude","--resume","3c6a498a-73b0-4556-85b0-65b1b4ff6140"]` mode=resume-tui；随后 human-turn 与 handback 成功 | L27–L29；`claude-regression-run1/2.jsonl` 第 10–13 行 |
-| Codex | driver 级 resume-by-native-id（L44，1510ms）→ inject → end_turn → see nonce（L45–L47）；handoff 命令（L48） | `e2e-three-agents.jsonl` L44–L48 |
-| Pi | handoff → `["pi","--session",<abs jsonl>]`（L54）；此前 RPC attach 已实测（L50） | `e2e-three-agents.jsonl` L54、L50 |
+| Claude | handoff → `["claude","--resume","95f6aba9-8568-4598-865a-79efeae041c8"]` mode=resume-tui；随后 human-turn 与 handback 成功 | L28–L30；`claude-regression-run1/2.jsonl` 第 10–13 行 |
+| Codex | driver 级 resume-by-native-id（L49，1401ms）→ inject → end_turn → see nonce（L50–L52）；handoff 命令（L53） | `e2e-three-agents.jsonl` L49–L53；HTTP handoff L38 |
+| Pi | handoff → `["pi","--session",<abs jsonl>]`（L59）；此前 RPC attach 已实测（L55）、HTTP dispatch 已实测（L46） | `e2e-three-agents.jsonl` L55–L59、L46；HTTP handoff L43 |
 
 ### Gate #6 · 统一渲染与未知事件
 
-- `unified-claude`（L31）：8 条，shape `id,kind,role,text,ts`。
-- `unified-codex`（L14）：3 条，shape 同上；`unified-pi`（L15）：3 条，shape 同上。
-- 未知事件 fixture（人为塞入未知 `type`/坏的 payload 行）：L16 正常返回 2 条（`UNKNOWN_EVENT_USER` / `UNKNOWN_EVENT_OK`），未抛错、未中断游标。
+- `unified-claude`（L32）：7 条，shape `id,kind,role,text,ts`。
+- `unified-codex`（L15）：3 条，shape 同上；`unified-pi`（L16）：3 条，shape 同上。
+- 未知事件 fixture（人为塞入未知 `type`/坏的 payload 行）：L17 正常返回 2 条（`UNKNOWN_EVENT_USER` / `UNKNOWN_EVENT_OK`），未抛错、未中断游标。
+**事件流**：Claude L31 12 条（notice/state_update/thought/token）；Codex L37 2 条（thought 1 / token 1，pipeline 已订阅 CodexDriver.onUpdate）；Pi L47 14 条（token 14）。三 Agent 的事件都经 `EventPipeline.attach(source)` 落到同一个 `SessionEvent` 形状——B08 M2 修复前 codex/pi 只声明 `stream:true` 却无人订阅，本表把「transcript」与「事件流」分开取证。
 - 解析器口径：`codex-records.md` §2/§4（23 种 type|payload.type 枚举、developer 角色跳过、reasoning 取 summary）、`pi-records.md` §1–§3（21 文件 / 404 记录 / 0 坏行，custom_message 未知类型不抛）。
 
 ### Gate #7 · 四类结构化错误
 
 | 场景 | 证据 | 状态码与错误码 |
 |---|---|---|
-| adapter / agent 不存在 | L56 | 422 `E_AGENT_UNAVAILABLE`（agent `t9-no-such-agent`） |
-| 会话不存在 | L57 | 404 `E_SESSION_NOT_FOUND`（`claude:t9-missing-dac57517`） |
-| lease 冲突 | L40 / L53 | 409 `E_LEASE_CONFLICT`（`heldBy:"t9-dac57517"`；driver 级 `newProcesses=0`） |
-| resume 被拒 | L58 | `E_RESUME_REJECTED`（1535ms，`cause:"resume 被 agent 拒绝：Internal error"`，`details.sessionId=00000000-…`） |
+| adapter / agent 不存在 | L61 | 422 `E_AGENT_UNAVAILABLE`（agent `t9-no-such-agent`） |
+| 会话不存在 | L62 | 404 `E_SESSION_NOT_FOUND`（`claude:t9-missing-31dccd2f`） |
+| lease 冲突 | L42 / L58 | 409 `E_LEASE_CONFLICT`（`heldBy:"t9-31dccd2f"`；driver 级 `newProcesses=0`） |
+| resume 被拒 | L63 | `E_RESUME_REJECTED`（1012ms，`cause:"resume 被 agent 拒绝：Internal error"`，`details.sessionId=00000000-…`） |
 
 ## 4. 偏差与说明
 
-1. **证据文件命名**：spec §14 拟名（`codex-discover-resume.json`、`caps-matrix.json`、`attach-422.json` 等）在实际执行中合并为一条端到端流水 `e2e-three-agents.jsonl`（60 行，每行 `{ts,phase,step,ok,detail}`），Gate #1 单独用两轮 `claude-regression-run*.jsonl`；映射见上表行号。
-2. **Codex 会话发现数量**：15 条来自本机 30 天窗口内的 rollout（含历史会话），不是只有本次 seed；这正是「发现」要验证的能力。
+1. **证据文件命名**：spec §14 拟名（`codex-discover-resume.json`、`caps-matrix.json`、`attach-422.json` 等）在实际执行中合并为一条端到端流水 `e2e-three-agents.jsonl`（65 行，每行 `{ts,phase,step,ok,detail}`），Gate #1 单独用两轮 `claude-regression-run*.jsonl`；映射见上表行号。
+2. **Codex 会话发现数量**：25 条来自本机 30 天窗口内的 rollout（含历史会话），不是只有本次 seed；这正是「发现」要验证的能力。
 3. **Pi attach 语义**：caps.attach 保持 false（打开同一会话文件 ≠ 接管运行中进程），spec §9/§10 已按实测修订；`/attach` 对 Pi 的 422 是预期行为，不是缺陷。
-4. **未覆盖项**：Codex 运行中 ACP resume 的 quiesce 路径目前只有单测（cancel→idle→resume，15s 超时）；Pi `new_session` 的落盘路径未在真实进程上复测（见 spec §18 未决项 #7）。实验记录在 `probe-findings.md` §附。
-5. **测试与构建**：最终证据 run 在 `92edc27` 上执行；332/331+1 skip 与 extension 53 与 T9 交付时的数字一致，Gate 期间未再改代码。
+4. **未覆盖项**：Codex 运行中 ACP resume 的 quiesce 路径目前只有单测（cancel→idle→resume，15s 超时）；实测的是 idle 会话按原生 id resume。实验记录在 `probe-findings.md` §附。Pi `new_session` 已由 L46 的真实 `POST /dispatch agent=pi` 覆盖。
+5. **测试与构建**：最终证据 run 在评审修复后的工作树上执行；control-plane 341 tests / 340 pass / 1 skip / 0 fail，extension 53 pass，`pnpm -r build` 三包 Done。日志见 `tmp/final-verify.log`。
+6. **评审修复（B08）**：`docs/reviews/2026-11-16-phase-0.5b-review.md` 的 M1–M4 与 S1–S6 已修，逐条记录见 `review-fixes-2026-11-16.md`。E2E 新增 HTTP discovery/register、Pi dispatch、Codex/Pi WS 事件流、Pi handoff 前后进程数断言。
 
 ## 5. 复现命令汇总
 
@@ -155,4 +159,4 @@ node scripts/e2e-claude.mjs   # 跑两次
 
 ## 6. 结论
 
-七条 Gate 全部满足：Claude 无回归（两轮 PASS + 332 单测）、Codex 原生 id resume、Pi RPC + lease 双写拦截、三 Agent caps 与能力门、每 Agent 至少一条 handoff/resume、统一事件渲染与未知事件容错、四类结构化错误。**Gate 0.5-B 通过**，可进入 0.5-C 或按计划收尾合并；遗留项见 §4 第 4 条与 spec §18。
+七条 Gate 全部满足：Claude 无回归（两轮 PASS + 341 单测）、Codex 原生 id resume、Pi RPC + lease 双写拦截、三 Agent caps 与能力门、每 Agent 至少一条 handoff/resume、统一 transcript 与事件流渲染、未知事件容错、四类结构化错误。**Gate 0.5-B 通过**，可进入 0.5-C 或按计划收尾合并；遗留项见 §4 第 4 条与 spec §18。

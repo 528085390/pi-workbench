@@ -17,8 +17,8 @@
  *   统一渲染 三个 agent 的 /transcript 均为 UnifiedMessage（id/role/kind/text/ts）；未知记录/坏行不崩
  *
  * 证据：docs/evidence/phase-0.5b/e2e-three-agents.jsonl（每步一行 {ts,phase,step,ok,detail}）。
- * 只用 Node 内置能力 + HTTP；发现/驱动级步骤直接 import 产品源码（daemon 没有 discover/resume 路由，
- * 0.5-B 非目标），所有子进程调用都带 timeout。
+ * 只用 Node 内置能力 + HTTP；发现走 GET /sessions/discover、登记走 POST /sessions，
+ * 驱动级 resume/lease 步骤仍直接 import 产品源码，所有子进程调用都带 timeout。
  */
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -34,8 +34,6 @@ import { LeaseManager } from "../packages/control-plane/src/lease.ts";
 import { SessionRegistry } from "../packages/control-plane/src/registry.ts";
 import { CodexDriver } from "../packages/control-plane/src/agents/codex-driver.ts";
 import { PiDriver } from "../packages/control-plane/src/agents/pi-driver.ts";
-import { discoverCodexSessions } from "../packages/control-plane/src/discover/codex.ts";
-import { discoverPiSessions } from "../packages/control-plane/src/discover/pi.ts";
 import { readTranscript } from "../packages/control-plane/src/transcript/index.ts";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -285,19 +283,6 @@ function countPiRpcProcesses() {
   return Number.isFinite(value) ? value : -1;
 }
 
-function seedDaemonDb(refs) {
-  const db = openDb(join(home, "workbench.db"));
-  try {
-    migrate(db);
-    const registry = new SessionRegistry(db);
-    for (const ref of refs) {
-      registry.upsert(ref);
-    }
-  } finally {
-    db.close();
-  }
-}
-
 function writeUnknownTranscript() {
   const path = join(home, "unknown-events.jsonl");
   const lines = [
@@ -334,47 +319,53 @@ async function prepareSeeds() {
   record("setup", "pi-print-seed", piRun.status === 0, piRun);
   must(piRun.status === 0, "pi --print 造会话失败：" + JSON.stringify(piRun));
 
-  const codexRefs = await discoverCodexSessions({ cwd: workspace, limit: 50, sinceDays: 30 });
-  must(codexRefs.length > 0, "discoverCodexSessions 没发现 " + workspace + " 下的 rollout");
+  state.codexSeedNonce = codexNonce;
+  state.piSeedNonce = piNonce;
+  state.codexSeedStdout = codexRun.stdout;
+  state.piSeedStdout = piRun.stdout;
+}
+
+async function discoverAndRegister() {
+  const codexDiscovery = await http("GET", "/api/cp/sessions/discover?agent=codex&cwd=" + encodeURIComponent(workspace) + "&limit=50");
+  must(codexDiscovery.status === 200, "GET /sessions/discover?agent=codex 失败：" + JSON.stringify(codexDiscovery.body));
+  const codexRefs = codexDiscovery.body.sessions ?? [];
+  must(codexRefs.length > 0, "HTTP discovery 没发现 " + workspace + " 下的 rollout");
   const codexRef = codexRefs[0];
   record("codex", "discover", true, {
     count: codexRefs.length,
     key: codexRef.key,
     nativeId: codexRef.nativeId,
     transcriptPath: codexRef.transcriptPath,
-    seedEchoed: codexRun.stdout.includes(codexNonce),
+    seedEchoed: String(state.codexSeedStdout ?? "").includes(String(state.codexSeedNonce ?? "")),
   });
 
-  const piRefs = await discoverPiSessions({ cwd: workspace, limit: 50 });
-  must(piRefs.length > 0, "discoverPiSessions 没发现 " + workspace + " 下的 session");
+  const piDiscovery = await http("GET", "/api/cp/sessions/discover?agent=pi&cwd=" + encodeURIComponent(workspace) + "&limit=50");
+  must(piDiscovery.status === 200, "GET /sessions/discover?agent=pi 失败：" + JSON.stringify(piDiscovery.body));
+  const piRefs = piDiscovery.body.sessions ?? [];
+  must(piRefs.length > 0, "HTTP discovery 没发现 " + workspace + " 下的 session");
   const piRef = piRefs[0];
   record("pi", "discover", true, {
     count: piRefs.length,
     key: piRef.key,
     nativeId: piRef.nativeId,
     transcriptPath: piRef.transcriptPath,
-    seedEchoed: piRun.stdout.includes(piNonce),
+    seedEchoed: String(state.piSeedStdout ?? "").includes(String(state.piSeedNonce ?? "")),
   });
 
-  codexRef.status = "idle";
-  piRef.status = "idle";
   mkdirSync(home, { recursive: true });
   const unknownPath = writeUnknownTranscript();
-  const unknownRef = {
+  const registered = await http("POST", "/api/cp/sessions", {
     key: "pi:t9-unknown",
     agent: "pi",
     nativeId: "t9-unknown",
     cwd: workspace,
     transcriptPath: unknownPath,
-    status: "idle",
-    driver: "pi",
-    capabilities: { ...capsOf("pi") },
-    kind: "interactive",
-  };
-  seedDaemonDb([codexRef, piRef, unknownRef]);
-  record("setup", "seed-sessions", true, {
-    db: join(home, "workbench.db"),
-    keys: [codexRef.key, piRef.key, unknownRef.key],
+  });
+  must(registered.status === 200, "POST /sessions 登记未知事件 fixture 失败：" + JSON.stringify(registered.body));
+  record("setup", "register-sessions", true, {
+    codex: codexRef.key,
+    pi: piRef.key,
+    unknown: "pi:t9-unknown",
   });
 
   state.codexKey = codexRef.key;
@@ -426,6 +417,39 @@ async function phaseAgentsAndAttach() {
 
   const health = await http("GET", "/health");
   record("gate6", "daemon-health", health.status === 200, health.body);
+}
+
+async function collectWsEvents(waitMs = 1500) {
+  const wsUrl = "ws://127.0.0.1:" + String(state.port) + "/api/cp/ws?after=0";
+  const socket = new WebSocket(wsUrl);
+  const events = [];
+  await withTimeout(
+    new Promise((done, fail) => {
+      socket.onopen = done;
+      socket.onerror = () => fail(new Error("WS 连接失败：" + wsUrl));
+    }),
+    5000,
+    "事件流 WS 连接",
+  );
+  socket.onmessage = (event) => {
+    try {
+      events.push(JSON.parse(String(event.data)));
+    } catch {
+      // 非 JSON 帧忽略
+    }
+  };
+  await sleep(waitMs);
+  socket.close();
+  return events;
+}
+
+async function assertAgentEvents(agent) {
+  const events = await collectWsEvents();
+  const mine = events.filter((event) => event.source === agent && event.type !== "notice" && event.type !== "state_update");
+  must(mine.length > 0, agent + " 事件流没有产生 pipeline 事件：" + JSON.stringify(events.filter((event) => event.source === agent).slice(0, 5)));
+  const types = {};
+  for (const event of mine) types[event.type] = (types[event.type] ?? 0) + 1;
+  record("gate6", "events-" + agent, true, { count: mine.length, types, firstSeq: mine[0]?.seq ?? null, lastSeq: mine[mine.length - 1]?.seq ?? null });
 }
 
 async function phaseClaude() {
@@ -565,6 +589,7 @@ async function phaseCodexHttp() {
   const ready = await pollTranscript(state.codexHttpKey, "0", (messages) => firstAssistant(messages), 120_000);
   must(ready.hit, "Codex dispatch 后 120s 内没有 assistant 消息");
   record("codex", "http-see", true, { waitedMs: ready.waitedMs, messages: ready.messages.length, last: ready.messages.slice(-1).map(textOf) });
+  await assertAgentEvents("codex");
 
   const lease = await http("POST", "/api/cp/sessions/" + encodeURIComponent(state.codexHttpKey) + "/lease", {
     action: "acquire",
@@ -615,6 +640,32 @@ async function phasePiHttp() {
   must(command[0] === "pi" && command[1] === "--session" && command[2] === state.piPath && handoff.body.mode === "resume-tui", "Pi handoff 命令形状不对：" + JSON.stringify(handoff.body));
   record("gate4", "handoff-pi", true, { status: handoff.status, command, mode: handoff.body.mode });
   record("gate5", "handoff-pi", true, { command, mode: handoff.body.mode });
+}
+
+async function phasePiDispatch() {
+  const injectNonce = "T9_PI_DISPATCH_" + nonce;
+  const dispatched = await http("POST", "/api/cp/dispatch", {
+    agent: "pi",
+    task: "Reply with exactly " + injectNonce + " and do not modify any files.",
+    idempotencyKey: "t9-pi-dispatch:" + nonce,
+  });
+  must(dispatched.status === 200, "POST /dispatch agent=pi 失败：" + JSON.stringify(dispatched));
+  const key = dispatched.body.key;
+  must(typeof key === "string" && key.startsWith("pi:"), "Pi dispatch 返回的 key 不对：" + JSON.stringify(dispatched.body));
+
+  const deadline = Date.now() + 120_000;
+  let messages = [];
+  while (Date.now() < deadline) {
+    const page = await http("GET", "/api/cp/sessions/" + encodeURIComponent(key) + "/transcript?after=0&limit=200");
+    if (page.status === 200) {
+      messages = messagesOf(page.body);
+      if (assistantHas(messages, injectNonce)) break;
+    }
+    await sleep(500);
+  }
+  must(assistantHas(messages, injectNonce), "Pi dispatch 后 transcript 没有回显 " + injectNonce + "：" + JSON.stringify(messages.slice(-3)));
+  record("gate3", "pi-dispatch", true, { key, messages: messages.length });
+  await assertAgentEvents("pi");
 }
 
 async function phaseCodexDriver() {
@@ -702,9 +753,12 @@ async function phasePiDriver() {
       must(before === after && before >= 1, "第二写者不应新增 RPC 子进程：before=" + String(before) + " after=" + String(after));
       record("gate3", "pi-lease-conflict", true, { conflict, before, after, newProcesses: after - before });
 
+      const beforeHandoff = countPiRpcProcesses();
       const handoff = await first.handoff(ref);
       must(Array.isArray(handoff.command) && handoff.command[0] === "pi" && handoff.command[1] === "--session" && handoff.command[2] === ref.transcriptPath && handoff.mode === "resume-tui", "Pi driver handoff 命令不对：" + JSON.stringify(handoff));
-      record("gate5", "handoff-pi-driver", true, handoff);
+      const afterHandoff = countPiRpcProcesses();
+      must(afterHandoff === beforeHandoff - 1, "Pi handoff 应只关闭自己的 RPC 子进程：before=" + String(beforeHandoff) + " after=" + String(afterHandoff));
+      record("gate5", "handoff-pi-driver", true, { ...handoff, rpcProcessesBefore: beforeHandoff, rpcProcessesAfter: afterHandoff });
     } finally {
       await second.dispose();
       await first.dispose();
@@ -780,10 +834,12 @@ async function main() {
   const phases = [
     ["setup", prepareSeeds],
     ["setup", startDaemon],
+    ["setup", discoverAndRegister],
     ["gate4+6", phaseAgentsAndAttach],
     ["claude", phaseClaude],
     ["codex-http", phaseCodexHttp],
     ["pi-http", phasePiHttp],
+    ["pi-dispatch", phasePiDispatch],
     ["codex-driver", phaseCodexDriver],
     ["pi-driver", phasePiDriver],
     ["gate7", phaseErrorPaths],

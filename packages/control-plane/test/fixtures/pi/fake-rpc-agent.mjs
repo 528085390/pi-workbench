@@ -79,6 +79,16 @@ function handle(command) {
     emit({ type: "agent_settled", aborted: true });
     return;
   }
+  if (type === "new_session") {
+    if (process.env.FAKE_PI_NEW_SESSION_ERROR) {
+      fail("new_session", process.env.FAKE_PI_NEW_SESSION_ERROR, command.id);
+      return;
+    }
+    sessionId = process.env.FAKE_PI_NEW_SESSION_ID ?? "new-" + String(Date.now());
+    currentSessionFile = process.env.FAKE_PI_NEW_SESSION_FILE ?? (process.cwd() + "/pi-new-" + sessionId + ".jsonl");
+    respond("new_session", { cancelled: false }, command.id);
+    return;
+  }
   if (type === "switch_session") {
     currentSessionFile = command.sessionPath;
     if (typeof command.sessionPath === "string") {

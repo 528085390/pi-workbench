@@ -22,10 +22,10 @@ import fastifyWebsocket from "@fastify/websocket";
 import Fastify from "fastify";
 import type { FastifyError, FastifyInstance, FastifyRequest } from "fastify";
 
-import type { AgentAdapter } from "./adapters/types.ts";
+import type { AdapterUpdate, AgentAdapter } from "./adapters/types.ts";
 import type { AgentRouter } from "./agents/router.ts";
 import type { AgentStatus } from "./agents/types.ts";
-import { CLAUDE_CAPABILITIES } from "./capabilities.ts";
+import { capsOf, CLAUDE_CAPABILITIES } from "./capabilities.ts";
 import type { CheckpointStore } from "./checkpoints.ts";
 import type { Config } from "./config.ts";
 import { SCHEMA_VERSION } from "./db.ts";
@@ -58,10 +58,10 @@ export type ServerTranscriptReader = (
 
 /**
  * 事件管线的结构依赖：只要求 attach，不 import pipeline 模块（避免 server 与 pipeline 双向耦合）。
- * EventPipeline.attach(adapter, sessionKey) 正好满足。
+ * EventPipeline.attach(source, sessionKey) 对 AgentAdapter 与 AgentDriver 都成立（B08 M2）。
  */
 export type PipelineLike = {
-  attach(adapter: AgentAdapter, sessionKey: string): () => void;
+  attach(source: { onUpdate(cb: (update: AdapterUpdate) => void): () => void }, sessionKey: string): () => void;
 };
 
 /** createServer 的依赖（R38 / R46：比 brief 多 adapter 与 checkpoints） */
@@ -160,6 +160,7 @@ export const INTERNAL_ERROR_CODE = "E_INTERNAL";
 export const INTERNAL_ERROR_MESSAGE = "internal error";
 
 const ROUTE_LIST = "GET /sessions";
+const ROUTE_DISCOVER = "GET /sessions/discover";
 const ROUTE_DETAIL = "GET /sessions/:key";
 const ROUTE_TRANSCRIPT = "GET /sessions/:key/transcript";
 const ROUTE_LEASE = "POST /sessions/:key/lease";
@@ -324,6 +325,37 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
       // 0.5-B B01-b：有注册表时由 router.list() 动态生成；缺省保留 0.5-A 的 claude-only 描述
       api.get("/agents", async () => await currentAgents());
 
+      // 0.5-B B08（评审 M4）：发现层必须有产品出口，否则用户无法让 daemon 认识既有原生会话。
+      // GET /sessions/discover?agent=codex&cwd=...&limit=... → 发现并登记（幂等 upsert），返回登记后的 SessionRef。
+      api.get("/sessions/discover", async (request) => {
+        const query = queryOf(request);
+        const agent = optionalString(query, "agent", ROUTE_DISCOVER);
+        if (agent === undefined || agent.trim().length === 0) {
+          throw new WorkbenchError("E_BAD_REQUEST", ROUTE_DISCOVER + " 必须带 agent", { route: ROUTE_DISCOVER });
+        }
+        const driver = deps.router?.get(agent) ?? null;
+        if (driver === null) {
+          throw new WorkbenchError("E_AGENT_UNAVAILABLE", "Agent 未注册或不可用：" + agent, { agent });
+        }
+        const cwd = optionalString(query, "cwd", ROUTE_DISCOVER);
+        const rawLimit = query["limit"];
+        let limit: number | undefined;
+        if (typeof rawLimit === "string" && rawLimit.trim().length > 0) {
+          limit = Number(rawLimit);
+          if (!Number.isInteger(limit) || limit <= 0) {
+            throw new WorkbenchError("E_BAD_REQUEST", ROUTE_DISCOVER + " 的 limit 必须是正整数", { limit: rawLimit });
+          }
+        }
+        const refs = await driver.discover({
+          ...(cwd === undefined || cwd.length === 0 ? {} : { cwd }),
+          ...(limit === undefined ? {} : { limit }),
+        });
+        for (const ref of refs) {
+          deps.registry.upsert(ref.status === "idle" ? ref : { ...ref, status: "idle" });
+        }
+        return { sessions: refs, count: refs.length };
+      });
+
       api.get("/sessions", async (request) => {
         const query = queryOf(request);
         const filter: SessionFilter = {};
@@ -339,6 +371,34 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         // 不带 clientId 时保持 v1 的形状（纯 SessionRef 数组），带则每项附读状态（spec §6.5）
         const clientId = optionalString(query, "clientId", ROUTE_LIST);
         return clientId === undefined ? sessions : sessions.map((session) => viewOf(session, clientId));
+      });
+
+      // B08 M4：登记一个已存在的原生会话（发现结果 / 外部扫描器都走这里，不再直接写库）。
+      api.post("/sessions", async (request) => {
+        const routeName = "POST /sessions";
+        const body = bodyOf(request.body, routeName);
+        const agent = requireString(body, "agent", routeName);
+        const nativeId = requireString(body, "nativeId", routeName);
+        const cwd = requireString(body, "cwd", routeName);
+        const key = optionalString(body, "key", routeName) ?? agent + ":" + nativeId;
+        const transcriptPath = optionalString(body, "transcriptPath", routeName);
+        const driver = deps.router?.get(agent) ?? null;
+        if (driver === null && deps.router !== undefined) {
+          throw new WorkbenchError("E_AGENT_UNAVAILABLE", "Agent 未注册或不可用：" + agent, { agent });
+        }
+        const ref: SessionRef = {
+          key,
+          agent,
+          nativeId,
+          cwd,
+          ...(transcriptPath === undefined || transcriptPath.length === 0 ? {} : { transcriptPath }),
+          status: "idle",
+          driver: "none",
+          capabilities: driver === null ? capsOf(agent) : driver.caps,
+          kind: "interactive",
+        };
+        deps.registry.upsert(ref);
+        return ref;
       });
 
       api.get("/sessions/:key", async (request) => {
@@ -550,12 +610,11 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
       api.post("/dispatch", async (request) => {
         // 0.5-B：启动探测是后台跑的，探测未完成时 codex/pi 会以 available=false + reason 注册；
         // 首次 dispatch 前先等这一次探测（3s 上限、in-flight 复用），避免刚启动就误报 E_AGENT_UNAVAILABLE。
-        if (deps.agentStatuses !== undefined) {
-          try {
-            await deps.agentStatuses();
-          } catch {
-            // 探测失败照常走注册表快照，由下面的可用性判定给出结构化错误
-          }
+        try {
+          // 复用 /agents 的 30s 缓存；deps.agentStatuses 缺省时 currentAgents() 直接读注册表
+          await currentAgents();
+        } catch {
+          // 探测失败照常走注册表快照，由下面的可用性判定给出结构化错误
         }
         const body = bodyOf(request.body, ROUTE_DISPATCH);
         // 0.5-B B01-b：agent 缺省 claude（保持 0.5-A 调用方兼容），透传给引擎按注册表判可用
@@ -566,8 +625,12 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         const ref = await deps.engine.dispatch({ agent, task, cwd, idempotencyKey });
         // 新会话挂事件管线，后续 ACP update 才会被归一化成事件（R39 的 pipeline 接线落点）
         try {
-          // 事件管线当前只挂 Claude ACP adapter；codex/pi 的 update 由各自 driver 负责
-          if (ref.agent === "claude") {
+          // B08 M2：Claude / Codex / Pi 统一挂各自 driver 的 update 流。
+          // 没注册 driver 时保留 0.5-A 的 claude-only adapter 回落。
+          const driver = deps.router?.get(ref.agent) ?? null;
+          if (driver !== null) {
+            deps.pipeline?.attach(driver, ref.key);
+          } else if (ref.agent === "claude") {
             deps.pipeline?.attach(deps.adapter, ref.key);
           }
         } catch (err) {

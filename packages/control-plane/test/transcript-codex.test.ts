@@ -235,3 +235,16 @@ test("readTranscript: 未注册 agent 抛 E_BAD_REQUEST", () => {
     (err: unknown) => err instanceof WorkbenchError && err.code === "E_BAD_REQUEST",
   );
 });
+
+test("readCodexTranscript: 文件变短时游标归零并产出 notice", (t) => {
+  const path = tempFile(t);
+  writeFileSync(path, userLine("第一行") + "\n" + assistantLine("第二行") + "\n", "utf8");
+  const first = readCodexTranscript(path, "0");
+
+  writeFileSync(path, userLine("替换后的短文件") + "\n", "utf8");
+  const page = readCodexTranscript(path, first.nextCursor);
+
+  assert.equal(page.messages[0]?.kind, "notice");
+  assert.ok(page.messages.some((message) => message.text === "替换后的短文件"));
+  assert.ok(page.messages.every((message) => message.id.length > 0));
+});

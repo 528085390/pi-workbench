@@ -82,7 +82,7 @@ export type DispatchInput = {
 
 /** 驱动层的扩展入口（不属于 AgentDriver 六方法，Codex/Pi 的 dispatch/handoff 用） */
 type DriverRuntime = AgentDriver & {
-  newSession?: (cwd: string) => Promise<{ sessionId: string }>;
+  newSession?: (cwd: string) => Promise<{ sessionId: string; transcriptPath?: string }>;
   waitForTurn?: (ref: SessionRef, timeoutMs?: number) => Promise<{ stopReason: string }>;
   close?: (ref: SessionRef) => Promise<void>;
   resolveTranscriptPath?: (ref: SessionRef) => Promise<string | undefined>;
@@ -420,6 +420,7 @@ export class TakeoverEngine {
     }
 
     let sessionId: string;
+    let openedTranscriptPath: string | undefined;
     try {
       if (driver !== null && input.agent !== "claude") {
         const opener = (driver as DriverRuntime).newSession;
@@ -428,7 +429,9 @@ export class TakeoverEngine {
             agent: input.agent,
           });
         }
-        sessionId = (await opener.call(driver, resolvedCwd)).sessionId;
+        const opened = await opener.call(driver, resolvedCwd);
+        sessionId = opened.sessionId;
+        openedTranscriptPath = opened.transcriptPath;
       } else {
         const opened = await this.#adapter.newSession(resolvedCwd);
         sessionId = opened.sessionId;
@@ -444,8 +447,11 @@ export class TakeoverEngine {
       acpSessionId: sessionId,
       cwd: resolvedCwd,
       // 只有 Claude 的会话文件路径能由 cwd 推导；Codex/Pi 由各自发现层补写
-      transcriptPath:
-        input.agent === "claude" ? join(claudeProjectDir(resolvedCwd), sessionId + ".jsonl") : undefined,
+      ...(input.agent === "claude"
+        ? { transcriptPath: join(claudeProjectDir(resolvedCwd), sessionId + ".jsonl") }
+        : openedTranscriptPath === undefined
+          ? {}
+          : { transcriptPath: openedTranscriptPath }),
       status: "running",
       driver: "pi",
       capabilities: driver === null ? CLAUDE_CAPABILITIES : driver.caps,
@@ -564,8 +570,9 @@ export class TakeoverEngine {
   }
 
   /**
-   * 关闭控制通道：Claude 走既有 adapter.close；Codex 有扩展 close；Pi 没有 close
-   * （RPC 子进程随 driver.dispose 回收，原生 session 文件不归控制面关）。
+   * 关闭控制通道：Claude 走既有 adapter.close；Codex / Pi 走各自的 close。
+   * Pi 的 close 会停掉 --mode rpc 子进程 —— 否则 handoff 给原生终端后，
+   * daemon 与人类终端会同时写同一个 session jsonl（A11 实测 Pi 无文件锁）。
    */
   async #closeDriverRef(ref: SessionRef, driver: AgentDriver, clientId: string): Promise<void> {
     if (driver.agent === "claude") {

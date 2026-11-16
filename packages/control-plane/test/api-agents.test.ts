@@ -143,7 +143,7 @@ type HarnessOptions = {
   agentStatuses?: () => Promise<AgentStatus[]>;
   now?: () => number;
   seed?: SessionRef[];
-  pipelineAttach?: () => void;
+  pipelineAttach?: (source: unknown) => void;
 };
 
 type Harness = {
@@ -198,8 +198,8 @@ async function makeHarness(options: HarnessOptions = {}): Promise<Harness> {
     ...(options.now === undefined ? {} : { now: options.now }),
     ...(options.pipelineAttach === undefined
       ? {}
-      : { pipeline: { attach: () => {
-          options.pipelineAttach?.();
+      : { pipeline: { attach: (source: unknown) => {
+          options.pipelineAttach?.(source);
           return () => {};
         } } }),
   };
@@ -329,16 +329,16 @@ test("POST /dispatch 能力不足返回 422 E_CAP_UNSUPPORTED，不产生 adapte
   }
 });
 
-test("codex dispatch 成功时不走 Claude 的 pipeline.attach；claude dispatch 仍挂管线", async () => {
+test("codex dispatch 挂 codex driver 的 update 流；claude dispatch 挂 claude driver（B08 M2）", async () => {
   const claude = makeDriver("claude", CLAUDE_CAPABILITIES);
   const codex = makeDriver("codex", CODEX_CAPABILITIES, {
     newSession: async () => ({ sessionId: "sess-codex" }),
   });
-  let attached = 0;
+  const attached: unknown[] = [];
   const h = await makeHarness({
     drivers: [{ driver: claude.driver }, { driver: codex.driver }],
-    pipelineAttach: () => {
-      attached += 1;
+    pipelineAttach: (source) => {
+      attached.push(source);
     },
   });
   try {
@@ -349,7 +349,8 @@ test("codex dispatch 成功时不走 Claude 的 pipeline.attach；claude dispatc
     });
     assert.equal(codexRes.statusCode, 200, codexRes.body);
     assert.equal(codexRes.json<SessionRef>().key, "codex:sess-codex");
-    assert.equal(attached, 0, "codex 没有 attach 语义，不得调用 Claude 管线");
+    assert.equal(attached.length, 1, "codex dispatch 必须挂事件管线");
+    assert.equal(attached[0], codex.driver, "codex 挂的是 codex driver，不是 Claude adapter");
     assert.ok(codex.calls.includes("inject"));
 
     const claudeRes = await h.app.inject({
@@ -358,7 +359,8 @@ test("codex dispatch 成功时不走 Claude 的 pipeline.attach；claude dispatc
       payload: { task: "干活", idempotencyKey: "k-claude" },
     });
     assert.equal(claudeRes.statusCode, 200, claudeRes.body);
-    assert.equal(attached, 1, "claude dispatch 仍按 0.5-A 挂事件管线");
+    assert.equal(attached.length, 2, "claude dispatch 也要挂事件管线");
+    assert.equal(attached[1], claude.driver, "claude 挂的是 claude driver");
   } finally {
     await h.close();
   }
@@ -439,14 +441,19 @@ test("handoff 若实际返回 attach 语义而 agent caps.attach=false，返回 
 test("Pi 写操作在共享 LeaseManager 上临时切换到 driver clientId，handoff 不报 E_LEASE_CONFLICT", async () => {
   const key = "pi:sess-pi";
   const holders: string[] = [];
+  const order: string[] = [];
   let h: Harness | null = null;
   const pi = makeDriver("pi", capsOf("pi"), {
     inject: async () => {
       holders.push(h?.leases.current(key)?.clientId ?? "none");
       return { messageId: "pi-m1", effective: "now" };
     },
+    close: async () => {
+      order.push("close");
+    },
     handoff: async () => {
       holders.push(h?.leases.current(key)?.clientId ?? "none");
+      order.push("handoff");
       return { command: ["pi", "--session", "C:\\sessions\\pi-sess-pi.jsonl"], mode: "resume-tui" };
     },
   });
@@ -468,6 +475,7 @@ test("Pi 写操作在共享 LeaseManager 上临时切换到 driver clientId，ha
     });
     assert.equal(handed.statusCode, 200, handed.body);
     assert.deepEqual(holders, ["pi", "pi"], "driver 内部看到的租约持有人必须与其 clientId 一致");
+    assert.deepEqual(order, ["close", "handoff"], "handoff 必须先 close 控制通道，再返回原生命令（避免双写）");
   } finally {
     await h.close();
   }
@@ -618,6 +626,77 @@ test("POST /attach：会话不存在 → 404 E_SESSION_NOT_FOUND", async () => {
     assert.equal(res.statusCode, 404, res.body);
     assert.equal(res.json<ErrorEnvelope>().error.code, "E_SESSION_NOT_FOUND");
     assert.deepEqual(claude.calls, []);
+  } finally {
+    await h.close();
+  }
+});
+
+test("GET /sessions/discover：按 agent 发现并登记，返回 SessionRef", async () => {
+  const found = sessionRef("codex", "sess-found", { cwd: "E:\\work" });
+  const calls: string[] = [];
+  const codex = makeDriver("codex", CODEX_CAPABILITIES, {
+    discover: async (opts) => {
+      calls.push(JSON.stringify(opts));
+      return [found];
+    },
+  });
+  const h = await makeHarness({ drivers: [{ driver: codex.driver }] });
+  try {
+    const res = await h.app.inject({
+      method: "GET",
+      url: API + "/sessions/discover?agent=codex&cwd=" + encodeURIComponent("E:\\work") + "&limit=5",
+    });
+    assert.equal(res.statusCode, 200, res.body);
+    const body = res.json<{ sessions: SessionRef[]; count: number }>();
+    assert.equal(body.count, 1);
+    assert.equal(body.sessions[0]?.key, "codex:sess-found");
+    assert.equal(calls.length, 1);
+    assert.deepEqual(JSON.parse(calls[0] ?? "{}"), { cwd: "E:\\work", limit: 5 });
+
+    const list = await h.app.inject({ method: "GET", url: API + "/sessions?agent=codex" });
+    assert.equal(list.statusCode, 200);
+    const keys = list.json<SessionRef[]>().map((row) => row.key);
+    assert.ok(keys.includes("codex:sess-found"), "发现结果必须登记进注册表：" + JSON.stringify(keys));
+  } finally {
+    await h.close();
+  }
+});
+
+test("GET /sessions/discover：缺 agent 400，未注册 agent 422", async () => {
+  const h = await makeHarness({ drivers: [] });
+  try {
+    const missing = await h.app.inject({ method: "GET", url: API + "/sessions/discover" });
+    assert.equal(missing.statusCode, 400);
+    assert.equal(missing.json<ErrorEnvelope>().error.code, "E_BAD_REQUEST");
+
+    const unknown = await h.app.inject({ method: "GET", url: API + "/sessions/discover?agent=nope" });
+    assert.equal(unknown.statusCode, 422);
+    assert.equal(unknown.json<ErrorEnvelope>().error.code, "E_AGENT_UNAVAILABLE");
+  } finally {
+    await h.close();
+  }
+});
+
+test("dispatch 复用 /agents 的 30s 探测缓存：两次 dispatch 只探测一次（B08 S1）", async () => {
+  const claude = makeDriver("claude", CLAUDE_CAPABILITIES);
+  let probes = 0;
+  const h = await makeHarness({
+    drivers: [{ driver: claude.driver }],
+    agentStatuses: async () => {
+      probes += 1;
+      return [{ agent: "claude", available: true, version: "x", caps: CLAUDE_CAPABILITIES }];
+    },
+  });
+  try {
+    for (const key of ["k-a", "k-b"]) {
+      const res = await h.app.inject({
+        method: "POST",
+        url: API + "/dispatch",
+        payload: { agent: "claude", task: "干活", idempotencyKey: key },
+      });
+      assert.equal(res.statusCode, 200, res.body);
+    }
+    assert.equal(probes, 1, "30s 缓存内第二次 dispatch 不得重新探测");
   } finally {
     await h.close();
   }

@@ -12,21 +12,18 @@
  * 测试不依赖真实 codex：spawnAdapter / discoverSessions / readTranscript / resolveRolloutPath
  * 都可注入，进程级用例走 test/fixtures/fake-codex-acp-agent.mjs。
  */
-import { homedir } from "node:os";
-import { join } from "node:path";
 import type { SessionCaps, SessionRef, UnifiedMessage } from "@pi-workbench/shared";
 import type { CodexAcpSpawnOptions } from "../adapters/codex-acp.ts";
 import { spawnCodexAcpAdapter } from "../adapters/codex-acp.ts";
 import type { AdapterUpdate, AgentAdapter } from "../adapters/types.ts";
 import { capsOf } from "../capabilities.ts";
 import type { Config } from "../config.ts";
-import { discoverCodexSessions } from "../discover/codex.ts";
+import { DEFAULT_CODEX_SESSIONS_ROOT, discoverCodexSessions } from "../discover/codex.ts";
 import { isWorkbenchError, WorkbenchError } from "../errors.ts";
 import { readTranscript } from "../transcript/index.ts";
 import type { AgentDriver, DiscoverOptions, HandoffCommand, SeeResult } from "./types.ts";
 
-/** Codex 默认 rollout 根：~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl */
-export const DEFAULT_CODEX_SESSIONS_ROOT = join(homedir(), ".codex", "sessions");
+export { DEFAULT_CODEX_SESSIONS_ROOT };
 
 /** 运行中 resume 的 quiesce 窗口（规格 §8：cancel → idle 15s 超时判 E_RESUME_REJECTED） */
 export const DEFAULT_QUIESCE_TIMEOUT_MS = 15_000;
@@ -325,7 +322,15 @@ export class CodexDriver implements AgentDriver {
   async #ensureAdapter(): Promise<AgentAdapter> {
     this.#assertLive("adapter");
     if (this.#adapter !== null) {
-      return this.#adapter;
+      // B08 S5：ACP 子进程退出后重建，而不是让 codex 永久 E_ADAPTER_DOWN 到 daemon 重启。
+      if (this.#adapter.isAlive === undefined || this.#adapter.isAlive()) {
+        return this.#adapter;
+      }
+      const dead = this.#adapter;
+      this.#adapter = null;
+      this.#adapterUnsubscribe?.();
+      this.#adapterUnsubscribe = null;
+      void dead.dispose().catch(() => undefined);
     }
     if (this.#spawnPromise === null) {
       this.#spawnPromise = this.#spawnAdapter(this.#config, {

@@ -56,6 +56,8 @@ export interface AgentAdapter {
   close(sessionId: string): Promise<void>;
   /** 等本回合结束；超时抛 `E_ADAPTER_DOWN`（turn timeout），不挂起 */
   waitForTurn?(sessionId: string, timeoutMs?: number): Promise<AdapterTurnResult>;
+  /** 进程是否仍可用；可选，driver 用它决定是否重建缓存（B08 S5） */
+  isAlive?(): boolean;
   onUpdate(cb: (update: AdapterUpdate) => void): () => void;
   dispose(): Promise<void>;
 }

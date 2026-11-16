@@ -23,7 +23,7 @@ export type Driver = "pi" | "human" | "none";
 
 /** 统一消息模型（Phase 0.5-B D4：从 transcript/claude.ts 上移，三解析器共用） */
 export type UnifiedRole = "user" | "assistant" | "system";
-export type UnifiedKind = "text" | "thinking" | "tool_call" | "tool_result";
+export type UnifiedKind = "text" | "thinking" | "tool_call" | "tool_result" | "notice";
 export interface UnifiedMessage {
   id: string;
   role: UnifiedRole;

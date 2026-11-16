@@ -19,7 +19,7 @@ import { loadConfig } from "./config.ts";
 import { ReadCursorStore } from "./cursors.ts";
 import { migrate, openDb } from "./db.ts";
 import { DispatchStore } from "./dispatch-store.ts";
-import { isWorkbenchError } from "./errors.ts";
+import { isWorkbenchError, WorkbenchError } from "./errors.ts";
 import { EventStore } from "./events.ts";
 import { LeaseManager } from "./lease.ts";
 import { InstanceLockError, acquireInstanceLock, ensureDirs, resolvePaths } from "./paths.ts";
@@ -297,10 +297,27 @@ export async function main(): Promise<void> {
   // 并用固定 clientId "pi"（引擎在写操作期间临时换租约，见 takeover.ts #driverWrite）。
   const router = new AgentRouter();
   const claudeDriver = new ClaudeDriver(adapter);
-  const codexDriver = new CodexDriver(config);
+  // B08 S6：driver 级再兜一层租约检查。dispatch 首轮 inject 没有 lease（0.5-A 口径），放行；
+  // 若已有别的 writer，则在碰 ACP 之前直接 E_LEASE_CONFLICT，不依赖调用方一定走 TakeoverEngine。
+  const codexDriver = new CodexDriver(config, {
+    authorizeWrite: (ref, action) => {
+      // handoff/close 发生在 TakeoverEngine 把租约转给 human 之后，不能按 writer 身份拦。
+      if (action === "handoff" || action === "close") {
+        return;
+      }
+      const lease = leases.current(ref.key);
+      if (lease !== null && lease.clientId !== PI_AGENT_CLIENT_ID) {
+        throw new WorkbenchError("E_LEASE_CONFLICT", "租约被其他客户端持有：" + lease.clientId, {
+          sessionKey: ref.key,
+          heldBy: lease.clientId,
+        });
+      }
+    },
+  });
   const piDriver = new PiDriver({
     lease: leases,
     clientId: PI_AGENT_CLIENT_ID,
+    rpcCmd: config.pi.rpcCmd,
     ...(config.pi.provider === undefined ? {} : { provider: config.pi.provider }),
     ...(config.pi.model === undefined ? {} : { model: config.pi.model }),
   });

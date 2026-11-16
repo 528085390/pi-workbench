@@ -67,14 +67,24 @@ export function readCodexTranscript(
     if (size === 0) {
       return emptyPage(CURSOR_ZERO);
     }
-    // 游标越过文件末尾说明文件被截断/轮转，回退到 0 重新读
-    const from = start > size ? 0 : start;
+    // 游标越过文件末尾说明文件被截断/轮转，回退到 0 重新读，并给出 notice（规格 §10.4）
+    const reset = start > size;
+    const from = reset ? 0 : start;
     if (from === size) {
       return emptyPage(String(from));
     }
 
     const chunk = readBytes(fd, from, size - from);
     const messages: UnifiedMessage[] = [];
+    if (reset) {
+      messages.push({
+        id: "codex:cursor-reset:" + String(start),
+        kind: "notice",
+        role: "system",
+        text: "transcript 文件比游标短（可能被截断或轮转），已从头重读",
+        ts: new Date().toISOString(),
+      });
+    }
     const state: LineState = { sessionTimestamp: "", assistantKeys: new Set<string>() };
     let consumed = 0;
     let pos = 0;

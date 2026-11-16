@@ -93,6 +93,11 @@ class FixtureRpcClient implements PiRpcClientLike {
     await this.#wait("abort");
   }
 
+  newSession(): Promise<{ cancelled: boolean }> {
+    this.#send({ type: "new_session" });
+    return this.#wait("new_session") as Promise<{ cancelled: boolean }>;
+  }
+
   switchSession(sessionPath: string): Promise<{ cancelled: boolean }> {
     this.#send({ type: "switch_session", sessionPath });
     return this.#wait("switch_session") as Promise<{ cancelled: boolean }>;
@@ -408,6 +413,68 @@ test("PiDriver.dispose: 停止所有 RPC 子进程", async () => {
     assert.equal(h.created.length, 1);
     await driver.dispose();
     assert.equal(h.created[0]?.stopped, true);
+  } finally {
+    await h.disposeAll();
+    h.db.close();
+    rmSync(h.dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
+});
+
+test("PiDriver.close: 停掉该会话的 RPC 子进程（handoff 前必须断开，避免双写）", async () => {
+  const h = makeHarness();
+  try {
+    const driver = h.make("client-a");
+    await driver.attach(h.ref);
+    assert.equal(h.created.length, 1);
+    await driver.close(h.ref);
+    assert.equal(h.created[0]?.stopped, true);
+  } finally {
+    await h.disposeAll();
+    h.db.close();
+    rmSync(h.dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
+});
+
+test("PiDriver.newSession: 不带 --session 启动，new_session 后用 get_state 取 id 与文件", async () => {
+  const h = makeHarness();
+  try {
+    const sessionFile = join(h.dir, "pi-new-new-session-1.jsonl");
+    const driver = h.make("client-a", {
+      env: { FAKE_PI_NEW_SESSION_ID: "new-session-1", FAKE_PI_NEW_SESSION_FILE: sessionFile },
+    });
+    const opened = await driver.newSession(h.dir);
+    assert.equal(opened.sessionId, "new-session-1");
+    assert.equal(opened.transcriptPath, sessionFile);
+
+    const log = h.readLog();
+    const start = log.find((record) => record.event === "start");
+    assert.ok(start !== undefined);
+    assert.ok(!(start.argv as string[]).includes("--session"), "newSession 不应带 --session");
+    assert.ok(log.some((record) => record.event === "request" && record.command === "new_session"));
+    assert.ok(log.some((record) => record.event === "request" && record.command === "get_state"));
+
+    // 新会话已进入 clients 映射：再 inject 应复用同一个子进程
+    await driver.inject({ ...h.ref, key: "pi:new-session-1", nativeId: "new-session-1", transcriptPath: opened.transcriptPath }, "hi");
+    assert.equal(h.created.length, 1, "inject 不应再拉起第二个 RPC 进程");
+  } finally {
+    await h.disposeAll();
+    h.db.close();
+    rmSync(h.dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
+});
+
+test("PiDriver.rpcCmd: 额外参数透传，--mode rpc 不重复", async () => {
+  const h = makeHarness();
+  try {
+    const driver = h.make("client-a", {
+      cliPath: undefined,
+      rpcCmd: [FAKE_AGENT, "--mode", "rpc", "--provider", "zz"],
+    });
+    await driver.attach(h.ref);
+    const start = h.readLog().find((record) => record.event === "start");
+    assert.ok(start !== undefined);
+    const argv = start.argv as string[];
+    assert.deepEqual(argv.slice(0, 5), ["--mode", "rpc", "--provider", "zz", "--session"]);
   } finally {
     await h.disposeAll();
     h.db.close();

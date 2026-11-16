@@ -6,7 +6,9 @@
  * 因此这里只读首行，不解析全文；坏文件/半行跳过而不是崩。
  *
  * 口径（probe-findings 实测补充，2026-11-16）：
- * - 不按 thread_source 过滤：ACP session/new 落盘的 rollout 可能缺该字段；
+ * - 默认只列 thread_source=user 的线程（规格 §7.1 规则 2）；缺失该字段的保留
+ *   （ACP session/new 落盘的 rollout 实测会缺 thread_source，probe-findings）；
+ *   includeSubagents 才列出子代理线程；
  * - cwd 一律取首行 payload.cwd，不从目录名推断；
  * - native id 取 payload.id（thread id，rollout 文件名后缀）；缺失时回退 session_id；
  * - ~/.codex/archived_sessions 默认不列，includeArchived 才扫。
@@ -31,6 +33,17 @@ const MAX_FIRST_LINE_BYTES = 1024 * 1024;
 const NEWLINE = 0x0a;
 const DAY_MS = 86_400_000;
 
+/** 发现缓存（B08 S2）：目录按 mtime 缓存列表，文件按 mtime+size 缓存首行解析结果 */
+type CachedDirEntry = { name: string; directory: boolean; file: boolean };
+const DIR_CACHE = new Map<string, { mtimeMs: number; entries: CachedDirEntry[] }>();
+const META_CACHE = new Map<string, { mtimeMs: number; size: number; meta: RolloutMeta | null }>();
+
+/** 测试用：清空发现缓存 */
+export function clearCodexDiscoveryCache(): void {
+  DIR_CACHE.clear();
+  META_CACHE.clear();
+}
+
 export type DiscoverCodexOptions = {
   /** rollout 根目录；缺省 ~/.codex/sessions */
   sessionsRoot?: string;
@@ -42,6 +55,8 @@ export type DiscoverCodexOptions = {
   sinceDays?: number;
   /** 是否扫 ~/.codex/archived_sessions，默认 false */
   includeArchived?: boolean;
+  /** 是否列出 thread_source=subagent 的线程，默认 false（规格 §7.1） */
+  includeSubagents?: boolean;
   /** 返回条数上限；缺省不截断 */
   limit?: number;
   /** 测试注入的时钟 */
@@ -89,6 +104,10 @@ export async function discoverCodexSessions(opts: DiscoverCodexOptions = {}): Pr
       if (wantedCwd !== undefined && normalizeCwd(meta.cwd) !== wantedCwd) {
         continue;
       }
+      // 缺失 thread_source 的保留：ACP 新建会话的 rollout 实测不带该字段。
+      if (opts.includeSubagents !== true && meta.threadSource !== undefined && meta.threadSource !== "user") {
+        continue;
+      }
       const fileMtimeMs = fileMtime(file);
       const timestampMs = parseTimestamp(meta.timestamp) ?? fileMtimeMs;
       if (timestampMs < cutoff) {
@@ -134,17 +153,31 @@ function collectRolloutFiles(root: string): string[] {
     if (depth > 3) {
       return;
     }
-    let entries;
+    let mtimeMs: number;
     try {
-      entries = readdirSync(dir, { withFileTypes: true });
+      mtimeMs = statSync(dir).mtimeMs;
     } catch {
       return;
     }
+    const cached = DIR_CACHE.get(dir);
+    let entries: CachedDirEntry[];
+    if (cached !== undefined && cached.mtimeMs === mtimeMs) {
+      entries = cached.entries;
+    } else {
+      let dirents;
+      try {
+        dirents = readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      entries = dirents.map((entry) => ({ name: entry.name, directory: entry.isDirectory(), file: entry.isFile() }));
+      DIR_CACHE.set(dir, { mtimeMs, entries });
+    }
     for (const entry of entries) {
       const path = join(dir, entry.name);
-      if (entry.isDirectory()) {
+      if (entry.directory) {
         walk(path, depth + 1);
-      } else if (entry.isFile() && /^rollout-.*\.jsonl$/.test(entry.name)) {
+      } else if (entry.file && /^rollout-.*\.jsonl$/.test(entry.name)) {
         files.push(path);
       }
     }
@@ -156,6 +189,22 @@ function collectRolloutFiles(root: string): string[] {
 
 /** 只读首行；解析失败、非 session_meta、缺 id 都返回 null */
 function readRolloutMeta(path: string): RolloutMeta | null {
+  let stat;
+  try {
+    stat = statSync(path);
+  } catch {
+    return null;
+  }
+  const cached = META_CACHE.get(path);
+  if (cached !== undefined && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+    return cached.meta;
+  }
+  const meta = parseRolloutMeta(path);
+  META_CACHE.set(path, { mtimeMs: stat.mtimeMs, size: stat.size, meta });
+  return meta;
+}
+
+function parseRolloutMeta(path: string): RolloutMeta | null {
   const firstLine = readFirstLine(path);
   if (firstLine === null) {
     return null;

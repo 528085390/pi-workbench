@@ -41,7 +41,7 @@ test("discoverPiSessions: 只认首行 cwd，不猜目录名 mangle", async () =
     assert.equal(first.cwd, "E:\\proj");
     assert.equal(first.transcriptPath, resolve(hit));
     assert.equal(first.status, "unknown");
-    assert.equal(first.driver, "pi");
+    assert.equal(first.driver, "none");
     assert.equal(first.kind, "interactive");
     assert.deepEqual(first.capabilities, capsOf("pi"));
   } finally {

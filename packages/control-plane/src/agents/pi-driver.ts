@@ -46,6 +46,8 @@ export interface PiRpcClientLike {
   prompt(message: string, images?: unknown[], streamingBehavior?: "steer" | "followUp"): Promise<string>;
   abort(): Promise<void>;
   switchSession(sessionPath: string): Promise<{ cancelled: boolean }>;
+  /** 新建会话（Pi 的 new_session 只返回 cancelled，id / 文件要再查 getState） */
+  newSession?(): Promise<{ cancelled: boolean }>;
   getState(): Promise<{ sessionId: string; sessionFile?: string; isStreaming?: boolean }>;
 }
 
@@ -64,6 +66,8 @@ export type PiDriverOptions = {
   sessionsRoot?: string;
   /** 覆盖 pi 包内 dist/cli.js 绝对路径（测试 / 定制安装用） */
   cliPath?: string;
+  /** 启动命令（config.pi.rpcCmd，默认 ["pi","--mode","rpc"]）；首项为绝对路径时覆盖 cliPath */
+  rpcCmd?: string[];
   provider?: string;
   model?: string;
   env?: Record<string, string>;
@@ -89,6 +93,7 @@ export class PiDriver implements AgentDriver {
   readonly #clientId: string;
   readonly #sessionsRoot: string | undefined;
   readonly #cliPath: string | undefined;
+  readonly #rpcCmd: string[] | undefined;
   readonly #provider: string | undefined;
   readonly #model: string | undefined;
   readonly #env: Record<string, string> | undefined;
@@ -114,6 +119,7 @@ export class PiDriver implements AgentDriver {
     this.#clientId = options.clientId;
     this.#sessionsRoot = options.sessionsRoot;
     this.#cliPath = options.cliPath;
+    this.#rpcCmd = options.rpcCmd;
     this.#provider = options.provider;
     this.#model = options.model;
     this.#env = options.env;
@@ -209,6 +215,8 @@ export class PiDriver implements AgentDriver {
   /** handoff 出口：原生终端打开同一 session 文件（A12 实测能看到历史）。 */
   async handoff(ref: SessionRef): Promise<HandoffCommand> {
     this.#claim(ref);
+    // 先断开 RPC 子进程：否则人类终端与 daemon 会同时写同一个 session jsonl（A11：Pi 无文件锁）。
+    await this.#dropClient(ref.key);
     return { command: ["pi", "--session", transcriptPathOf(ref)], mode: "resume-tui" };
   }
 
@@ -239,11 +247,11 @@ export class PiDriver implements AgentDriver {
     return created.client;
   }
 
-  async #createClient(ref: SessionRef, transcriptPath: string): Promise<PiRpcClientLike> {
+  async #createClient(ref: SessionRef, transcriptPath?: string): Promise<PiRpcClientLike> {
     const options: PiRpcClientOptions = {
-      cliPath: this.#cliPath ?? resolveDefaultPiCliPath(),
+      cliPath: this.#cliPath ?? this.#cliPathOfRpcCmd() ?? resolveDefaultPiCliPath(),
       cwd: ref.cwd,
-      args: ["--session", transcriptPath],
+      args: [...this.#extraRpcArgs(), ...(transcriptPath === undefined ? [] : ["--session", transcriptPath])],
       ...(this.#env === undefined ? {} : { env: this.#env }),
       ...(this.#provider === undefined ? {} : { provider: this.#provider }),
       ...(this.#model === undefined ? {} : { model: this.#model }),
@@ -259,6 +267,83 @@ export class PiDriver implements AgentDriver {
       this.#emit(event);
     });
     return client;
+  }
+
+  /** config.pi.rpcCmd 的首项是绝对路径时用它覆盖默认 cli.js（其余参数见 #extraRpcArgs）。 */
+  #cliPathOfRpcCmd(): string | undefined {
+    const first = this.#rpcCmd?.[0];
+    return first !== undefined && first.trim().length > 0 && existsSync(first) ? first : undefined;
+  }
+
+  /** rpcCmd 里除可执行文件与 "--mode rpc" 之外的参数原样透传。 */
+  #extraRpcArgs(): string[] {
+    if (this.#rpcCmd === undefined) {
+      return [];
+    }
+    const rest = this.#rpcCmd.slice(1);
+    const args: string[] = [];
+    for (let index = 0; index < rest.length; index += 1) {
+      const arg = rest[index];
+      if (arg === undefined) {
+        continue;
+      }
+      if (arg === "--mode") {
+        index += 1; // 跳过紧随其后的 "rpc"
+        continue;
+      }
+      args.push(arg);
+    }
+    return args;
+  }
+
+  /**
+   * 新建会话：先拉起不带 --session 的 RPC 子进程，再 new_session + get_state。
+   * Pi 的 new_session 只返回 {cancelled}，真正的 sessionId / sessionFile 从 get_state 取。
+   */
+  async newSession(cwd: string): Promise<{ sessionId: string; transcriptPath?: string }> {
+    this.#assertProvider();
+    this.#assertNotDisposed();
+    const pseudo: SessionRef = {
+      key: "pi:pending",
+      agent: "pi",
+      nativeId: "pending",
+      cwd,
+      status: "starting",
+      driver: "pi",
+      capabilities: this.caps,
+      kind: "interactive",
+    };
+    const client = await this.#createClient(pseudo);
+    await client.start();
+    try {
+      if (client.newSession === undefined) {
+        throw new WorkbenchError("E_CAP_UNSUPPORTED", "Pi RpcClient 不支持 new_session", { agent: "pi" });
+      }
+      const opened = await withTimeout(client.newSession(), this.#timeoutMs, "Pi RPC new_session");
+      if (opened.cancelled) {
+        throw new WorkbenchError("E_ADAPTER_DOWN", "Pi new_session 被取消", { agent: "pi" });
+      }
+      const state = await withTimeout(client.getState(), this.#timeoutMs, "Pi RPC get_state");
+      const sessionId = state.sessionId;
+      if (typeof sessionId !== "string" || sessionId.length === 0) {
+        throw new WorkbenchError("E_ADAPTER_DOWN", "Pi new_session 后 get_state 没有 sessionId", { agent: "pi" });
+      }
+      const transcriptPath = typeof state.sessionFile === "string" && state.sessionFile.length > 0 ? state.sessionFile : undefined;
+      this.#clients.set("pi:" + sessionId, { client, transcriptPath: transcriptPath ?? "" });
+      return { sessionId, ...(transcriptPath === undefined ? {} : { transcriptPath }) };
+    } catch (error) {
+      try {
+        await withTimeout(client.stop(), STOP_TIMEOUT_MS, "Pi RPC stop（new_session）");
+      } catch {
+        // 已清理或进程已退出
+      }
+      throw error;
+    }
+  }
+
+  /** handoff 前释放控制通道：停掉 RPC 子进程，避免人类终端与 daemon 同时写同一个 jsonl。 */
+  async close(ref: SessionRef): Promise<void> {
+    await this.#dropClient(ref.key);
   }
 
   /**

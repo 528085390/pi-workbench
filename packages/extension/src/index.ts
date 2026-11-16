@@ -101,7 +101,7 @@ export type HealthBody = {
 export type AgentDescriptor = {
   agent: AgentName;
   available?: boolean;
-  version?: string;
+  version?: string | null;
   /** available=false 时的机器可读原因（与控制面 AgentStatus.reason 同源） */
   reason?: string;
   caps: SessionCaps;

@@ -20,6 +20,11 @@ import type { EventStore } from "./events.ts";
 import type { SessionRegistry } from "./registry.ts";
 import type { UnifiedMessage } from "./transcript/claude.ts";
 
+/** 事件源：ACP adapter 与 AgentDriver 都满足这个结构（B08 M2） */
+export type UpdateSource = {
+  onUpdate(cb: (update: AdapterUpdate) => void): () => void;
+};
+
 /**
  * 管线日志口（可注入；默认写 stderr）。
  * 只用 debug / error 两档：前者是「丢弃了什么」的噪声，后者是必须被看见的问题。
@@ -90,10 +95,10 @@ export class EventPipeline {
    * 同一 sessionKey 重复 attach 会先退订旧的，避免两条链同时写同一会话。
    * 返回只退订本次订阅的函数（可重复调用）。
    */
-  attach(adapter: AgentAdapter, sessionKey: string): () => void {
+  attach(source: UpdateSource, sessionKey: string): () => void {
     this.#attachments.get(sessionKey)?.detach();
 
-    const unsubscribe = adapter.onUpdate((update: AdapterUpdate) => {
+    const unsubscribe = source.onUpdate((update: AdapterUpdate) => {
       this.#handleUpdate(sessionKey, update);
     });
 

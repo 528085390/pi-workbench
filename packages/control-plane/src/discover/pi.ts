@@ -36,6 +36,12 @@ export type PiDiscoveryOptions = {
   cwd?: string;
   /** 条数上限；缺省不限制 */
   limit?: number;
+  /** 时间窗（天），按首行 timestamp 过滤；默认 30，Infinity 关闭 */
+  sinceDays?: number;
+  /** 目录递归深度上限，默认 4 */
+  maxDepth?: number;
+  /** 测试注入时钟 */
+  now?: () => number;
 };
 
 export type PiDiscoveryResult = {
@@ -50,6 +56,9 @@ export type PiDiscoveryResult = {
 
 const FIRST_LINE_MAX_BYTES = 64 * 1024;
 const SESSION_VERSION = 3;
+const DEFAULT_SINCE_DAYS = 30;
+const DEFAULT_MAX_DEPTH = 4;
+const DAY_MS = 86_400_000;
 
 /**
  * 扫描并返回 SessionRef[]（AgentDriver.discover 的默认实现）。
@@ -65,7 +74,9 @@ export async function scanPiSessions(opts: PiDiscoveryOptions = {}): Promise<PiD
   const root = opts.sessionsRoot ?? DEFAULT_PI_SESSIONS_ROOT;
   const wantedCwd = opts.cwd === undefined ? undefined : normalizeCwd(opts.cwd);
 
-  const files = collectJsonlFiles(root);
+  const files = collectJsonlFiles(root, opts.maxDepth ?? DEFAULT_MAX_DEPTH);
+  const sinceDays = opts.sinceDays ?? DEFAULT_SINCE_DAYS;
+  const cutoff = Number.isFinite(sinceDays) ? (opts.now ?? Date.now)() - sinceDays * DAY_MS : Number.NEGATIVE_INFINITY;
   const candidates: Array<{ ref: SessionRef; timestampMs: number; path: string }> = [];
   let skipped = 0;
   let unsupported = 0;
@@ -88,6 +99,10 @@ export async function scanPiSessions(opts: PiDiscoveryOptions = {}): Promise<PiD
     if (wantedCwd !== undefined && normalizeCwd(parsed.header.cwd) !== wantedCwd) {
       continue;
     }
+    const timestampMs = parseTimestamp(parsed.header.timestamp);
+    if (timestampMs < cutoff) {
+      continue;
+    }
     candidates.push({
       ref: {
         key: `pi:${parsed.header.id}`,
@@ -96,11 +111,11 @@ export async function scanPiSessions(opts: PiDiscoveryOptions = {}): Promise<PiD
         cwd: parsed.header.cwd,
         transcriptPath: resolve(path),
         status: "unknown",
-        driver: "pi",
+        driver: "none",
         capabilities: { ...capsOf("pi") },
         kind: "interactive",
       },
-      timestampMs: parseTimestamp(parsed.header.timestamp),
+      timestampMs,
       path,
     });
   }
@@ -147,9 +162,12 @@ export function parsePiSessionHeader(
 }
 
 /** 递归收集 .jsonl；根目录不存在 / 不可读时返回空数组（发现不是致命错误）。 */
-function collectJsonlFiles(root: string): string[] {
+function collectJsonlFiles(root: string, maxDepth: number): string[] {
   const out: string[] = [];
-  const visit = (dir: string): void => {
+  const visit = (dir: string, depth: number): void => {
+    if (depth > maxDepth) {
+      return;
+    }
     let entries;
     try {
       entries = readdirSync(dir, { withFileTypes: true });
@@ -159,13 +177,13 @@ function collectJsonlFiles(root: string): string[] {
     for (const entry of entries) {
       const path = join(dir, entry.name);
       if (entry.isDirectory()) {
-        visit(path);
+        visit(path, depth + 1);
       } else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
         out.push(path);
       }
     }
   };
-  visit(resolve(root));
+  visit(resolve(root), 0);
   return out;
 }
 
