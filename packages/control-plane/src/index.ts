@@ -64,6 +64,9 @@ export const PROBE_TIMEOUT_MS = 3000;
 /** spec §7.1：`instances.heartbeat_at` 刷新间隔（15s）。`unref()` 后不拖住进程退出。 */
 const INSTANCE_HEARTBEAT_MS = 15_000;
 
+/** spec §7.1 / 0.5-A D6：租约后台清扫间隔（30s）。`unref()` 后不拖住进程退出。 */
+const LEASE_SWEEP_MS = 30_000;
+
 export type AgentProbe = {
   agent: AgentName;
   available: boolean;
@@ -318,6 +321,17 @@ export async function main(): Promise<void> {
   }, INSTANCE_HEARTBEAT_MS);
   heartbeat.unref();
 
+  // 0.5-A D6：惰性过期之外再做周期清扫，避免过期行长期堆在库里。
+  // 清扫失败只告警：单个周期出错不该打崩 daemon，下个周期重试。
+  const leaseSweep = setInterval(() => {
+    try {
+      leases.sweepExpired();
+    } catch (err) {
+      console.error("[pi-workbenchd] 租约清扫失败（下个周期重试）：" + errorMessage(err));
+    }
+  }, LEASE_SWEEP_MS);
+  leaseSweep.unref();
+
   let adapter: ClaudeAdapter;
   try {
     adapter = await ClaudeAdapter.spawn(config, {
@@ -327,6 +341,7 @@ export async function main(): Promise<void> {
     const reason = err instanceof Error ? err.message : String(err);
     console.error("[pi-workbenchd] E_ADAPTER_DOWN：Claude ACP adapter 启动失败（" + reason + "）");
     clearInterval(heartbeat);
+    clearInterval(leaseSweep);
     await closeQuietly(db);
     lock.release();
     process.exitCode = 1;
@@ -428,6 +443,7 @@ export async function main(): Promise<void> {
   } catch (err) {
     reportStartupFailure(err, config);
     clearInterval(heartbeat);
+    clearInterval(leaseSweep);
     await disposeDriversQuietly([claudeDriver, codexDriver, piDriver]);
     await closeQuietly(db);
     lock.release();
@@ -456,6 +472,7 @@ export async function main(): Promise<void> {
     force.unref();
     await handle.close();
     clearInterval(heartbeat);
+    clearInterval(leaseSweep);
     // spec §7.1：关库前给本实例写 ended_at；写失败也不阻断后面的释放锁（force 计时器兜底）。
     try {
       instances.finish();
@@ -516,9 +533,11 @@ function bootStores(config: Config, paths: WorkbenchPaths, lock: InstanceLock): 
     migrate(db);
     // spec §7.1 第 3 步：迁移成功后立刻登记本次实例，心跳与收尾由 main 装配。
     const instances = new InstanceStore(db);
-    instances.begin();
+    const instance = instances.begin();
     const store = new EventStore(db);
-    const leases = new LeaseManager(db, { ttlMs: config.leaseTtlMs });
+    // spec §7.1 第 4 步：租约按实例归属；启动清扫必须早于 loadFromDb，避免恢复出别家实例的租约。
+    const leases = new LeaseManager(db, { ttlMs: config.leaseTtlMs, instanceId: instance.id });
+    leases.sweepForBoot();
     const registry = new SessionRegistry(db);
     // R34：冷启动恢复 —— 否则重启后 /sessions 与 dispatch 幂等复用都看不到历史会话
     const restored = registry.loadFromDb();
