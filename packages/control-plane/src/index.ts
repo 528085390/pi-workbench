@@ -23,6 +23,7 @@ import { SCHEMA_VERSION, backupDbFile, migrate, openDb, schemaVersion } from "./
 import { DispatchStore } from "./dispatch-store.ts";
 import { isWorkbenchError, WorkbenchError } from "./errors.ts";
 import { EventStore } from "./events.ts";
+import { InstanceStore } from "./instances.ts";
 import { LeaseManager } from "./lease.ts";
 import { InstanceLockError, acquireInstanceLock, ensureDirs, resolvePaths } from "./paths.ts";
 import type { InstanceLock, WorkbenchPaths } from "./paths.ts";
@@ -59,6 +60,9 @@ export function makeCodexWriteGuard(
 
 /** spec §11.1：单个探测子进程 / 动态 import 的硬超时 */
 export const PROBE_TIMEOUT_MS = 3000;
+
+/** spec §7.1：`instances.heartbeat_at` 刷新间隔（15s）。`unref()` 后不拖住进程退出。 */
+const INSTANCE_HEARTBEAT_MS = 15_000;
 
 export type AgentProbe = {
   agent: AgentName;
@@ -301,7 +305,18 @@ export async function main(): Promise<void> {
     process.exitCode = 1;
     return;
   }
-  const { db, store, leases, registry, restored, checkpoints, dispatches, cursors } = boot;
+  const { db, store, leases, registry, restored, checkpoints, dispatches, cursors, instances } = boot;
+
+  // spec §7.1：15s 心跳刷新 instances.heartbeat_at，让「这个 daemon 还活着」可被外部观测。
+  // 心跳失败只告警：DB 偶发错误不该打崩 daemon，下个周期重试。
+  const heartbeat = setInterval(() => {
+    try {
+      instances.touch();
+    } catch (err) {
+      console.error("[pi-workbenchd] 实例心跳写入失败（下个周期重试）：" + errorMessage(err));
+    }
+  }, INSTANCE_HEARTBEAT_MS);
+  heartbeat.unref();
 
   let adapter: ClaudeAdapter;
   try {
@@ -311,6 +326,7 @@ export async function main(): Promise<void> {
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     console.error("[pi-workbenchd] E_ADAPTER_DOWN：Claude ACP adapter 启动失败（" + reason + "）");
+    clearInterval(heartbeat);
     await closeQuietly(db);
     lock.release();
     process.exitCode = 1;
@@ -411,6 +427,7 @@ export async function main(): Promise<void> {
     });
   } catch (err) {
     reportStartupFailure(err, config);
+    clearInterval(heartbeat);
     await disposeDriversQuietly([claudeDriver, codexDriver, piDriver]);
     await closeQuietly(db);
     lock.release();
@@ -438,6 +455,13 @@ export async function main(): Promise<void> {
     }, 5000);
     force.unref();
     await handle.close();
+    clearInterval(heartbeat);
+    // spec §7.1：关库前给本实例写 ended_at；写失败也不阻断后面的释放锁（force 计时器兜底）。
+    try {
+      instances.finish();
+    } catch (err) {
+      console.error("[pi-workbenchd] 写 instances.ended_at 失败：" + errorMessage(err));
+    }
     await disposeDriversQuietly([claudeDriver, codexDriver, piDriver]);
     await closeQuietly(db);
     lock.release();
@@ -463,6 +487,8 @@ type Boot = {
   checkpoints: CheckpointStore;
   dispatches: DispatchStore;
   cursors: ReadCursorStore;
+  /** 本次 daemon 的实例记录（心跳 / 收尾在 main 里装配） */
+  instances: InstanceStore;
 };
 
 /**
@@ -488,6 +514,9 @@ function bootStores(config: Config, paths: WorkbenchPaths, lock: InstanceLock): 
       }
     }
     migrate(db);
+    // spec §7.1 第 3 步：迁移成功后立刻登记本次实例，心跳与收尾由 main 装配。
+    const instances = new InstanceStore(db);
+    instances.begin();
     const store = new EventStore(db);
     const leases = new LeaseManager(db, { ttlMs: config.leaseTtlMs });
     const registry = new SessionRegistry(db);
@@ -496,7 +525,7 @@ function bootStores(config: Config, paths: WorkbenchPaths, lock: InstanceLock): 
     const checkpoints = new CheckpointStore(db);
     const dispatches = new DispatchStore(db);
     const cursors = new ReadCursorStore(db);
-    return { db, store, leases, registry, restored, checkpoints, dispatches, cursors };
+    return { db, store, leases, registry, restored, checkpoints, dispatches, cursors, instances };
   } catch (err) {
     if (db !== null) {
       try {
