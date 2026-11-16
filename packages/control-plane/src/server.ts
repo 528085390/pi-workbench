@@ -175,6 +175,7 @@ export const STATUS_BY_CODE: Readonly<Record<WorkbenchErrorCode, number>> = {
   E_CAP_UNSUPPORTED: 422,
   E_AGENT_UNAVAILABLE: 422,
   E_ADAPTER_DOWN: 503,
+  E_ADAPTER_CRASHED: 503,
   E_HANDOFF_FAILED: 503,
   E_CHECKPOINT_FAILED: 500,
   E_RESUME_REJECTED: 409,
@@ -334,6 +335,7 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
     if (!db.ok) {
       void reply.code(503);
     }
+    const agents = await currentAgents();
     return {
       ok: db.ok,
       name: "pi-workbenchd",
@@ -343,7 +345,7 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
       schemaVersion: SCHEMA_VERSION,
       instanceId: deps.instanceId ?? "",
       db,
-      adapters: (deps.router?.list() ?? [describeAgent(deps.config, deps.adapter)]).map((status) => ({
+      adapters: agents.map((status) => ({
         agent: status.agent,
         available: status.available,
       })),
@@ -563,10 +565,10 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
             const page = await driver.see(resolved, after, limit);
             return { messages: page.messages, nextCursor: page.nextCursor, pending: page.pending };
           }
-          return { messages: [] as UnifiedMessage[], nextCursor: after };
+          return { messages: [] as UnifiedMessage[], nextCursor: after, pending: true };
         }
         const page = readPage(resolved.agent, path, after, limit);
-        return { messages: page.messages, nextCursor: page.nextCursor };
+        return { messages: page.messages, nextCursor: page.nextCursor, pending: page.pending };
       });
 
       // spec §6.5：只返回该读者没读过的消息。ack=1 才推进游标，ack=0 是 peek（默认不推进）。
@@ -670,6 +672,17 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
             agent: session.agent,
             cap: "attach",
           });
+        }
+        // 可用性与 /agents 同源（探测缓存 / 注册表快照）：不可用必须在能力闸门之前
+        // 报 422 E_AGENT_UNAVAILABLE，而不是调用 driver 后变成 503 E_ADAPTER_DOWN。
+        const status = (await currentAgents()).find((item) => item.agent === session.agent);
+        if (status !== undefined && !status.available) {
+          const reason = "reason" in status && typeof status.reason === "string" ? status.reason : undefined;
+          throw new WorkbenchError(
+            "E_AGENT_UNAVAILABLE",
+            "Agent 不可用：" + session.agent + (reason === undefined ? "" : "（" + reason + "）"),
+            { agent: session.agent, cap: "attach", reason: reason ?? null },
+          );
         }
         const declared = session.capabilities;
         if (declared.attach !== true) {

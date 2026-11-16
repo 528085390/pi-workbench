@@ -12,6 +12,7 @@ export type WorkbenchErrorCode =
   | "E_NO_LEASE"
   | "E_CAP_UNSUPPORTED"
   | "E_ADAPTER_DOWN"
+  | "E_ADAPTER_CRASHED"
   | "E_RESUME_REJECTED"
   | "E_IDEMPOTENCY_CONFLICT"
   | "E_AGENT_UNAVAILABLE"

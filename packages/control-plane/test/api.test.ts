@@ -696,17 +696,18 @@ test("GET transcript 用注入的 readTranscript（R46）", async () => {
       },
     ],
     nextCursor: "42",
-    pending: false,
+    pending: true,
   });
   const h = await makeHarness({ readTranscript: reader });
   try {
     const res = await h.app.inject({ method: "GET", url: SESSIONS + "/transcript?after=0&limit=5" });
     assert.equal(res.statusCode, 200);
-    const body = res.json<{ messages: { id: string; text: string }[]; nextCursor: string }>();
+    const body = res.json<{ messages: { id: string; text: string }[]; nextCursor: string; pending: boolean }>();
     assert.equal(body.messages.length, 1);
     assert.equal(body.messages[0]?.id, "m1");
     assert.ok(body.messages[0]?.text.includes("limit=5"));
     assert.equal(body.nextCursor, "42");
+    assert.equal(body.pending, true, "文件分支也必须透传 pending");
 
     const missing = await h.app.inject({ method: "GET", url: API + "/sessions/claude:nope/transcript" });
     assert.equal(missing.statusCode, 404);
@@ -810,6 +811,7 @@ test("错误码 → 状态码映射覆盖 R35 全表", () => {
     E_CAP_UNSUPPORTED: 422,
     E_AGENT_UNAVAILABLE: 422,
     E_ADAPTER_DOWN: 503,
+    E_ADAPTER_CRASHED: 503,
     E_HANDOFF_FAILED: 503,
     E_CHECKPOINT_FAILED: 500,
     E_RESUME_REJECTED: 409,

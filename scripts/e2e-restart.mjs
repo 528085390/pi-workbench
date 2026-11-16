@@ -175,6 +175,12 @@ function killStaleFromHome() {
   if (!existsSync(pidPath)) return;
   const pid = Number(readFileSync(pidPath, "utf8").trim());
   if (pidAlive(pid)) {
+    // 与 kill daemon #1 同一道闸：pid 文件只证明「某个 pid」，命令行不含 control-plane 时绝不下手。
+    const cmd = commandLineOf(pid);
+    if (!cmd.toLowerCase().includes("control-plane")) {
+      rmSync(pidPath, { force: true });
+      return;
+    }
     if (process.platform === "win32") {
       spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], { encoding: "utf8", timeout: 20_000, env: { ...process.env, ...winEnv } });
     } else {

@@ -111,6 +111,9 @@ export function wrapSpawnWithHiddenWindow(spawnImpl: typeof import("node:child_p
     const [command, commandArgs, options] = args;
     const child = (spawnImpl as (...callArgs: unknown[]) => unknown)(command, commandArgs, {
       windowsHide: true,
+      // POSIX：让子进程成为进程组组长，ProcessRegistry 退出时可用 kill(-pid) 杀掉整棵树。
+      // Windows 的 detached 会新建控制台，不能加这个键。
+      ...(process.platform === "win32" ? {} : { detached: true }),
       ...(options as Record<string, unknown> | undefined ?? {}),
     });
     registerSpawnedChild(child, command, commandArgs);

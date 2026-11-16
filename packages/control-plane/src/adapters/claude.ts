@@ -159,6 +159,8 @@ export class ClaudeAdapter implements AgentAdapter {
         stdio: ["pipe", "pipe", "pipe"],
         // daemon 是后台进程，ACP 子进程也不能在 Windows 弹控制台窗口。
         windowsHide: true,
+        // POSIX 进程组：ProcessRegistry.killAll 用 kill(-pid) 一并回收 adapter 的后代。
+        detached: process.platform !== "win32",
       });
     } catch (error) {
       throw new WorkbenchError("E_ADAPTER_DOWN", "启动 adapter 子进程失败：" + describeError(error), {

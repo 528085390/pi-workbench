@@ -290,6 +290,46 @@ test("killAll 真杀子进程树（Windows taskkill /T）", { skip: process.plat
   }
 });
 
+test("killAll 真杀 POSIX 进程组（detached + kill(-pid)）", { skip: process.platform === "win32" }, async () => {
+  const script = "const {spawn}=require('node:child_process'); const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'}); console.log(c.pid); setInterval(()=>{},1000);";
+  const parent = spawn(process.execPath, ["-e", script], {
+    stdio: ["ignore", "pipe", "ignore"],
+    detached: true,
+  });
+  const parentPid = parent.pid;
+  assert.equal(typeof parentPid, "number");
+  const grandPid = await new Promise<number>((resolve, reject) => {
+    let buffer = "";
+    const timer = setTimeout(() => reject(new Error("等待孙进程 pid 超时")), 3_000);
+    parent.stdout?.on("data", (chunk: Buffer) => {
+      buffer += chunk.toString("utf8");
+      const line = buffer.split(/\r?\n/)[0]?.trim() ?? "";
+      if (line.length > 0) {
+        clearTimeout(timer);
+        resolve(Number(line));
+      }
+    });
+    parent.once("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
+  try {
+    const registry = new ProcessRegistry();
+    registry.track(parent, "adapter:posix-tree", "pi");
+    await registry.killAll(300);
+    assert.equal(await waitDead(parentPid as number, 3_000), true, "父进程应被杀死");
+    assert.equal(await waitDead(grandPid, 3_000), true, "同进程组的孙进程应被 kill(-pid) 一并杀死");
+  } finally {
+    if (parentPid !== undefined && isAlive(parentPid)) {
+      try { process.kill(-parentPid, "SIGKILL"); } catch {}
+    }
+    if (isAlive(grandPid)) {
+      process.kill(grandPid, "SIGKILL");
+    }
+  }
+});
+
 function isAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);

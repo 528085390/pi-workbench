@@ -722,6 +722,54 @@ test("POST /attach：claude 交互式会话（caps.attach=false）同样 422，�
   }
 });
 
+test("POST /attach：agent available=false → 422 E_AGENT_UNAVAILABLE，先于能力闸门且不调用 driver", async () => {
+  const claude = makeDriver("claude", CLAUDE_BACKGROUND_CAPABILITIES);
+  const h = await makeHarness({
+    drivers: [{ driver: claude.driver, available: false, reason: "E_AGENT_UNAVAILABLE: claude CLI 未登录" }],
+    seed: [sessionRef("claude", "sess-bg-unavailable", { capabilities: CLAUDE_BACKGROUND_CAPABILITIES, kind: "background" })],
+  });
+  try {
+    const res = await h.app.inject({
+      method: "POST",
+      url: API + "/sessions/" + encodeURIComponent("claude:sess-bg-unavailable") + "/attach",
+    });
+    assert.equal(res.statusCode, 422, res.body);
+    const body = res.json<ErrorEnvelope>();
+    assert.equal(body.error.code, "E_AGENT_UNAVAILABLE");
+    assert.deepEqual(body.error.details, {
+      agent: "claude",
+      cap: "attach",
+      reason: "E_AGENT_UNAVAILABLE: claude CLI 未登录",
+    });
+    assert.deepEqual(claude.calls, [], "不可用 agent 不得调用 attach");
+  } finally {
+    await h.close();
+  }
+});
+
+test("GET /health.adapters 与 /agents 共用同一探测缓存（快照语义一致）", async () => {
+  const claude = makeDriver("claude", CLAUDE_CAPABILITIES);
+  let probes = 0;
+  const h = await makeHarness({
+    drivers: [{ driver: claude.driver }],
+    agentStatuses: async () => {
+      probes += 1;
+      return [{ agent: "claude", available: false, version: null, caps: CLAUDE_CAPABILITIES, reason: "E_AGENT_UNAVAILABLE: probe down" }];
+    },
+  });
+  try {
+    const health = await h.app.inject({ method: "GET", url: "/health" });
+    const agents = await h.app.inject({ method: "GET", url: API + "/agents" });
+    assert.equal(health.statusCode, 200, health.body);
+    assert.equal(agents.statusCode, 200, agents.body);
+    assert.deepEqual(health.json<{ adapters: unknown }>().adapters, [{ agent: "claude", available: false }]);
+    assert.equal(agents.json<AgentStatus[]>()[0]?.available, false);
+    assert.equal(probes, 1, "health 与 agents 必须共享同一次 30s 探测快照");
+  } finally {
+    await h.close();
+  }
+});
+
 test("POST /attach：会话不存在 → 404 E_SESSION_NOT_FOUND", async () => {
   const claude = makeDriver("claude", CLAUDE_BACKGROUND_CAPABILITIES);
   const h = await makeHarness({ drivers: [{ driver: claude.driver }] });

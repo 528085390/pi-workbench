@@ -20,7 +20,7 @@
 
 | HTTP | code | 含义 |
 |---|---|---|
-| 400 | `E_BAD_REQUEST` | 参数 / 请求体 / 查询串非法（含 Fastify 的 413、415） |
+| 400 / 413 / 415 | `E_BAD_REQUEST` | 参数 / 请求体 / 查询串非法；Fastify 的 413、415 保留原状态码，只把 code 归一到 `E_BAD_REQUEST` |
 | 400 | `E_ASSET_CONFIG_INVALID` | `assets.json` 格式或结构错误 |
 | 401 | `E_UNAUTHORIZED` | 缺少或错误的 Bearer token |
 | 404 | `E_SESSION_NOT_FOUND` | 会话键不存在 |
@@ -35,6 +35,7 @@
 | 500 | `E_CHECKPOINT_FAILED` | 检查点写文件 / 落库失败 |
 | 500 | `E_INTERNAL` | 未预期异常（对外固定文案，细节只进 daemon 日志） |
 | 503 | `E_ADAPTER_DOWN` | Agent 适配器 / RPC 子进程不可用 |
+| 503 | `E_ADAPTER_CRASHED` | adapter 子进程异常退出；该 driver 名下 running 会话置 exited 并释放租约 |
 | 503 | `E_HANDOFF_FAILED` | handoff 某一步失败，`details.step` 指明 `cancel` / `close` / `handoff` |
 
 ### 游标与事件序号
@@ -95,7 +96,7 @@
 - `version` 是 daemon 版本；`schemaVersion` 是契约当前的库 schema（v1 承诺为 4）。
 - `instanceId` 同 `GET /api/cp/version`，未登记时为空串。
 - `db.ok=false` 时 HTTP 返回 **503**（body 仍是完整健康摘要：`ok=false`、`db.schemaVersion=0`）；表示 daemon 存活但库不可用。
-- `adapters` 是各 Agent 的 `{ agent, available }` 订阅，数据源与 `GET /api/cp/agents` 同源。
+- `adapters` 是各 Agent 的 `{ agent, available }` 订阅，数据源与 `GET /api/cp/agents` 同源（共享 30s 探测缓存快照；探测未完成时回退注册表快照）。
 - 客户端必须忽略未知字段：v1 内只会 additive。
 
 ### GET /api/cp/version
@@ -336,7 +337,7 @@
 无需租约。返回最新检查点（`Checkpoint` + `path`），没有则 `200 null`：
 
 ```json
-{ "sessionKey": "claude:abc", "summary": "...", "touchedFiles": [], "nextStep": "...", "transcriptCursor": "512", "createdAt": "...", "version": 1, "path": "E:/.../handoffs/claude-abc.json" }
+{ "sessionKey": "claude:abc", "summary": "...", "touchedFiles": [], "nextStep": "...", "transcriptCursor": "512", "createdAt": "...", "version": 1, "path": "E:/.../handoffs/claude-abc.md" }
 ```
 
 错误：`400`、`401`、`404 E_SESSION_NOT_FOUND`、`500 E_INTERNAL`。
@@ -451,7 +452,7 @@
 
 ```json
 {
-  "mcpServers": [ { "name": "filesystem", "transport": "stdio", "command": ["npx", "..."], "exists": true } ],
+  "mcpServers": [ { "name": "filesystem", "transport": "stdio", "command": ["npx", "..."] } ],
   "skills": [ { "name": "doc-tree", "path": "C:/Users/me/.dsh/skills/doc-tree", "exists": true } ],
   "memory": { "projection": "disabled" }
 }

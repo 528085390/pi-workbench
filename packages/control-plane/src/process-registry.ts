@@ -273,7 +273,16 @@ function defaultTreeKill(pid: number, signal: NodeJS.Signals): unknown {
     }
     return true;
   }
-  return process.kill(pid, signal);
+  // POSIX：子进程以 detached:true 启动，pid 即进程组组长，负 pid 一次杀整组；
+  // 老调用方/测试里未分组的子进程退回直接杀，避免 kill(-pid) 的 ESRCH 变成静默失败。
+  try {
+    return process.kill(-pid, signal);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
+      throw error;
+    }
+    return process.kill(pid, signal);
+  }
 }
 
 function positiveInteger(value: number, name: string): number {
