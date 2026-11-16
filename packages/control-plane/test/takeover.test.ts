@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
@@ -268,6 +268,13 @@ function makeRef(overrides: Partial<SessionRef> = {}): SessionRef {
   };
 }
 
+function checkpointPathFor(key: string, at: number, seq: number): string {
+  const sanitized = key.replace(/[^A-Za-z0-9._-]+/g, "-");
+  const iso = new Date(at).toISOString().replace(/:/g, "-");
+  const hash = createHash("sha256").update(key).digest("hex").slice(0, 8);
+  return sanitized + "-" + iso + "-" + hash + "-" + seq + ".md";
+}
+
 function dispatchHash(agent: string, task: string, cwd: string): string {
   return createHash("sha256").update(JSON.stringify({ agent, task, cwd })).digest("hex");
 }
@@ -424,7 +431,11 @@ test("checkpoint: 文件名带 sanitize 后的 key + ISO 时间戳，内容含�
     const files = readdirSync(h.handoffDir);
     assert.equal(files.length, 1);
     const name = files[0] ?? "";
-    assert.match(name, /^claude-sess-1-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d{3}Z\.md$/, "文件名口径：key-ISO.md");
+    assert.match(
+      name,
+      /^claude-sess-1-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d{3}Z-[0-9a-f]{8}-\d+\.md$/,
+      "文件名口径：key-ISO-keyHash-seq.md",
+    );
 
     const text = readFileSync(join(h.handoffDir, name), "utf8");
     assert.ok(text.includes("## 摘要"), "缺 摘要 段");
@@ -1584,8 +1595,7 @@ test("checkpoint: rename 失败（崩溃窗口）→ E_CHECKPOINT_FAILED，清�
 
     // 第二次换一个时间戳；把目标路径占成目录，rename 必然失败 —— 等价于 tmp 写完、替身前崩溃
     h.clock.advance(1000);
-    const target =
-      join(h.handoffDir, "claude-sess-1-" + new Date(START + 1000).toISOString().replace(/:/g, "-") + ".md");
+    const target = join(h.handoffDir, checkpointPathFor(KEY, START + 1000, 2));
     mkdirSync(target);
 
     assert.throws(
@@ -1605,12 +1615,78 @@ test("checkpoint: rename 失败（崩溃窗口）→ E_CHECKPOINT_FAILED，清�
   }
 });
 
+test("checkpoint: 同一毫秒连续写两次 → 文件名唯一，两行 DB 不共用文件（C03 fix）", () => {
+  const h = fresh();
+  try {
+    h.registry.upsert(makeRef({ status: "idle" }));
+    h.leases.acquire(KEY, "pi", "pi-1");
+
+    h.engine.checkpoint(KEY, { summary: "第一次", touchedFiles: [], nextStep: "继续" }, "pi-1");
+    const firstPath = h.checkpoints.latest(KEY)?.path ?? "";
+    h.engine.checkpoint(KEY, { summary: "第二次", touchedFiles: [], nextStep: "继续" }, "pi-1");
+    const secondPath = h.checkpoints.latest(KEY)?.path ?? "";
+
+    assert.ok(firstPath.length > 0);
+    assert.ok(secondPath.length > 0);
+    assert.notEqual(firstPath, secondPath, "同毫秒两次写必须落到不同文件");
+    const files = readdirSync(h.handoffDir).sort();
+    assert.equal(files.length, 2, "两个检查点应各有一个文件：" + files.join(","));
+    assert.ok(!files.some((name) => name.endsWith(".tmp")), "不得残留 .tmp");
+    assert.ok(readFileSync(firstPath, "utf8").includes("第一次"));
+    assert.ok(readFileSync(secondPath, "utf8").includes("第二次"));
+    assert.equal(countRows(h.db, "checkpoints"), 2);
+    assert.deepEqual(h.checkpoints.list(KEY).map((item) => item.path).sort(), [firstPath, secondPath].sort());
+  } finally {
+    h.close();
+  }
+});
+
+test("checkpoint: sanitize 后同名的不同 key 不互相覆盖（C03 fix）", () => {
+  const h = fresh();
+  try {
+    const keyA = "claude:sess/1";
+    const keyB = "claude:sess-1";
+    h.registry.upsert(makeRef({ key: keyA, nativeId: "sess-a" }));
+    h.registry.upsert(makeRef({ key: keyB, nativeId: "sess-b" }));
+    h.leases.acquire(keyA, "pi", "pi-a");
+    h.leases.acquire(keyB, "pi", "pi-b");
+
+    h.engine.checkpoint(keyA, { summary: "斜杠 key", touchedFiles: [], nextStep: "" }, "pi-a");
+    const firstPath = h.checkpoints.latest(keyA)?.path ?? "";
+    h.engine.checkpoint(keyB, { summary: "连字符 key", touchedFiles: [], nextStep: "" }, "pi-b");
+    const secondPath = h.checkpoints.latest(keyB)?.path ?? "";
+
+    assert.ok(firstPath.length > 0);
+    assert.ok(secondPath.length > 0);
+    assert.notEqual(firstPath, secondPath, "sanitize 后同名也必须落到不同文件");
+    const files = readdirSync(h.handoffDir).sort();
+    assert.equal(files.length, 2, "两个 key 应各有一个文件：" + files.join(","));
+    assert.ok(readFileSync(firstPath, "utf8").includes("斜杠 key"));
+    assert.ok(readFileSync(secondPath, "utf8").includes("连字符 key"));
+    assert.equal(countRows(h.db, "checkpoints"), 2);
+  } finally {
+    h.close();
+  }
+});
+
+test("takeover 构造时清理 handoffDir 里遗留的 *.tmp（C03 fix）", () => {
+  const h = fresh();
+  try {
+    writeFileSync(join(h.handoffDir, "orphan.tmp"), "上次崩溃遗留的半成品");
+    writeFileSync(join(h.handoffDir, "keep.md"), "不是 tmp，不能删");
+    restart(h);
+    assert.deepEqual(readdirSync(h.handoffDir).sort(), ["keep.md"], "启动时只清 *.tmp，正式文件保留");
+  } finally {
+    h.close();
+  }
+});
+
 test("handoff: checkpoint 写失败 → E_CHECKPOINT_FAILED，状态不变、租约归调用方、不 close（补偿表）", async () => {
   const h = fresh();
   try {
     h.registry.upsert(makeRef({ status: "running" }));
     h.leases.acquire(KEY, "pi", "pi-1");
-    const target = join(h.handoffDir, "claude-sess-1-" + new Date(START).toISOString().replace(/:/g, "-") + ".md");
+    const target = join(h.handoffDir, checkpointPathFor(KEY, START, 1));
     mkdirSync(target);
 
     await expectRejectCode(() => h.engine.handoff(KEY, "human", "pi-1"), "E_CHECKPOINT_FAILED");

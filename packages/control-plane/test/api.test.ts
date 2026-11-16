@@ -5,7 +5,7 @@
  */
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { connect } from "node:net";
 import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
@@ -528,6 +528,35 @@ test("checkpoint：POST 缺 clientId → 400；GET 先 null 再返回保存的�
     assert.equal(stored.summary, "摘要");
     assert.equal(stored.nextStep, "继续");
     assert.equal(typeof stored.transcriptCursor, "string");
+  } finally {
+    await h.close();
+  }
+});
+
+test("checkpoint：落库失败 → 500 E_CHECKPOINT_FAILED，不留文件 / 行（C03 fix）", async () => {
+  const h = await makeHarness();
+  try {
+    await acquire(h.app, "pi:1");
+    // 让 checkpoints.save 在 INSERT 时失败，模拟落库异常
+    h.db.exec(
+      "CREATE TRIGGER fail_checkpoint_save BEFORE INSERT ON checkpoints " +
+        "BEGIN SELECT RAISE(ABORT, 'checkpoint save boom'); END;",
+    );
+
+    const res = await h.app.inject({
+      method: "POST",
+      url: SESSIONS + "/checkpoint",
+      payload: { summary: "s", touchedFiles: [], nextStep: "n", clientId: "pi:1" },
+    });
+    assert.equal(res.statusCode, 500);
+    assert.equal(res.json<ErrorEnvelope>().error.code, "E_CHECKPOINT_FAILED");
+
+    const row = h.db.prepare("SELECT count(*) AS n FROM checkpoints").get() as { n?: number } | undefined;
+    assert.equal(Number(row?.n ?? 0), 0, "落库失败不得留行");
+    assert.deepEqual(readdirSync(join(h.dir, "handoffs")), [], "落库失败必须清掉正式文件和 tmp");
+
+    const latest = await h.app.inject({ method: "GET", url: SESSIONS + "/checkpoint" });
+    assert.equal(latest.json<unknown>(), null);
   } finally {
     await h.close();
   }

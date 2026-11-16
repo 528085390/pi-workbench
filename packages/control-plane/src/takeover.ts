@@ -13,7 +13,7 @@
  * - 本模块不 import server / fastify，也不 import 任何 HTTP 层。
  */
 import { createHash } from "node:crypto";
-import { mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import type { AgentName, Checkpoint, SessionRef, UnifiedMessage } from "@pi-workbench/shared";
@@ -161,6 +161,8 @@ export class TakeoverEngine {
   readonly #audit: AuditStore | undefined;
   readonly #dispatchTtlMs: number;
   readonly #handoffDir: string;
+  /** checkpoint 文件序号：同毫秒 / 同 sanitize 结果也不能撞名（Task 8 review） */
+  #checkpointSeq = 0;
   readonly #now: () => number;
   readonly #readTranscript: TranscriptReader | undefined;
   readonly #piClientId: string;
@@ -193,6 +195,8 @@ export class TakeoverEngine {
     this.#readTranscript = deps.readTranscript;
     this.#piClientId = deps.piClientId ?? "pi";
     this.#piLeaseTtlMs = deps.piLeaseTtlMs;
+    // 启动时清掉上次进程崩溃遗留的半成品（Task 8 review）
+    this.#sweepCheckpointTmp();
   }
 
   /**
@@ -854,8 +858,16 @@ export class TakeoverEngine {
       version: CHECKPOINT_VERSION,
     };
 
-    const path = join(this.#handoffDir, sanitizeKey(ref.key) + "-" + isoForFile(nowMs) + ".md");
-    const tmp = path + ".tmp";
+    // 文件名必须同时带「原始 key 的短哈希」和「进程内自增序号」：
+    // - 不同 key 经 sanitizeKey 后可能相同（claude:sess/1 与 claude:sess-1 → claude-sess-1）；
+    // - 固定时钟或极快连续写会出现同毫秒。
+    // 只靠 sanitizeKey + 时间戳会让两次写指向同一个文件：后写覆盖前写、两行 DB 共用一个 path。
+    const keyHash = createHash("sha256").update(ref.key).digest("hex").slice(0, 8);
+    const seq = (this.#checkpointSeq += 1);
+    const base = sanitizeKey(ref.key) + "-" + isoForFile(nowMs) + "-" + keyHash + "-" + seq;
+    const path = join(this.#handoffDir, base + ".md");
+    // tmp 同样唯一：即使崩溃遗留，也不会被下一次写误用
+    const tmp = join(this.#handoffDir, base + ".tmp");
     try {
       mkdirSync(this.#handoffDir, { recursive: true });
       writeFileSync(tmp, renderCheckpoint(checkpoint), "utf8");
@@ -878,12 +890,30 @@ export class TakeoverEngine {
     return { checkpoint: stored, path };
   }
 
-  /** 清理半成品：ENOENT / 占用都不覆盖原始失败原因 */
+  /** 清理半成品：ENOENT 静默；其他错误写 stderr，但都不覆盖原始失败原因 */
   #removeQuietly(path: string): void {
     try {
       unlinkSync(path);
+    } catch (err) {
+      // 清理只是止损：ENOENT 说明本来就没有；其余错误留痕，方便排查残留半成品
+      if ((err as { code?: string }).code !== "ENOENT") {
+        console.error("[takeover] 清理临时文件失败：" + path + " — " + (err instanceof Error ? err.message : String(err)));
+      }
+    }
+  }
+
+  /** 启动时清掉上次进程崩溃遗留的 <handoffDir>/*.tmp（Task 8 review） */
+  #sweepCheckpointTmp(): void {
+    let names: string[];
+    try {
+      names = readdirSync(this.#handoffDir);
     } catch {
-      // 清理只是止损
+      return; // 目录还不存在：首次写 checkpoint 时会 mkdir
+    }
+    for (const name of names) {
+      if (name.endsWith(".tmp")) {
+        this.#removeQuietly(join(this.#handoffDir, name));
+      }
     }
   }
 

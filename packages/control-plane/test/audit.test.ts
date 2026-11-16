@@ -4,7 +4,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
@@ -382,11 +382,11 @@ test("handoff 内 checkpoint 失败：500 E_CHECKPOINT_FAILED，details.action=c
   const h = await makeHarness();
   try {
     await acquire(h.app, "pi:1");
-    const target = join(
-      h.handoffDir,
-      "claude-sess-1-" + new Date(h.clock.now()).toISOString().replace(/:/g, "-") + ".md",
+    // 直接让 checkpoints.save 失败：文件名已带 key 哈希与序号，不能再靠占位目录制造 rename 失败
+    h.db.exec(
+      "CREATE TRIGGER fail_checkpoint_save BEFORE INSERT ON checkpoints " +
+        "BEGIN SELECT RAISE(ABORT, 'checkpoint save boom'); END;",
     );
-    mkdirSync(target, { recursive: true });
 
     const failed = await h.app.inject({
       method: "POST",

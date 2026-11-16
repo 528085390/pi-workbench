@@ -103,3 +103,22 @@ test("历史行缺 version 值时读取按 1 处理", () => {
   ).run("claude:legacy", "/tmp/old.md", "s", "[]", "", "0", "2026-11-16T00:00:00.000Z");
   assert.equal(new CheckpointStore(db).latest("claude:legacy")?.version, 1);
 });
+test("version 列为 NULL 时读取按 1 处理（old-schema / 半迁移行）", () => {
+  const db = openDb(":memory:");
+  // 模拟迁移前的旧表：version 列可空，行里是 NULL —— 走 toStored 的 row.version ?? 1 分支
+  db.exec(
+    "CREATE TABLE checkpoints (" +
+      "id INTEGER PRIMARY KEY AUTOINCREMENT, session_key TEXT NOT NULL, path TEXT NOT NULL, " +
+      "summary TEXT NOT NULL, touched_files_json TEXT NOT NULL, next_step TEXT NOT NULL, " +
+      "cursor TEXT NOT NULL, created_at TEXT NOT NULL, version INTEGER)",
+  );
+  db.prepare(
+    "INSERT INTO checkpoints (session_key, path, summary, touched_files_json, next_step, cursor, created_at, version) " +
+      "VALUES (?,?,?,?,?,?,?,NULL)",
+  ).run("claude:null-version", "/tmp/null.md", "s", "[]", "", "0", "2026-11-16T00:00:00.000Z");
+  try {
+    assert.equal(new CheckpointStore(db).latest("claude:null-version")?.version, 1);
+  } finally {
+    db.close();
+  }
+});
