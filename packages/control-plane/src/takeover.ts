@@ -501,6 +501,16 @@ export class TakeoverEngine {
       // kind === "retry"：本调用赢下超时回收，继续走下面的 newSession 路径
     }
 
+    // C02：newSession 可能超过 reserved TTL；按 TTL/3 续约，避免被并发调用回收后重复执行。
+    const renew = setInterval(() => {
+      try {
+        this.#dispatches.touch(idempotencyKey, new Date(this.#now()));
+      } catch {
+        // 续约失败下个周期重试；真丢了预留会被 complete/fail 的 fencing 拦住
+      }
+    }, Math.max(1, Math.floor(this.#dispatchTtlMs / 3)));
+    renew.unref();
+
     let sessionId: string;
     let openedTranscriptPath: string | undefined;
     try {
@@ -520,6 +530,8 @@ export class TakeoverEngine {
       }
     } catch (err) {
       throw this.#dispatchFailed(idempotencyKey, "newSession", err);
+    } finally {
+      clearInterval(renew);
     }
 
     const ref: SessionRef = {
@@ -561,8 +573,14 @@ export class TakeoverEngine {
       this.#registry.upsert(ref);
       // C02：先写 dispatch_key（唯一索引兜底防双会话），再把幂等记录标成 done；
       // 等待方（并发 / 重启 / 回收）才能按 key 复用或补记。
-      this.#registry.setDispatchKey(ref.key, idempotencyKey);
-      this.#dispatches.complete(idempotencyKey, ref.key, new Date(this.#now()));
+      this.#registry.setDispatchKey(ref.key, idempotencyKey, new Date(this.#now()));
+      if (!this.#dispatches.complete(idempotencyKey, ref.key, new Date(this.#now()))) {
+        throw new WorkbenchError(
+          "E_DISPATCH_IN_PROGRESS",
+          "dispatch 预留已被回收，拒绝覆盖： " + idempotencyKey,
+          { idempotencyKey },
+        );
+      }
 
       this.#store.append({
         sessionKey: ref.key,
@@ -580,6 +598,8 @@ export class TakeoverEngine {
       // 尽力而为：upsert 本身就是失败点时内存里没有这行（updateStatus 对未知 key 返回 null），
       // 回收抛错也不覆盖原始失败原因，因为 dispatches.fail 必须照常落库。
       try {
+        // C02：complete 失败（预留已被回收）时 dispatch_key 可能已经写上；不清掉会挡住同 key 重试。
+        this.#registry.clearDispatchKey(ref.key, new Date(this.#now()));
         this.#registry.updateStatus(ref.key, "idle");
       } catch {
         // 状态回收失败不影响止损：幂等记录仍会被标成 failed
@@ -812,11 +832,34 @@ export class TakeoverEngine {
         sessionKey: record.sessionKey,
       });
     }
-    if (record.status === "failed") {
-      throw dispatchFailedError(idempotencyKey, record.error);
+    let current = record;
+    if (current.status === "failed") {
+      // C02：failed + 同 payload 允许原子重试（failed→reserved，清 session_key/error、重置时间戳）。
+      if (this.#dispatches.retryFailed(idempotencyKey, new Date(this.#now()))) {
+        return { kind: "retry" };
+      }
+      const latest = this.#dispatches.get(idempotencyKey);
+      if (latest === null) {
+        throw new WorkbenchError("E_ADAPTER_DOWN", "dispatch 的失败记录在重试前消失： " + idempotencyKey, {
+          idempotencyKey,
+        });
+      }
+      if (latest.payloadHash !== hash) {
+        throw new WorkbenchError("E_IDEMPOTENCY_CONFLICT", "幂等键已用于另一个任务： " + idempotencyKey, {
+          idempotencyKey,
+          sessionKey: latest.sessionKey,
+        });
+      }
+      if (latest.status === "failed") {
+        throw dispatchFailedError(idempotencyKey, latest.error);
+      }
+      if (latest.status === "done") {
+        return { kind: "ref", ref: this.#refOf(latest, idempotencyKey) };
+      }
+      current = latest;
     }
-    if (record.status === "done") {
-      return { kind: "ref", ref: this.#refOf(record, idempotencyKey) };
+    if (current.status === "done") {
+      return { kind: "ref", ref: this.#refOf(current, idempotencyKey) };
     }
 
     // C02 回收前必查：上次可能已经建好会话（registry.upsert + dispatch_key 成功，但 complete 没落），

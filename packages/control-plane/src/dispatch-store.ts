@@ -53,6 +53,10 @@ export class DispatchStore {
   #reclaimStmt: StatementSync | null = null;
   #touchStmt: StatementSync | null = null;
   #pruneStmt: StatementSync | null = null;
+  #retryStmt: StatementSync | null = null;
+  #pruneStaleStmt: StatementSync | null = null;
+  #clearRetainedKeysStmt: StatementSync | null = null;
+  #clearStaleKeysStmt: StatementSync | null = null;
 
   constructor(db: DatabaseSync) {
     this.#db = db;
@@ -77,12 +81,23 @@ export class DispatchStore {
     return row === undefined ? null : toRecord(row);
   }
 
-  complete(idempotencyKey: string, sessionKey: string, now = new Date()): void {
-    this.#completes().run("done", sessionKey, null, now.toISOString(), idempotencyKey);
+  /** 只有仍持有 reserved 预留的调用者才能落 done（ fencing，防止覆盖已被回收/完成的记录）。 */
+  complete(idempotencyKey: string, sessionKey: string, now = new Date()): boolean {
+    const result = this.#completes().run("done", sessionKey, null, now.toISOString(), idempotencyKey);
+    return Number(result.changes) === 1;
   }
 
-  fail(idempotencyKey: string, reason: string, now = new Date()): void {
-    this.#completes().run("failed", null, reason, now.toISOString(), idempotencyKey);
+  /** 只有仍持有 reserved 预留的调用者才能落 failed（fencing，防止覆盖 done）。 */
+  fail(idempotencyKey: string, reason: string, now = new Date()): boolean {
+    const result = this.#completes().run("failed", null, reason, now.toISOString(), idempotencyKey);
+    return Number(result.changes) === 1;
+  }
+
+  /** 原子把 failed 重置为 reserved，供同 payload 重试；session_key/error 清空，时间戳重置。 */
+  retryFailed(idempotencyKey: string, now = new Date()): boolean {
+    const ts = now.toISOString();
+    const result = this.#retry().run(ts, ts, idempotencyKey);
+    return Number(result.changes) === 1;
   }
 
   /**
@@ -91,7 +106,8 @@ export class DispatchStore {
    */
   reclaim(idempotencyKey: string, ttlMs: number, now = new Date()): boolean {
     const cutoff = new Date(now.getTime() - ttlMs).toISOString();
-    const result = this.#reclaim().run(now.toISOString(), idempotencyKey, cutoff);
+    const ts = now.toISOString();
+    const result = this.#reclaim().run(ts, ts, idempotencyKey, cutoff);
     return Number(result.changes) === 1;
   }
 
@@ -100,11 +116,22 @@ export class DispatchStore {
     this.#touch().run(now.toISOString(), idempotencyKey);
   }
 
-  /** 删除超过保留期的 done/failed 记录，返回删除行数。 */
+  /** 删除超过保留期的 done/failed 记录，返回删除行数；同一事务清掉对应 sessions.dispatch_key。 */
   pruneRetained(retentionMs: number, now = new Date()): number {
     const cutoff = new Date(now.getTime() - retentionMs).toISOString();
-    const result = this.#prune().run(cutoff);
-    return Number(result.changes);
+    return this.#inTransaction(() => {
+      this.#clearRetainedKeys().run(cutoff);
+      return Number(this.#prune().run(cutoff).changes);
+    });
+  }
+
+  /** 删除超过保留期仍停在 reserved 的记录（进程崩溃残留），同一事务清 dispatch_key。 */
+  pruneStaleReserved(retentionMs: number, now = new Date()): number {
+    const cutoff = new Date(now.getTime() - retentionMs).toISOString();
+    return this.#inTransaction(() => {
+      this.#clearStaleKeys().run(cutoff);
+      return Number(this.#pruneStale().run(cutoff).changes);
+    });
   }
 
   #insert(): StatementSync {
@@ -122,14 +149,21 @@ export class DispatchStore {
 
   #completes(): StatementSync {
     this.#completesStmt ??= this.#db.prepare(
-      "UPDATE dispatches SET status = ?, session_key = ?, error = ?, updated_at = ? WHERE idempotency_key = ?",
+      "UPDATE dispatches SET status = ?, session_key = ?, error = ?, updated_at = ? WHERE idempotency_key = ? AND status = 'reserved'",
     );
     return this.#completesStmt;
   }
 
+  #retry(): StatementSync {
+    this.#retryStmt ??= this.#db.prepare(
+      "UPDATE dispatches SET status = 'reserved', session_key = NULL, error = NULL, created_at = ?, updated_at = ? WHERE idempotency_key = ? AND status = 'failed'",
+    );
+    return this.#retryStmt;
+  }
+
   #reclaim(): StatementSync {
     this.#reclaimStmt ??= this.#db.prepare(
-      "UPDATE dispatches SET updated_at = ? WHERE idempotency_key = ? AND status = 'reserved' AND updated_at <= ?",
+      "UPDATE dispatches SET status = 'reserved', created_at = ?, updated_at = ? WHERE idempotency_key = ? AND status = 'reserved' AND updated_at <= ?",
     );
     return this.#reclaimStmt;
   }
@@ -146,5 +180,42 @@ export class DispatchStore {
       "DELETE FROM dispatches WHERE status IN ('done','failed') AND updated_at < ?",
     );
     return this.#pruneStmt;
+  }
+
+  #pruneStale(): StatementSync {
+    this.#pruneStaleStmt ??= this.#db.prepare(
+      "DELETE FROM dispatches WHERE status = 'reserved' AND updated_at < ?",
+    );
+    return this.#pruneStaleStmt;
+  }
+
+  #clearRetainedKeys(): StatementSync {
+    this.#clearRetainedKeysStmt ??= this.#db.prepare(
+      "UPDATE sessions SET dispatch_key = NULL WHERE dispatch_key IN (SELECT idempotency_key FROM dispatches WHERE status IN ('done','failed') AND updated_at < ?)",
+    );
+    return this.#clearRetainedKeysStmt;
+  }
+
+  #clearStaleKeys(): StatementSync {
+    this.#clearStaleKeysStmt ??= this.#db.prepare(
+      "UPDATE sessions SET dispatch_key = NULL WHERE dispatch_key IN (SELECT idempotency_key FROM dispatches WHERE status = 'reserved' AND updated_at < ?)",
+    );
+    return this.#clearStaleKeysStmt;
+  }
+
+  #inTransaction<T>(fn: () => T): T {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = fn();
+      this.#db.exec("COMMIT");
+      return result;
+    } catch (err) {
+      try {
+        this.#db.exec("ROLLBACK");
+      } catch {
+        // 回滚失败不覆盖原始错误
+      }
+      throw err;
+    }
   }
 }

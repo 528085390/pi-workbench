@@ -69,6 +69,10 @@ const INSTANCE_HEARTBEAT_MS = 15_000;
 /** spec §7.1 / 0.5-A D6：租约后台清扫间隔（30s）。`unref()` 后不拖住进程退出。 */
 const LEASE_SWEEP_MS = 30_000;
 
+/** C02：dispatch 幂等记录保留 24h，后台每小时清扫一次（含超期 reserved）。 */
+const DISPATCH_RETENTION_MS = 24 * 3600_000;
+const DISPATCH_SWEEP_MS = 3600_000;
+
 export type AgentProbe = {
   agent: AgentName;
   available: boolean;
@@ -312,10 +316,15 @@ export async function main(): Promise<void> {
   }
   const { db, store, leases, registry, restored, recovery, checkpoints, dispatches, cursors, instances } = boot;
 
-  // C02：dispatch 幂等记录保留 24h，启动时清一次过期的 done/failed。
+  // C02：dispatch 幂等记录保留 24h；启动先扫一次，之后每小时扫一次（含超期 reserved）。
+  const sweepDispatches = (): number => {
+    const retained = dispatches.pruneRetained(DISPATCH_RETENTION_MS);
+    const stale = dispatches.pruneStaleReserved(DISPATCH_RETENTION_MS);
+    return retained + stale;
+  };
   try {
-    const pruned = dispatches.pruneRetained(24 * 3600_000);
-    console.log("[pi-workbenchd] dispatch 幂等记录清理完成：删除 " + String(pruned) + " 条（保留 24h）");
+    const swept = sweepDispatches();
+    console.log("[pi-workbenchd] dispatch 幂等记录清理完成：删除 " + String(swept) + " 条（保留 24h）");
   } catch (err) {
     console.error("[pi-workbenchd] dispatch 幂等记录清理失败（启动继续）：" + errorMessage(err));
   }
@@ -342,6 +351,19 @@ export async function main(): Promise<void> {
   }, LEASE_SWEEP_MS);
   leaseSweep.unref();
 
+  // C02：保留期清扫不能只在启动时跑；每小时清一次，失败只告警。
+  const dispatchSweep = setInterval(() => {
+    try {
+      const swept = sweepDispatches();
+      if (swept > 0) {
+        console.log("[pi-workbenchd] dispatch 幂等记录清理完成：删除 " + String(swept) + " 条（保留 24h）");
+      }
+    } catch (err) {
+      console.error("[pi-workbenchd] dispatch 幂等记录清理失败（下个周期重试）：" + errorMessage(err));
+    }
+  }, DISPATCH_SWEEP_MS);
+  dispatchSweep.unref();
+
   let adapter: ClaudeAdapter;
   try {
     adapter = await ClaudeAdapter.spawn(config, {
@@ -352,6 +374,7 @@ export async function main(): Promise<void> {
     console.error("[pi-workbenchd] E_ADAPTER_DOWN：Claude ACP adapter 启动失败（" + reason + "）");
     clearInterval(heartbeat);
     clearInterval(leaseSweep);
+    clearInterval(dispatchSweep);
     await closeQuietly(db);
     lock.release();
     process.exitCode = 1;
@@ -455,6 +478,7 @@ export async function main(): Promise<void> {
     reportStartupFailure(err, config);
     clearInterval(heartbeat);
     clearInterval(leaseSweep);
+    clearInterval(dispatchSweep);
     await disposeDriversQuietly([claudeDriver, codexDriver, piDriver]);
     await closeQuietly(db);
     lock.release();
@@ -503,6 +527,7 @@ export async function main(): Promise<void> {
     await handle.close();
     clearInterval(heartbeat);
     clearInterval(leaseSweep);
+    clearInterval(dispatchSweep);
     // spec §7.1：关库前给本实例写 ended_at；写失败也不阻断后面的释放锁（force 计时器兜底）。
     try {
       instances.finish();

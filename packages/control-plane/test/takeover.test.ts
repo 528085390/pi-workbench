@@ -22,6 +22,7 @@ import type { UnifiedMessage } from "../src/transcript/claude.ts";
 import { CLAUDE_CAPABILITIES } from "../src/capabilities.ts";
 import { AgentRouter } from "../src/agents/router.ts";
 import type { AgentDriver } from "../src/agents/types.ts";
+import { STATUS_BY_CODE } from "../src/server.ts";
 import { TakeoverEngine } from "../src/takeover.ts";
 import type { TranscriptReader } from "../src/takeover.ts";
 
@@ -57,8 +58,20 @@ type Fake = {
 
 /** 假 adapter：只记录调用，不跑任何子进程 */
 function makeFake(
-  opts: { resumeError?: Error; closeError?: Error; cancelError?: Error; newSessionError?: Error } = {},
+  opts: {
+    resumeError?: Error;
+    closeError?: Error;
+    cancelError?: Error;
+    newSessionError?: Error;
+    newSessionErrorTimes?: number;
+    onNewSession?: () => void | Promise<void>;
+    newSessionGate?: Promise<void>;
+    newSessionIds?: string[];
+  } = {},
 ): Fake {
+  let newSessionFailuresLeft =
+    opts.newSessionError === undefined ? 0 : (opts.newSessionErrorTimes ?? Number.POSITIVE_INFINITY);
+  let newSessionSeq = 0;
   const calls: Call[] = [];
   const record = (method: string, args: unknown[]): void => {
     calls.push({ method, args });
@@ -67,10 +80,17 @@ function makeFake(
   const adapter: AgentAdapter = {
     newSession: async (cwd: string) => {
       record("newSession", [cwd]);
-      if (opts.newSessionError !== undefined) {
+      await opts.onNewSession?.();
+      if (opts.newSessionGate !== undefined) {
+        await opts.newSessionGate;
+      }
+      if (opts.newSessionError !== undefined && newSessionFailuresLeft > 0) {
+        newSessionFailuresLeft -= 1;
         throw opts.newSessionError;
       }
-      return { sessionId: "sess-new" };
+      const sessionId = opts.newSessionIds?.[newSessionSeq] ?? "sess-new";
+      newSessionSeq += 1;
+      return { sessionId };
     },
     resume: async (sessionId: string, cwd: string) => {
       record("resume", [sessionId, cwd]);
@@ -136,6 +156,11 @@ type FakeOpts = {
   closeError?: Error;
   cancelError?: Error;
   newSessionError?: Error;
+  newSessionErrorTimes?: number;
+  onNewSession?: () => void | Promise<void>;
+  newSessionGate?: Promise<void>;
+  newSessionIds?: string[];
+  dispatchReservedTtlMs?: number;
 };
 
 const emptyReader: TranscriptReader = (_path, cursor) => ({
@@ -163,6 +188,7 @@ function fresh(opts: FakeOpts = {}): Harness {
     checkpoints,
     dispatches,
     handoffDir,
+    dispatchReservedTtlMs: opts.dispatchReservedTtlMs ?? 120_000,
     now: clock.now,
     readTranscript: opts.readTranscript ?? emptyReader,
   });
@@ -809,18 +835,22 @@ test("dispatch: 真重启（全新 store/registry/leases + loadFromDb）同 key 
   }
 });
 
-test("dispatch: newSession 失败 → 落 failed 记录 + E_ADAPTER_DOWN，重试同键仍报 E_ADAPTER_DOWN（C1）", async () => {
-  const h = fresh({ newSessionError: new Error("spawn claude ENOENT") });
+test("dispatch: newSession 失败 → failed；同键重试原子转 reserved 后重新执行（C02 fix）", async () => {
+  const h = fresh({ newSessionError: new Error("spawn claude ENOENT"), newSessionErrorTimes: 1 });
   try {
-    const input = { agent: "claude" as const, task: "必然失败", cwd: CWD, idempotencyKey: "idem-fail" };
+    const input = { agent: "claude" as const, task: "首次失败，重试成功", cwd: CWD, idempotencyKey: "idem-fail" };
     await expectRejectCode(() => h.engine.dispatch(input), "E_ADAPTER_DOWN");
 
+    const failed = h.dispatches.get("idem-fail");
+    assert.equal(failed?.status, "failed", "失败必须落库，不能停在 reserved");
+    assert.ok((failed?.error ?? "").includes("ENOENT"), "失败原因要落库：" + String(failed?.error));
+
+    const retried = await h.engine.dispatch(input);
+    assert.equal(retried.key, "claude:sess-new");
+    assert.equal(h.fake.count("newSession"), 2, "failed + 同 payload 必须重新执行一次");
     const record = h.dispatches.get("idem-fail");
-    assert.equal(record?.status, "failed", "失败必须落库，不能停在 reserved");
-    assert.ok((record?.error ?? "").includes("ENOENT"), "失败原因要落库：" + String(record?.error));
-
-    await expectRejectCode(() => h.engine.dispatch(input), "E_ADAPTER_DOWN");
-    assert.equal(h.fake.count("newSession"), 1, "failed 记录不能让重试又起一个会话");
+    assert.equal(record?.status, "done", "重试成功后必须落 done");
+    assert.equal(record?.error, null, "重试成功必须清掉旧错误");
   } finally {
     h.close();
   }
@@ -862,6 +892,111 @@ test("dispatch: reserved 超 TTL 后回收并重建会话，sessions.dispatch_ke
       | undefined;
     assert.equal(row?.dispatch_key, input.idempotencyKey, "新会话必须写入 dispatch_key");
     assert.equal(h.dispatches.get(input.idempotencyKey)?.status, "done");
+  } finally {
+    h.close();
+  }
+});
+
+test("dispatch: 慢 newSession 由 TTL/3 心跳续约，其他调用不会回收重建（C02 fix）", async () => {
+  let release!: () => void;
+  let entered!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const enteredPromise = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const h = fresh({
+    dispatchReservedTtlMs: 60,
+    newSessionGate: gate,
+    onNewSession: () => {
+      entered();
+    },
+  });
+  try {
+    const input = { agent: "claude" as const, task: "慢会话", cwd: CWD, idempotencyKey: "idem-slow" };
+    const first = h.engine.dispatch(input);
+    await enteredPromise;
+
+    // 固定时钟跨过 TTL，再等心跳周期；没有 touch 的话第二次调用会 reclaim 并二次 newSession
+    h.clock.advance(60_000);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const second = h.engine.dispatch(input);
+
+    release();
+    const [a, b] = await Promise.all([first, second]);
+    assert.deepEqual(a, b);
+    assert.equal(h.fake.count("newSession"), 1, "心跳续约后不得被回收重建");
+    assert.equal(h.dispatches.get(input.idempotencyKey)?.status, "done");
+  } finally {
+    release();
+    h.close();
+  }
+});
+
+test("dispatch: reserved 未超 TTL → 轮询耗尽 E_DISPATCH_IN_PROGRESS（409，C02）", async () => {
+  const h = fresh();
+  try {
+    const input = { agent: "claude" as const, task: "等待超时", cwd: CWD, idempotencyKey: "idem-busy" };
+    h.dispatches.reserve(
+      input.idempotencyKey,
+      dispatchHash(input.agent, input.task, input.cwd),
+      new Date(h.clock.now()),
+    );
+
+    await expectRejectCode(() => h.engine.dispatch(input), "E_DISPATCH_IN_PROGRESS");
+    assert.equal(STATUS_BY_CODE.E_DISPATCH_IN_PROGRESS, 409);
+    assert.equal(h.fake.count("newSession"), 0, "轮询超时不得抢跑 newSession");
+  } finally {
+    h.close();
+  }
+});
+
+test("dispatch: 两个并发调用同时回收超时预留，只有一个 newSession（C02 fix）", async () => {
+  const h = fresh();
+  try {
+    const input = { agent: "claude" as const, task: "并发回收", cwd: CWD, idempotencyKey: "idem-reclaim-race" };
+    h.dispatches.reserve(
+      input.idempotencyKey,
+      dispatchHash(input.agent, input.task, input.cwd),
+      new Date(h.clock.now() - 120_000),
+    );
+
+    const [a, b] = await Promise.all([h.engine.dispatch(input), h.engine.dispatch(input)]);
+    assert.equal(a.key, b.key);
+    assert.equal(h.fake.count("newSession"), 1, "原子 reclaim 只能有一个赢家");
+    assert.equal(h.registry.list().length, 1);
+    assert.equal(h.dispatches.get(input.idempotencyKey)?.status, "done");
+  } finally {
+    h.close();
+  }
+});
+
+test("dispatch: pruneRetained 清理幂等记录时同步清 sessions.dispatch_key，24h 后可复用同 key（C02 fix）", async () => {
+  const h = fresh({ newSessionIds: ["sess-prune-1", "sess-prune-2"] });
+  try {
+    const input = { agent: "claude" as const, task: "prune 后复用", cwd: CWD, idempotencyKey: "idem-prune" };
+    const first = await h.engine.dispatch(input);
+    assert.equal(first.key, "claude:sess-prune-1");
+    const before = h.db.prepare("SELECT dispatch_key FROM sessions WHERE key = ?").get(first.key) as
+      | { dispatch_key?: string | null }
+      | undefined;
+    assert.equal(before?.dispatch_key, input.idempotencyKey);
+
+    h.clock.advance(24 * 3600_000 + 1000);
+    assert.equal(h.dispatches.pruneRetained(24 * 3600_000, new Date(h.clock.now())), 1);
+    const cleared = h.db.prepare("SELECT dispatch_key FROM sessions WHERE key = ?").get(first.key) as
+      | { dispatch_key?: string | null }
+      | undefined;
+    assert.equal(cleared?.dispatch_key, null, "prune 必须在同一事务清掉 sessions.dispatch_key");
+
+    const second = await h.engine.dispatch(input);
+    assert.equal(second.key, "claude:sess-prune-2", "24h 后同 key 必须能重新建会话");
+    assert.equal(h.fake.count("newSession"), 2);
+    const after = h.db.prepare("SELECT dispatch_key FROM sessions WHERE key = ?").get(second.key) as
+      | { dispatch_key?: string | null }
+      | undefined;
+    assert.equal(after?.dispatch_key, input.idempotencyKey);
   } finally {
     h.close();
   }
@@ -1044,7 +1179,7 @@ test("dispatch: registry.upsert 失败 → 回收 adapter 会话（close 1 次�
     assert.ok((record?.error ?? "").includes("写入 sessions 表失败"), "失败原因要落库：" + String(record?.error));
 
     await expectRejectCode(() => h.engine.dispatch(input), "E_ADAPTER_DOWN");
-    assert.equal(h.fake.count("newSession"), 1, "failed 记录不能让重试又起一个会话");
+    assert.equal(h.fake.count("newSession"), 2, "failed + 同 payload 的重试会重新 newSession 一次");
   } finally {
     h.close();
   }
@@ -1054,7 +1189,7 @@ test("dispatch: complete 抛错 → 回收 adapter 会话 + 会话行回 idle + 
   const h = fresh();
   try {
     // 让「标 done」这一步抛错：此时 registry.upsert 已经成功，会话行与内存都已经落库
-    h.dispatches.complete = (): void => {
+    h.dispatches.complete = (): boolean => {
       throw new Error("写 dispatches 表失败");
     };
 
@@ -1080,6 +1215,36 @@ test("dispatch: complete 抛错 → 回收 adapter 会话 + 会话行回 idle + 
     assert.equal(record?.status, "failed", "幂等键不能停在 reserved");
     assert.equal(record?.sessionKey, null, "fail 会把 session_key 置空");
     assert.ok((record?.error ?? "").includes("写 dispatches 表失败"), "失败原因要落库：" + String(record?.error));
+  } finally {
+    h.close();
+  }
+});
+
+test("dispatch: complete 抛错后清 sessions.dispatch_key，同 key 重试可建新会话（C02 fix）", async () => {
+  const h = fresh({ newSessionIds: ["sess-complete-old", "sess-complete-new"] });
+  try {
+    const originalComplete = h.dispatches.complete.bind(h.dispatches);
+    let first = true;
+    h.dispatches.complete = (idempotencyKey, sessionKey, now): boolean => {
+      if (first) {
+        first = false;
+        throw new Error("写 dispatches 表失败");
+      }
+      return originalComplete(idempotencyKey, sessionKey, now);
+    };
+
+    const input = { agent: "claude" as const, task: "complete 失败后重试", cwd: CWD, idempotencyKey: "idem-complete-retry" };
+    await expectRejectCode(() => h.engine.dispatch(input), "E_ADAPTER_DOWN");
+    const oldKey = "claude:sess-complete-old";
+    const oldRow = h.db.prepare("SELECT dispatch_key FROM sessions WHERE key = ?").get(oldKey) as
+      | { dispatch_key?: string | null }
+      | undefined;
+    assert.equal(oldRow?.dispatch_key, null, "失败回收必须清掉旧会话的 dispatch_key");
+
+    const retried = await h.engine.dispatch(input);
+    assert.equal(retried.key, "claude:sess-complete-new", "同 key 重试不得被旧 dispatch_key 的唯一索引挡住");
+    assert.equal(h.fake.count("newSession"), 2);
+    assert.equal(h.dispatches.get(input.idempotencyKey)?.status, "done");
   } finally {
     h.close();
   }
