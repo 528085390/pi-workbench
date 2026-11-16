@@ -14,6 +14,7 @@ import type { CodexWriteAction } from "./agents/codex-driver.ts";
 import { PiDriver, resolvePiPackageDir } from "./agents/pi-driver.ts";
 import { AgentRouter } from "./agents/router.ts";
 import type { AgentDriver } from "./agents/types.ts";
+import { hideWindowsChildProcesses } from "./child-process.ts";
 import { CheckpointStore } from "./checkpoints.ts";
 import type { Config } from "./config.ts";
 import { loadConfig } from "./config.ts";
@@ -269,6 +270,7 @@ function withProbeTimeout<T>(promise: Promise<T>, timeoutMs: number, label: stri
  * 抽成函数是为了让本模块可被导入而不产生副作用（测试 / 复用），只有直接执行时才启动。
  */
 export async function main(): Promise<void> {
+  hideWindowsChildProcesses();
   const config = loadConfig();
   const paths = resolvePaths(config.home);
   ensureDirs(paths);
