@@ -106,4 +106,9 @@ export interface Checkpoint {
   nextStep: string;
   transcriptCursor: string;
   createdAt: string;
+  /**
+   * 检查点格式版本（C03 / spec §7.3）：当前固定为 1。additive 字段 ——
+   * 历史库行没有该列值时，读取侧按 1 处理。
+   */
+  version: number;
 }

@@ -162,7 +162,9 @@ export const STATUS_BY_CODE: Readonly<Record<WorkbenchErrorCode, number>> = {
   E_CAP_UNSUPPORTED: 422,
   E_AGENT_UNAVAILABLE: 422,
   E_ADAPTER_DOWN: 503,
-  E_RESUME_REJECTED: 503,
+  E_HANDOFF_FAILED: 503,
+  E_CHECKPOINT_FAILED: 500,
+  E_RESUME_REJECTED: 409,
 };
 
 /** 兜底错误码（spec §6 之外，仅「未知异常 → 500」使用） */

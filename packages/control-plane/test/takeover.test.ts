@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
@@ -1197,20 +1197,27 @@ test("handback: 真重启（全新 store/registry/leases + loadFromDb）仍用�
   }
 });
 
-test("handoff: close 失败 → 写 error 事件 + 状态回 idle + 抛 E_ADAPTER_DOWN（I4）", async () => {
+test("handoff: close 失败 → E_HANDOFF_FAILED（step=close）+ error 事件 + 状态/租约保持原状（spec §7.3）", async () => {
   const h = fresh({ closeError: new Error("close 时 IPC 已断开") });
   try {
     h.registry.upsert(makeRef({ status: "running" }));
     h.leases.acquire(KEY, "pi", "pi-1");
 
-    await expectRejectCode(() => h.engine.handoff(KEY, "human", "pi-1"), "E_ADAPTER_DOWN");
+    try {
+      await h.engine.handoff(KEY, "human", "pi-1");
+      assert.fail("预期抛 E_HANDOFF_FAILED");
+    } catch (err) {
+      assert.ok(isWorkbenchError(err), "预期 WorkbenchError，实际：" + String(err));
+      assert.equal(err.code, "E_HANDOFF_FAILED");
+      assert.equal((err.details as Record<string, unknown>)["step"], "close");
+    }
 
     const errors = h.store.list(KEY).filter((event) => event.type === "error");
     assert.equal(errors.length, 1, "失败必须留一条 error 事件");
     const payload = errors[0]?.payload as Record<string, unknown> | undefined;
     assert.ok(String(payload?.["message"] ?? "").includes("IPC 已断开"), "error 事件要带原因：" + String(payload?.["message"]));
 
-    assert.equal(h.registry.get(KEY)?.status, "idle", "失败后状态必须回到 idle，不能停在 running");
+    assert.equal(h.registry.get(KEY)?.status, "running", "close 失败回滚为原状态（running），不能谎报 idle");
     assert.equal(h.registry.get(KEY)?.driver, "pi", "失败后 driver 不得改成 human");
     const lease = h.leases.current(KEY);
     assert.equal(lease?.driver, "pi", "租约仍在原客户端手里");
@@ -1220,17 +1227,25 @@ test("handoff: close 失败 → 写 error 事件 + 状态回 idle + 抛 E_ADAPTE
   }
 });
 
-test("handoff: cancel 失败 → error 事件 + idle + E_ADAPTER_DOWN，且不再调用 close（I4）", async () => {
+test("handoff: cancel 失败 → E_HANDOFF_FAILED（step=cancel）+ 状态不变 + 不再调用 close（spec §7.3）", async () => {
   const h = fresh({ cancelError: new Error("cancel 失败：session 已消失") });
   try {
     h.registry.upsert(makeRef({ status: "running" }));
     h.leases.acquire(KEY, "pi", "pi-1");
 
-    await expectRejectCode(() => h.engine.handoff(KEY, "human", "pi-1"), "E_ADAPTER_DOWN");
+    try {
+      await h.engine.handoff(KEY, "human", "pi-1");
+      assert.fail("预期抛 E_HANDOFF_FAILED");
+    } catch (err) {
+      assert.ok(isWorkbenchError(err), "预期 WorkbenchError，实际：" + String(err));
+      assert.equal(err.code, "E_HANDOFF_FAILED");
+      assert.equal((err.details as Record<string, unknown>)["step"], "cancel");
+    }
 
     const errors = h.store.list(KEY).filter((event) => event.type === "error");
     assert.equal(errors.length, 1);
-    assert.equal(h.registry.get(KEY)?.status, "idle");
+    assert.equal(h.registry.get(KEY)?.status, "running", "cancel 失败时会话状态不变");
+    assert.equal(h.leases.current(KEY)?.clientId, "pi-1", "租约仍在调用方手里");
     assert.equal(h.fake.count("close"), 0, "cancel 失败后不应继续 close");
   } finally {
     h.close();
@@ -1525,6 +1540,226 @@ test("refreshTranscriptPath: running 解析失败不缓存，下一次立即重�
     assert.equal(h.calls(), 1);
     assert.equal(await h.engine.refreshTranscriptPath("codex:sess-1"), undefined);
     assert.equal(h.calls(), 2, "running 的新 rollout 不能因一次 miss 被缓存");
+  } finally {
+    h.close();
+  }
+});
+
+// ---------------------------------------------------------------- C03 checkpoint v2 / handoff 硬化
+
+test("checkpoint: v1 front matter（version/session/cursor/agent），原子写不残留 .tmp（C03）", () => {
+  const h = fresh();
+  try {
+    h.registry.upsert(makeRef({ status: "idle" }));
+    h.leases.acquire(KEY, "pi", "pi-1");
+
+    const checkpoint = h.engine.checkpoint(KEY, { summary: "fmt", touchedFiles: ["a.ts"], nextStep: "n" }, "pi-1");
+
+    assert.equal(checkpoint.version, 1, "所有 Checkpoint 构造点必须带 version: 1");
+    assert.equal(h.checkpoints.latest(KEY)?.version, 1, "checkpoints.version 必须落库");
+    const files = readdirSync(h.handoffDir);
+    assert.equal(files.length, 1, "只留正式文件，不残留 .tmp：" + files.join(","));
+    assert.ok(!(files[0] ?? "").endsWith(".tmp"));
+    const text = readFileSync(join(h.handoffDir, files[0] ?? ""), "utf8");
+    assert.ok(text.startsWith("---\n"), "检查点必须带 front matter");
+    assert.ok(text.includes("pi-workbench-checkpoint: 1"), "front matter 缺版本行");
+    assert.ok(text.includes("session: " + KEY));
+    assert.ok(text.includes('cursor: "0"'), "游标按 spec 加引号");
+    assert.ok(text.includes("agent: claude"));
+    assert.ok(text.includes("\n---\n"), "front matter 必须闭合");
+  } finally {
+    h.close();
+  }
+});
+
+test("checkpoint: rename 失败（崩溃窗口）→ E_CHECKPOINT_FAILED，清理 .tmp、不落库、旧文件不变（C03）", () => {
+  const h = fresh();
+  try {
+    h.registry.upsert(makeRef({ status: "idle" }));
+    h.leases.acquire(KEY, "pi", "pi-1");
+
+    const first = h.engine.checkpoint(KEY, { summary: "old", touchedFiles: [], nextStep: "" }, "pi-1");
+    const firstPath = h.checkpoints.latest(KEY)?.path ?? "";
+    const firstText = readFileSync(firstPath, "utf8");
+
+    // 第二次换一个时间戳；把目标路径占成目录，rename 必然失败 —— 等价于 tmp 写完、替身前崩溃
+    h.clock.advance(1000);
+    const target =
+      join(h.handoffDir, "claude-sess-1-" + new Date(START + 1000).toISOString().replace(/:/g, "-") + ".md");
+    mkdirSync(target);
+
+    assert.throws(
+      () => h.engine.checkpoint(KEY, { summary: "new", touchedFiles: [], nextStep: "" }, "pi-1"),
+      (err: unknown) => isWorkbenchError(err) && err.code === "E_CHECKPOINT_FAILED",
+    );
+
+    const names = readdirSync(h.handoffDir);
+    assert.ok(!names.some((name) => name.endsWith(".tmp")), "失败后不得残留 .tmp：" + names.join(","));
+    assert.equal(countRows(h.db, "checkpoints"), 1, "写失败不得落库");
+    assert.equal(readFileSync(firstPath, "utf8"), firstText, "旧检查点文件不得被半成品覆盖");
+    const latest = h.checkpoints.latest(KEY);
+    assert.equal(latest?.summary, "old");
+    assert.equal(latest?.transcriptCursor, first.transcriptCursor);
+  } finally {
+    h.close();
+  }
+});
+
+test("handoff: checkpoint 写失败 → E_CHECKPOINT_FAILED，状态不变、租约归调用方、不 close（补偿表）", async () => {
+  const h = fresh();
+  try {
+    h.registry.upsert(makeRef({ status: "running" }));
+    h.leases.acquire(KEY, "pi", "pi-1");
+    const target = join(h.handoffDir, "claude-sess-1-" + new Date(START).toISOString().replace(/:/g, "-") + ".md");
+    mkdirSync(target);
+
+    await expectRejectCode(() => h.engine.handoff(KEY, "human", "pi-1"), "E_CHECKPOINT_FAILED");
+
+    assert.equal(h.fake.count("cancel"), 1, "quiesce 已执行");
+    assert.equal(h.fake.count("close"), 0, "checkpoint 失败后不得继续 close");
+    assert.equal(h.registry.get(KEY)?.status, "running", "会话状态不变");
+    assert.equal(h.leases.current(KEY)?.clientId, "pi-1", "租约归还调用方");
+    assert.equal(countRows(h.db, "checkpoints"), 0, "写失败不得落库");
+  } finally {
+    h.close();
+  }
+});
+
+test("handoff: 命令拼接失败 → exited + 租约释放 + E_HANDOFF_FAILED（detail.checkpointPath，C03）", async () => {
+  const db = openDb(":memory:");
+  migrate(db);
+  const clock = makeClock();
+  const registry = new SessionRegistry(db);
+  const leases = new LeaseManager(db, { now: clock.now });
+  const store = new EventStore(db);
+  const handoffDir = mkdtempSync(join(tmpdir(), "pi-handoff-cmd-"));
+  const driver: AgentDriver = {
+    agent: "codex",
+    caps: { ...CLAUDE_CAPABILITIES, permissions: false },
+    discover: async () => [],
+    attach: async () => {},
+    inject: async () => ({ messageId: "m", effective: "now" }),
+    interrupt: async () => ({ stopReason: "cancelled" }),
+    resume: async () => {},
+    handoff: async () => {
+      throw new Error("command build failed");
+    },
+    onUpdate: (_cb: (update: AdapterUpdate) => void) => () => {},
+    dispose: async () => {},
+  };
+  const router = new AgentRouter();
+  router.register(driver);
+  const engine = new TakeoverEngine({
+    store,
+    leases,
+    registry,
+    adapter: makeFake().adapter,
+    router,
+    checkpoints: new CheckpointStore(db),
+    dispatches: new DispatchStore(db),
+    handoffDir,
+    now: clock.now,
+    readTranscript: emptyReader,
+  });
+  const key = "codex:sess-1";
+  try {
+    registry.upsert({
+      key,
+      agent: "codex",
+      nativeId: "sess-1",
+      cwd: CWD,
+      status: "idle",
+      driver: "pi",
+      capabilities: driver.caps,
+      kind: "interactive",
+    });
+    leases.acquire(key, "pi", "pi-1");
+
+    try {
+      await engine.handoff(key, "human", "pi-1");
+      assert.fail("预期抛 E_HANDOFF_FAILED");
+    } catch (err) {
+      assert.ok(isWorkbenchError(err), "预期 WorkbenchError，实际：" + String(err));
+      assert.equal(err.code, "E_HANDOFF_FAILED");
+      const details = err.details as Record<string, unknown>;
+      assert.equal(details["step"], "handoff");
+      assert.match(String(details["checkpointPath"] ?? ""), /\.md$/);
+    }
+
+    assert.equal(registry.get(key)?.status, "exited", "命令拼接失败后会话置 exited");
+    assert.equal(leases.current(key), null, "失败后租约必须释放");
+    assert.equal(countRows(db, "checkpoints"), 1, "checkpoint 在命令失败前已落库");
+  } finally {
+    db.close();
+    rmSync(handoffDir, { recursive: true, force: true });
+  }
+});
+
+test("handoff/handback 两次往返：第三次 checkpoint 游标严格前进，see 能读到人类回合（spec §7.3）", async () => {
+  let stage = 0;
+  const reader: TranscriptReader = (_path, cursor) => {
+    const c = cursor ?? "0";
+    const pages: Record<string, { role: UnifiedMessage["role"]; text: string; next: string }> = {
+      "0": { role: "assistant", text: "第一轮 pi 输出", next: "100" },
+      "100": { role: "user", text: "人类第一轮修改", next: "200" },
+      "200": { role: "assistant", text: "第二轮 pi 输出", next: "300" },
+      "300": { role: "user", text: "人类第二轮修改", next: "400" },
+      "400": { role: "assistant", text: "第三轮 pi 输出", next: "500" },
+    };
+    const visible =
+      c === "0" ||
+      (stage >= 1 && c === "100") ||
+      (stage >= 2 && c === "200") ||
+      (stage >= 3 && c === "300") ||
+      (stage >= 4 && c === "400");
+    if (!visible) {
+      return { messages: [], nextCursor: c, pending: true };
+    }
+    const page = pages[c];
+    if (page === undefined) {
+      return { messages: [], nextCursor: c, pending: true };
+    }
+    return { messages: [msg("m-" + c, page.role, page.text)], nextCursor: page.next, pending: false };
+  };
+  const h = fresh({ readTranscript: reader });
+  try {
+    h.registry.upsert(makeRef({ status: "idle" }));
+    h.leases.acquire(KEY, "pi", "pi-1");
+
+    // 第一轮：handoff 的 checkpoint 记录 100；人类回合从 100 开始
+    const first = await h.engine.handoff(KEY, "human", "pi-1", { summary: "r1", touchedFiles: [], nextStep: "" });
+    assert.equal(first.checkpoint.transcriptCursor, "100");
+    const firstCursor = Number(first.checkpoint.transcriptCursor);
+    stage = 1;
+    const back1 = await h.engine.handback(KEY, "handoff-pi-1");
+    assert.equal(back1.deltaSummary, "user: 人类第一轮修改");
+    const seen = h.engine.see(KEY, "100");
+    assert.ok(
+      seen.messages.some((message) => message.text.includes("人类第一轮")),
+      "see 必须能看到人类回合消息",
+    );
+
+    // 第二轮：pi 回合 200 之后再次交人，checkpoint 推进到 300
+    stage = 2;
+    h.clock.advance(1000);
+    const second = await h.engine.handoff(KEY, "human", "pi-1", { summary: "r2", touchedFiles: [], nextStep: "" });
+    assert.equal(second.checkpoint.transcriptCursor, "300");
+    stage = 3;
+    const back2 = await h.engine.handback(KEY, "handoff-pi-1");
+    assert.equal(back2.deltaSummary, "user: 人类第二轮修改");
+
+    // 第三次 checkpoint：游标必须严格大于第一次
+    stage = 4;
+    h.clock.advance(1000);
+    const third = h.engine.checkpoint(KEY, { summary: "r3", touchedFiles: [], nextStep: "" }, "pi-1");
+    assert.ok(
+      Number(third.transcriptCursor) > firstCursor,
+      third.transcriptCursor + " 必须大于 " + String(firstCursor),
+    );
+    assert.equal(third.version, 1);
+    const listed = h.checkpoints.list(KEY);
+    assert.equal(listed.length, 3, "两次 handoff + 一次 checkpoint 共 3 行");
+    assert.equal(listed[0]?.version, 1);
   } finally {
     h.close();
   }

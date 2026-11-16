@@ -27,6 +27,7 @@ test("save/latest 往返：字段完整、touchedFiles 数组还原", () => {
       nextStep: "下一步",
       transcriptCursor: "120",
       createdAt: new Date().toISOString(),
+      version: 1,
     });
     const latest = store.latest("claude:s1");
     assert.ok(latest);
@@ -52,6 +53,7 @@ test("latest 取最新一条，list 倒序", () => {
         nextStep: "",
         transcriptCursor: String(n),
         createdAt: new Date(2026, 0, n).toISOString(),
+        version: 1,
       });
     }
     assert.equal(store.latest("claude:s2")?.summary, "s3");
@@ -74,4 +76,30 @@ test("坏 JSON 不抛异常，touchedFiles 退化为空数组", () => {
     db.close();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("checkpoint 带 version 且缺省为 1", () => {
+  const db = openDb(":memory:");
+  migrate(db);
+  const store = new CheckpointStore(db);
+  store.save({
+    sessionKey: "claude:a",
+    path: "/tmp/a.md",
+    summary: "s",
+    touchedFiles: [],
+    nextStep: "n",
+    transcriptCursor: "10",
+    createdAt: "2026-11-17T00:00:00.000Z",
+    version: 1,
+  });
+  assert.equal(store.latest("claude:a")?.version, 1);
+});
+
+test("历史行缺 version 值时读取按 1 处理", () => {
+  const db = openDb(":memory:");
+  migrate(db);
+  db.prepare(
+    "INSERT INTO checkpoints (session_key, path, summary, touched_files_json, next_step, cursor, created_at) VALUES (?,?,?,?,?,?,?)",
+  ).run("claude:legacy", "/tmp/old.md", "s", "[]", "", "0", "2026-11-16T00:00:00.000Z");
+  assert.equal(new CheckpointStore(db).latest("claude:legacy")?.version, 1);
 });

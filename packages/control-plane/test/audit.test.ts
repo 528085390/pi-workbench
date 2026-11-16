@@ -313,14 +313,14 @@ test("handoff 失败写 errorCode 与出错步骤（cancel）", async () => {
       payload: { to: "human", clientId: "pi:1" },
     });
     assert.equal(failed.statusCode, 503);
-    assert.equal(failed.json<{ error: { code: string } }>().error.code, "E_ADAPTER_DOWN");
+    assert.equal(failed.json<{ error: { code: string } }>().error.code, "E_HANDOFF_FAILED");
 
     const res = await h.app.inject({ method: "GET", url: API + "/audit?sessionKey=" + encodeURIComponent(KEY) });
     const items = res.json<{ items: AuditItem[] }>().items;
     assert.equal(items.length, 1);
     assert.equal(items[0]?.action, "handoff");
     assert.equal(items[0]?.outcome, "error");
-    assert.equal(items[0]?.errorCode, "E_ADAPTER_DOWN");
+    assert.equal(items[0]?.errorCode, "E_HANDOFF_FAILED");
     assert.deepEqual(items[0]?.detail, { to: "human", step: "cancel" });
   } finally {
     await h.dispose();

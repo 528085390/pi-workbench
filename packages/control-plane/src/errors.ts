@@ -16,7 +16,9 @@ export type WorkbenchErrorCode =
   | "E_IDEMPOTENCY_CONFLICT"
   | "E_AGENT_UNAVAILABLE"
   | "E_DISPATCH_IN_PROGRESS"
-  | "E_SESSION_BUSY";
+  | "E_SESSION_BUSY"
+  | "E_HANDOFF_FAILED"
+  | "E_CHECKPOINT_FAILED";
 
 /**
  * 带错误码的控制面异常。

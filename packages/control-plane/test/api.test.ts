@@ -748,7 +748,9 @@ test("错误码 → 状态码映射覆盖 R35 全表", () => {
     E_CAP_UNSUPPORTED: 422,
     E_AGENT_UNAVAILABLE: 422,
     E_ADAPTER_DOWN: 503,
-    E_RESUME_REJECTED: 503,
+    E_HANDOFF_FAILED: 503,
+    E_CHECKPOINT_FAILED: 500,
+    E_RESUME_REJECTED: 409,
   });
 });
 
@@ -770,7 +772,7 @@ test("错误体形状与状态码（E_BAD_REQUEST / E_NO_LEASE / E_IDEMPOTENCY_C
     assert.equal(noLease.statusCode, 409);
     assert.equal(noLease.json<ErrorEnvelope>().error.code, "E_NO_LEASE");
 
-    // E_RESUME_REJECTED：handback 的 resume 失败 → 503
+    // E_RESUME_REJECTED：handback 的 resume 失败 → 409（spec §7.3 / §8）
     await acquire(h.app, "pi:1");
     const handoff = await h.app.inject({
       method: "POST",
@@ -783,7 +785,7 @@ test("错误体形状与状态码（E_BAD_REQUEST / E_NO_LEASE / E_IDEMPOTENCY_C
       url: SESSIONS + "/handback",
       payload: { clientId: "handoff-pi:1" },
     });
-    assert.equal(handback.statusCode, 503);
+    assert.equal(handback.statusCode, 409);
     assert.equal(handback.json<ErrorEnvelope>().error.code, "E_RESUME_REJECTED");
 
     // E_IDEMPOTENCY_CONFLICT：同 key 换 payload

@@ -13,7 +13,7 @@
  * - 本模块不 import server / fastify，也不 import 任何 HTTP 层。
  */
 import { createHash } from "node:crypto";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import type { AgentName, Checkpoint, SessionRef, UnifiedMessage } from "@pi-workbench/shared";
@@ -22,6 +22,7 @@ import type { AgentAdapter } from "./adapters/types.ts";
 import type { AgentRouter } from "./agents/router.ts";
 import type { AdapterCapability, AgentDriver } from "./agents/types.ts";
 import { CLAUDE_CAPABILITIES } from "./capabilities.ts";
+import { CHECKPOINT_VERSION } from "./checkpoints.ts";
 import type { CheckpointStore, StoredCheckpoint } from "./checkpoints.ts";
 import { DEFAULT_DISPATCH_RESERVED_TTL_MS } from "./config.ts";
 import type { DispatchRecord, DispatchStore } from "./dispatch-store.ts";
@@ -338,10 +339,11 @@ export class TakeoverEngine {
         await this.#waitForTurn(ref, driver);
       }
     } catch (err) {
-      throw this.#handoffAborted(ref, "cancel", err);
+      // spec §7.3 补偿表：cancel 失败 → 会话状态不变、租约归还调用方
+      throw this.#handoffFailed(ref, "cancel", err);
     }
 
-    // 3. checkpoint（文件 + checkpoints 表）
+    // 3. checkpoint（文件 + checkpoints 表）。写失败抛 E_CHECKPOINT_FAILED：状态不变、租约不动。
     const { checkpoint, path } = this.#writeCheckpoint(ref, input ?? defaultHandoffInput(to));
 
     // 4. 释放控制通道里的会话，交给原生终端（没有 close 的 driver，如 Pi，保持原生会话不动）
@@ -352,7 +354,8 @@ export class TakeoverEngine {
         await this.#adapter.close(ref.nativeId);
       }
     } catch (err) {
-      throw this.#handoffAborted(ref, "close", err);
+      // spec §7.3 补偿表：close 失败 → 回滚为原状态（此前未改注册表）、租约归还调用方
+      throw this.#handoffFailed(ref, "close", err);
     }
 
     // 5. 接管命令由 driver.handoff(ref) 决定（Claude：background attach / interactive --resume；
@@ -366,7 +369,13 @@ export class TakeoverEngine {
       if (isWorkbenchError(err) && (err.code === "E_CAP_UNSUPPORTED" || err.code === "E_AGENT_UNAVAILABLE")) {
         throw err;
       }
-      throw this.#handoffAborted(ref, "handoff", err);
+      // spec §7.3：命令拼接失败 → 会话 exited、租约释放，detail 带 checkpointPath
+      try {
+        this.#leases.release(key, clientId);
+      } catch {
+        // 租约已不在调用方名下（理论上不会发生）：仍按失败返回，不覆盖原始原因
+      }
+      throw this.#handoffFailed(ref, "handoff", err, { checkpointPath: path });
     }
 
     // 6. 租约转给接管的 driver，人类窗口固定 30 分钟
@@ -410,6 +419,7 @@ export class TakeoverEngine {
       throw new WorkbenchError("E_RESUME_REJECTED", "恢复会话被拒绝：" + key, {
         sessionKey: key,
         nativeId: ref.nativeId,
+        step: "resume",
         reason: err instanceof Error ? err.message : String(err),
       });
     }
@@ -777,7 +787,11 @@ export class TakeoverEngine {
     return readTranscript(ref.agent, path, cursor);
   }
 
-  /** 落 checkpoint 文件 + 落库，返回对象与文件路径（C3） */
+  /**
+   * 落 checkpoint 文件 + 落库，返回对象与文件路径（C3 / spec §7.3）。
+   * 原子写：先写 `<path>.tmp`，再 `renameSync` 覆盖正式文件；任一步失败都清理半成品并抛
+   * `E_CHECKPOINT_FAILED`（500），调用方看到的永远是完整文件或旧文件。
+   */
   #writeCheckpoint(ref: SessionRef, input: CheckpointInput): { checkpoint: StoredCheckpoint; path: string } {
     const nowMs = this.#now();
     const checkpoint: Checkpoint = {
@@ -787,16 +801,52 @@ export class TakeoverEngine {
       nextStep: input.nextStep,
       transcriptCursor: ref.transcriptPath === undefined ? CURSOR_ZERO : this.#cursorAtEnd(ref),
       createdAt: new Date(nowMs).toISOString(),
+      version: CHECKPOINT_VERSION,
     };
 
     const path = join(this.#handoffDir, sanitizeKey(ref.key) + "-" + isoForFile(nowMs) + ".md");
-    mkdirSync(this.#handoffDir, { recursive: true });
-    writeFileSync(path, renderCheckpoint(checkpoint), "utf8");
+    const tmp = path + ".tmp";
+    try {
+      mkdirSync(this.#handoffDir, { recursive: true });
+      writeFileSync(tmp, renderCheckpoint(checkpoint), "utf8");
+      renameSync(tmp, path);
+    } catch (err) {
+      // 崩溃窗口的清理：tmp 没被 rename 就失败时不能留在目录里被误读成检查点
+      this.#removeQuietly(tmp);
+      throw this.#checkpointFailed(ref, path, err);
+    }
 
     // C3：文件之外必须落库，否则进程重启后 handback 拿不到游标
     const stored: StoredCheckpoint = { ...checkpoint, path };
-    this.#checkpoints.save(stored);
+    try {
+      this.#checkpoints.save(stored);
+    } catch (err) {
+      // 落库失败同样不能留半文件：删掉刚 rename 的文件，保持「失败无副作用」
+      this.#removeQuietly(path);
+      throw this.#checkpointFailed(ref, path, err);
+    }
     return { checkpoint: stored, path };
+  }
+
+  /** 清理半成品：ENOENT / 占用都不覆盖原始失败原因 */
+  #removeQuietly(path: string): void {
+    try {
+      unlinkSync(path);
+    } catch {
+      // 清理只是止损
+    }
+  }
+
+  /** checkpoint 写文件 / 落库失败 → 500 E_CHECKPOINT_FAILED（spec §7.3 / §8） */
+  #checkpointFailed(ref: SessionRef, path: string, err: unknown): WorkbenchError {
+    const message = err instanceof Error ? err.message : String(err);
+    return new WorkbenchError("E_CHECKPOINT_FAILED", "写检查点失败：" + ref.key + " — " + message, {
+      sessionKey: ref.key,
+      nativeId: ref.nativeId,
+      path,
+      step: "checkpoint",
+      cause: message,
+    });
   }
 
   /** 把 transcript 游标推进到当前末尾（handback 从该偏移读人类接管期间的增量） */
@@ -1011,16 +1061,31 @@ export class TakeoverEngine {
     });
   }
 
-  /** I4：cancel / close 失败 → 写 error 事件 + 状态回 idle，再抛 E_ADAPTER_DOWN（带原因文本） */
-  #handoffAborted(ref: SessionRef, where: string, err: unknown): never {
+  /**
+   * handoff 失败补偿（spec §7.3）：
+   * - cancel / close：会话状态保持不变，租约仍在调用方；
+   * - handoff（命令拼接）：控制通道已 close，会话置 `exited`，租约已由调用方释放。
+   * 统一抛 503 `E_HANDOFF_FAILED`，details.step 指明失败步骤（action 留给审计提取层）。
+   */
+  #handoffFailed(
+    ref: SessionRef,
+    step: "cancel" | "close" | "handoff",
+    err: unknown,
+    extra: Record<string, unknown> = {},
+  ): never {
     const message = err instanceof Error ? err.message : String(err);
-    this.#appendError(ref, message, "handoff-" + where);
-    this.#registry.updateStatus(ref.key, "idle");
-    throw new WorkbenchError(
-      "E_ADAPTER_DOWN",
-      "handoff 无法停止/关闭会话（" + where + "）：" + ref.key + " — " + message,
-      { sessionKey: ref.key, nativeId: ref.nativeId, action: where, cause: message },
-    );
+    this.#appendError(ref, message, "handoff-" + step);
+    if (step === "handoff") {
+      this.#registry.updateStatus(ref.key, "exited");
+    }
+    throw new WorkbenchError("E_HANDOFF_FAILED", "handoff 失败（" + step + "）：" + ref.key + " — " + message, {
+      sessionKey: ref.key,
+      nativeId: ref.nativeId,
+      step,
+      action: step,
+      cause: message,
+      ...extra,
+    });
   }
 
   /** 失败留痕：error 事件（payload.message），避免「租约还在、状态 running、却没有任何事件」 */
@@ -1080,9 +1145,18 @@ function isoForFile(ms: number): string {
 function renderCheckpoint(checkpoint: Checkpoint): string {
   const files =
     checkpoint.touchedFiles.length === 0 ? "- （无）" : checkpoint.touchedFiles.map((file) => "- " + file).join("\n");
+  const colon = checkpoint.sessionKey.indexOf(":");
+  const agent = colon > 0 ? checkpoint.sessionKey.slice(0, colon) : checkpoint.sessionKey;
   return [
-    "# Checkpoint：" + checkpoint.sessionKey,
-    "生成时间：" + checkpoint.createdAt,
+    "---",
+    "pi-workbench-checkpoint: " + String(checkpoint.version ?? CHECKPOINT_VERSION),
+    "session: " + checkpoint.sessionKey,
+    "created: " + checkpoint.createdAt,
+    "cursor: " + JSON.stringify(checkpoint.transcriptCursor),
+    "agent: " + agent,
+    "---",
+    "",
+    "# 检查点",
     "",
     "## 摘要",
     checkpoint.summary,
