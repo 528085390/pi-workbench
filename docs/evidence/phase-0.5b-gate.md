@@ -23,7 +23,7 @@
 | @agentclientprotocol/claude-agent-acp | 0.107.0 |
 | @agentclientprotocol/sdk | 2.6.0 |
 | fastify / @fastify/websocket | 5.12.8 / 11.3.7 |
-| commit | `795e0a7` + 复审修复工作树（branch `feat/phase-0.5b-codex-pi`，2026-11-16 17:46） |
+| commit | `5f8243a`（branch `feat/phase-0.5b-codex-pi`；复审修复提交，Gate 证据采于其工作树，2026-11-16 17:46） |
 
 复现环境：
 
