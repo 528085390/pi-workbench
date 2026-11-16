@@ -144,7 +144,7 @@ node --experimental-strip-types --input-type=module -e "<T5 原生 resume 探针
 | adapter 子进程已退出 | 任意后续 RPC | `E_ADAPTER_DOWN` 原样透传 | adapter 既有用例 + 驱动透传分支 |
 | 无写租约 | `authorizeWrite` 抛 `E_NO_LEASE` | `E_NO_LEASE`，且 **0 个 ACP 请求 / 0 次 spawn** | `inject 无 lease 时不 spawn adapter、不发 prompt` |
 | Codex 不支持 attach | `driver.attach()` | `E_CAP_UNSUPPORTED`，不 spawn | `attach 明确拒绝（caps.attach=false），不 spawn adapter` |
-| 发现 / transcript 模块未就绪 | 动态 import 失败 | `E_AGENT_UNAVAILABLE`（含模块名） | 由默认路径集成用例覆盖已就绪场景 |
+| T3/T4 模块缺失 | 构建期静态 import 失败 | `tsc` 报错（不静默降级） | 由默认路径集成用例覆盖已就绪场景 |
 
 约定：驱动不把 `E_RESUME_REJECTED` 静默降级成新会话；运行中 resume 必须先 cancel 等 idle，
 超时直接失败（规格 §8 的保守策略）。
@@ -187,7 +187,7 @@ node --test --experimental-strip-types test/codex-driver.test.ts
 - **T8 需要处理**：`packages/control-plane/src/index.ts` 目前只注册 `ClaudeAdapter` / Claude 驱动；
   T5 被禁止改 `src/index.ts`、`src/server.ts`、`src/takeover.ts`，因此 `CodexDriver` 的注册与路由接线
   （以及 `newSession/waitForTurn/close` 的 dispatch / takeover 调用）留给 T8。
-- transcript 懒解析依赖 T3 的 `discover/codex.ts` 与 T4 的 `transcript/index.ts`；两者已存在时默认路径可用，
-  缺失时 `see` 按 `pending:true` 返回，不报错。ACP 全新会话刚创建时 rollout 可能尚未落盘，属于规格 §7.1 的允许窗口。
+- transcript 懒解析静态依赖 T3 的 `discover/codex.ts` 与 T4 的 `transcript/index.ts`；缺模块会在构建期暴露，不会静默降级。
+  ACP 全新会话刚创建时 rollout 可能尚未落盘，此时 `see` 按 `pending:true` 返回，属于规格 §7.1 的允许窗口。
 - `session/resume` 成功响应没有显式 `resumed` 字段；本驱动以 JSON-RPC 成功作为恢复成功，不伪造该字段。
 - 真实 codex-acp 联调是手动证据，不进 CI；CI 只跑假 ACP server。

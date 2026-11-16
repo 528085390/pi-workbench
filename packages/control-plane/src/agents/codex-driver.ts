@@ -20,7 +20,9 @@ import { spawnCodexAcpAdapter } from "../adapters/codex-acp.ts";
 import type { AdapterUpdate, AgentAdapter } from "../adapters/types.ts";
 import { capsOf } from "../capabilities.ts";
 import type { Config } from "../config.ts";
+import { discoverCodexSessions } from "../discover/codex.ts";
 import { isWorkbenchError, WorkbenchError } from "../errors.ts";
+import { readTranscript } from "../transcript/index.ts";
 import type { AgentDriver, DiscoverOptions, HandoffCommand, SeeResult } from "./types.ts";
 
 /** Codex 默认 rollout 根：~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl */
@@ -61,9 +63,9 @@ export type CodexWriteAction = "inject" | "interrupt" | "resume" | "handoff" | "
 export type CodexDriverOptions = {
   /** 覆盖 ACP 进程启动（测试注入假 adapter；默认 spawnCodexAcpAdapter） */
   spawnAdapter?: (config: Config, options: CodexAcpSpawnOptions) => Promise<AgentAdapter>;
-  /** 覆盖发现（默认动态 import ../transcript/codex-discovery.ts，避免 T3 未落地时编译耦合） */
+  /** 覆盖发现（默认 T3 的 discoverCodexSessions） */
   discoverSessions?: CodexDiscovery;
-  /** 覆盖 transcript 读取（默认动态 import ../transcript/types.ts） */
+  /** 覆盖 transcript 读取（默认 T4 的 readTranscript） */
   readTranscript?: CodexTranscriptReader;
   /** 按 thread id 尽力解析 rollout 文件（默认用发现层扫 sessionsRoot） */
   resolveRolloutPath?: (threadId: string, cwd: string) => Promise<string | undefined>;
@@ -95,8 +97,8 @@ export class CodexDriver implements AgentDriver {
   readonly #activeSessions = new Set<string>();
   readonly #rolloutPaths = new Map<string, string>();
 
-  #discoverSessions: CodexDiscovery | null;
-  #readTranscript: CodexTranscriptReader | null;
+  #discoverSessions: CodexDiscovery;
+  #readTranscript: CodexTranscriptReader;
   #adapter: AgentAdapter | null = null;
   #spawnPromise: Promise<AgentAdapter> | null = null;
   #adapterUnsubscribe: (() => void) | null = null;
@@ -105,8 +107,8 @@ export class CodexDriver implements AgentDriver {
   constructor(config: Config, options: CodexDriverOptions = {}) {
     this.#config = config;
     this.#spawnAdapter = options.spawnAdapter ?? spawnCodexAcpAdapter;
-    this.#discoverSessions = options.discoverSessions ?? null;
-    this.#readTranscript = options.readTranscript ?? null;
+    this.#discoverSessions = options.discoverSessions ?? discoverCodexSessions;
+    this.#readTranscript = options.readTranscript ?? ((input) => readTranscript(input));
     this.#authorizeWrite = options.authorizeWrite;
     this.#sessionsRoot = options.sessionsRoot ?? DEFAULT_CODEX_SESSIONS_ROOT;
     this.#quiesceTimeoutMs = options.quiesceTimeoutMs ?? DEFAULT_QUIESCE_TIMEOUT_MS;
@@ -117,9 +119,7 @@ export class CodexDriver implements AgentDriver {
 
   async discover(opts: DiscoverOptions = {}): Promise<SessionRef[]> {
     this.#assertLive("discover");
-    const discovery = this.#discoverSessions ?? (await loadDefaultCodexDiscovery());
-    this.#discoverSessions = discovery;
-    return await discovery({
+    return await this.#discoverSessions({
       sessionsRoot: this.#sessionsRoot,
       ...(opts.cwd === undefined ? {} : { cwd: opts.cwd }),
       ...(opts.limit === undefined ? {} : { limit: opts.limit }),
@@ -143,8 +143,7 @@ export class CodexDriver implements AgentDriver {
       // 规格 §7.1：ACP 新会话的 rollout 可能尚未落盘/被 T3 索引；空页 + pending，不报错。
       return { messages: [], nextCursor: cursor, pending: true };
     }
-    const reader = await this.#transcriptReader();
-    const page = await reader({
+    const page = await this.#readTranscript({
       agent: "codex",
       path,
       cursor,
@@ -363,17 +362,8 @@ export class CodexDriver implements AgentDriver {
     }
   }
 
-  async #transcriptReader(): Promise<CodexTranscriptReader> {
-    if (this.#readTranscript === null) {
-      this.#readTranscript = await loadDefaultTranscriptReader();
-    }
-    return this.#readTranscript;
-  }
-
   async #discoverRolloutPath(threadId: string, cwd: string): Promise<string | undefined> {
-    const discovery = this.#discoverSessions ?? (await loadDefaultCodexDiscovery());
-    this.#discoverSessions = discovery;
-    const refs = await discovery({ sessionsRoot: this.#sessionsRoot, cwd, sinceDays: 30, limit: 1000 });
+    const refs = await this.#discoverSessions({ sessionsRoot: this.#sessionsRoot, cwd, sinceDays: 30, limit: 1000 });
     const hit = refs.find((ref) => ref.nativeId === threadId || ref.key === "codex:" + threadId);
     return hit?.transcriptPath;
   }
@@ -434,34 +424,4 @@ function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-async function loadDefaultCodexDiscovery(): Promise<CodexDiscovery> {
-  const moduleId: string = "../discover/codex.ts";
-  const loaded: unknown = await import(moduleId);
-  const candidate = isRecord(loaded) ? loaded["discoverCodexSessions"] : undefined;
-  if (typeof candidate !== "function") {
-    throw new WorkbenchError(
-      "E_AGENT_UNAVAILABLE",
-      "E_AGENT_UNAVAILABLE: codex 发现模块不可用（缺少 discoverCodexSessions）",
-      { module: moduleId },
-    );
-  }
-  return candidate as CodexDiscovery;
-}
 
-async function loadDefaultTranscriptReader(): Promise<CodexTranscriptReader> {
-  const moduleId: string = "../transcript/index.ts";
-  const loaded: unknown = await import(moduleId);
-  const candidate = isRecord(loaded) ? loaded["readTranscript"] : undefined;
-  if (typeof candidate !== "function") {
-    throw new WorkbenchError(
-      "E_AGENT_UNAVAILABLE",
-      "E_AGENT_UNAVAILABLE: codex transcript 读取器不可用（缺少 readTranscript）",
-      { module: moduleId },
-    );
-  }
-  return candidate as CodexTranscriptReader;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
