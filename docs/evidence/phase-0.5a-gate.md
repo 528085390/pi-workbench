@@ -359,3 +359,11 @@ $ git check-ignore -v spike/acp-probe/evidence/claude-full.jsonl          → .g
 - 不阻塞 Pi 启动：工厂函数 fire-and-forget，第一个 `cp_*` 调用前经 `beforeCall` 钩子等待就绪。
 - 证据（含冷启动真机实录、schema 校验）：`docs/evidence/phase-0.5a/daemon-autostart.md`。
 - 测试：extension 27 全绿（新增 daemon 6 + beforeCall 2）。
+
+## 21. 事件推送与唤醒（2026-11-16 增量，spec §6.6）
+
+- Pi 扩展订阅 `WS /api/cp/ws`，claude 回合结束 / needs-input / error 时用 `pi.sendMessage(..., { deliverAs, triggerTurn })` 叫醒 Pi 主对话；
+  默认 `followUp`（本轮结束后投递），`PI_WORKBENCH_NOTIFY_MODE` 可改 `steer|nextTurn`，`PI_WORKBENCH_NOTIFY=0` 全关。
+- 防"提醒你看已经看完的东西"：投递前复查未读（0 则静默丢弃）、消息是指针不含完成断言、`cp_see`/`cp_read` 成功即清账、连续唤醒上限 5。
+- 真机闭环：Pi 派发任务后不轮询即结束本轮 → 20 秒后 claude 答完 → Pi 收到"1 个会话有更新（未读共 7 条）"并自行调用 `cp_see`，读到即结清。
+- 证据：`docs/evidence/phase-0.5a/event-wake.md` + `pi-wake-screen.txt`；extension 40 tests 全绿（notify 13）。

@@ -59,6 +59,11 @@ export type WorkbenchClientOptions = {
    * 抛错则本次调用直接失败（不会发请求）。
    */
   beforeCall?: () => Promise<void> | void;
+  /**
+   * 读完某会话（unread / markRead 成功）后的回调。插件用它清掉该会话的待发通知——
+   * 同一轮里 Pi 自己读过的，绝不能再收到过期提醒（spec §6.6 规则 3）。
+   */
+  onSessionRead?: (sessionKey: string) => void;
 };
 
 /**
@@ -316,17 +321,26 @@ export function createWorkbenchClient(options: WorkbenchClientOptions = {}): Wor
             clientId: filter?.clientId ?? clientId,
           }),
       )) as SessionView[],
-    unread: async (key, options) =>
-      (await call(
+    unread: async (key, readOptions) => {
+      const page = (await call(
         "GET",
         sessionPath(key, "/unread") +
-          queryOf({ clientId, limit: options?.limit, ack: options?.ack === false ? 0 : 1 }),
-      )) as UnreadPage,
-    markRead: async (key, cursor) =>
-      (await call("POST", sessionPath(key, "/read"), {
+          queryOf({ clientId, limit: readOptions?.limit, ack: readOptions?.ack === false ? 0 : 1 }),
+      )) as UnreadPage;
+      // 只有真的推进了游标才算"读过"；peek 不动账，通知也别清
+      if (page.acked) {
+        options.onSessionRead?.(key);
+      }
+      return page;
+    },
+    markRead: async (key, cursor) => {
+      const result = (await call("POST", sessionPath(key, "/read"), {
         clientId,
         ...(cursor === undefined ? {} : { cursor }),
-      })) as { sessionKey: string; clientId: string; lastReadCursor: string },
+      })) as { sessionKey: string; clientId: string; lastReadCursor: string };
+      options.onSessionRead?.(key);
+      return result;
+    },
     dispatch: async (input) => {
       const body: Record<string, unknown> = {
         agent: input.agent ?? "claude",
@@ -702,3 +716,4 @@ export function registerWorkbenchTools(
 }
 // daemon 自动拉起（Pi 插件加载时用）
 export * from "./daemon.ts";
+export * from "./notify.ts";

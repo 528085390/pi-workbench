@@ -3,9 +3,13 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "pi": {
-    "extensions": ["./pi-workbench.plugin.ts"]
+    "extensions": [
+      "./pi-workbench.plugin.ts"
+    ]
   },
   "main": "./dist/index.js",
   "scripts": {
@@ -14,6 +18,10 @@
     "test": "node --test --experimental-strip-types \"test/*.test.ts\""
   },
   "dependencies": {
-    "@pi-workbench/shared": "workspace:*"
+    "@pi-workbench/shared": "workspace:*",
+    "ws": "^8.23.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.2"
   }
 }
