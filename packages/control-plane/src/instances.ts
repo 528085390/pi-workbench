@@ -134,6 +134,20 @@ export class InstanceStore {
     return row === undefined ? null : toInfo(row);
   }
 
+  /**
+   * 启动收尾：把本实例之前所有未写 `ended_at` 的历史实例补上当前时间（spec §7.1 第 8 步）。
+   * 只处理 `instance_id != 本实例` 的行；未 `begin()` 时 no-op。返回收尾行数。
+   */
+  closeStale(): number {
+    if (this.#id === null) {
+      return 0;
+    }
+    const result = this.#db
+      .prepare("UPDATE instances SET ended_at = ? WHERE ended_at IS NULL AND instance_id != ?")
+      .run(this.#iso(), this.#id);
+    return Number(result.changes);
+  }
+
   /** 未正常收尾（`ended_at` 为空）的实例，按启动时间升序；重启对账用。 */
   unfinished(): InstanceInfo[] {
     const rows = this.#db

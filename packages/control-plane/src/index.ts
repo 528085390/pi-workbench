@@ -463,6 +463,15 @@ export async function main(): Promise<void> {
   }
 
   console.log("pi-workbenchd listening on " + handle.url);
+  // spec §7.1 第 8 步：HTTP/WS 起来后再补上一个实例的 ended_at；失败只告警，不影响本次启动。
+  try {
+    const closedStale = instances.closeStale();
+    if (closedStale > 0) {
+      console.log("[pi-workbenchd] 已补齐 " + String(closedStale) + " 个历史实例的 ended_at");
+    }
+  } catch (err) {
+    console.error("[pi-workbenchd] 补齐历史实例 ended_at 失败（启动继续）：" + errorMessage(err));
+  }
   // 探测最长 3s，绝不把监听卡在子进程上；首个 GET /agents 会 await 同一个 in-flight Promise。
   void refreshAgentStatuses().catch(() => {});
   if (restored > 0) {
@@ -557,16 +566,6 @@ function bootStores(config: Config, paths: WorkbenchPaths, lock: InstanceLock): 
     // spec §7.1 第 3 步：迁移成功后立刻登记本次实例，心跳与收尾由 main 装配。
     const instances = new InstanceStore(db);
     const instance = instances.begin();
-    // spec §7.1 第 8 步：单实例锁保证上一个实例已死，启动时补齐它的 ended_at。
-    // unfinished() 会包含本实例行，按 id 跳过；多个历史失败行一并收尾。
-    const staleInstances = instances.unfinished().filter((row) => row.id !== instance.id);
-    if (staleInstances.length > 0) {
-      const endedAt = new Date().toISOString();
-      const finishStmt = db.prepare("UPDATE instances SET ended_at = ? WHERE instance_id = ?");
-      for (const stale of staleInstances) {
-        finishStmt.run(endedAt, stale.id);
-      }
-    }
     const store = new EventStore(db);
     // spec §7.1 第 4 步：租约按实例归属；启动清扫必须早于 loadFromDb，避免恢复出别家实例的租约。
     const leases = new LeaseManager(db, { ttlMs: config.leaseTtlMs, instanceId: instance.id });

@@ -585,6 +585,9 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
           });
         }
         await driver.attach(session);
+        // spec §7.1：重启后对账把 driver 会话置为 driver=none/status=unknown；attach 成功即恢复
+        // 控制面驱动并进入 idle，避免会话永远停在 unknown。
+        deps.registry.upsert({ ...session, driver: "pi", status: "idle" });
         return { attached: true, sessionKey: key, agent: session.agent };
       });
 

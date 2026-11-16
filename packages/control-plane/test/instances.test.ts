@@ -43,3 +43,19 @@ test("unfinished 列出上次未收尾的实例，finish 只收尾本实例行",
   assert.equal(current.get(previous.id)?.endedAt, null);
   assert.equal(current.get(info.id)?.endedAt, "2026-11-16T00:01:00.000Z");
 });
+
+test("closeStale 只补历史未完成实例的 ended_at，可重复调用", () => {
+  const db = openDb(":memory:");
+  migrate(db);
+  const t0 = Date.parse("2026-11-16T00:00:00.000Z");
+  let clock = t0;
+  const previous = new InstanceStore(db, { pid: 1, host: "host-a", now: () => clock }).begin();
+  clock += 60_000;
+  const currentStore = new InstanceStore(db, { pid: 2, host: "host-b", now: () => clock });
+  const current = currentStore.begin();
+
+  assert.equal(currentStore.closeStale(), 1);
+  assert.equal(currentStore.get(previous.id)?.endedAt, "2026-11-16T00:01:00.000Z");
+  assert.equal(currentStore.get(current.id)?.endedAt, null);
+  assert.equal(currentStore.closeStale(), 0);
+});

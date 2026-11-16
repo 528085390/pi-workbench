@@ -16,7 +16,9 @@ import type { SessionCaps, SessionEvent, SessionRef } from "@pi-workbench/shared
 import type { FastifyInstance } from "fastify";
 
 import type { AgentAdapter } from "../src/adapters/types.ts";
-import { CLAUDE_CAPABILITIES } from "../src/capabilities.ts";
+import type { AgentDriver } from "../src/agents/types.ts";
+import { AgentRouter } from "../src/agents/router.ts";
+import { CLAUDE_BACKGROUND_CAPABILITIES, CLAUDE_CAPABILITIES } from "../src/capabilities.ts";
 import { CheckpointStore } from "../src/checkpoints.ts";
 import { ReadCursorStore } from "../src/cursors.ts";
 import type { Config } from "../src/config.ts";
@@ -131,6 +133,8 @@ type BundleOptions = {
   storeFactory?: (db: DatabaseSync) => EventStore;
   /** 500 路径的内部错误收集器（Fastify logger:false 时 app.log.error 是 no-op） */
   logError?: (error: unknown) => void;
+  /** 需要走 /agents 或 attach 的用例注入注册表 */
+  router?: AgentRouter;
 };
 
 function makeBundle(opts: BundleOptions = {}): Bundle {
@@ -169,6 +173,7 @@ function makeBundle(opts: BundleOptions = {}): Bundle {
     cursors,
     readTranscript: opts.readTranscript,
     logError: opts.logError,
+    ...(opts.router === undefined ? {} : { router: opts.router }),
   };
 
   return {
@@ -1434,6 +1439,48 @@ test("读语义：GET /unread 默认只读不推进（peek），ack=1 才推进�
     const after = await h.app.inject({ method: "GET", url: API + "/sessions?clientId=pi:1" });
     assert.equal(after.json<{ unread: number }[]>()[0]?.unread, 3, "已读 2 条 → 剩 3 条");
     assert.equal(after.json<{ lastReadCursor: string }[]>()[0]?.lastReadCursor, "2");
+  } finally {
+    await h.close();
+  }
+});
+
+test("attach 成功后恢复 driver=pi 且 status=idle（spec §7.1）", async () => {
+  const calls: string[] = [];
+  const router = new AgentRouter();
+  const driver: AgentDriver = {
+    agent: "claude",
+    caps: CLAUDE_BACKGROUND_CAPABILITIES,
+    discover: async () => [],
+    attach: async () => {
+      calls.push("attach");
+    },
+    inject: async () => ({ messageId: "m-1", effective: "now" }),
+    interrupt: async () => ({ stopReason: "cancelled" }),
+    resume: async () => {},
+    handoff: async () => ({ command: ["claude", "attach", "sess-1"], mode: "attach" }),
+    onUpdate: () => () => {},
+    dispose: async () => {},
+  };
+  router.register(driver);
+
+  const h = await makeHarness({
+    router,
+    seed: [
+      sessionRef({
+        status: "unknown",
+        driver: "none",
+        capabilities: CLAUDE_BACKGROUND_CAPABILITIES,
+        kind: "background",
+      }),
+    ],
+  });
+  try {
+    const res = await h.app.inject({ method: "POST", url: SESSIONS + "/attach" });
+    assert.equal(res.statusCode, 200, res.body);
+    assert.deepEqual(res.json(), { attached: true, sessionKey: SESSION_KEY, agent: "claude" });
+    assert.deepEqual(calls, ["attach"]);
+    assert.equal(h.registry.get(SESSION_KEY)?.driver, "pi");
+    assert.equal(h.registry.get(SESSION_KEY)?.status, "idle");
   } finally {
     await h.close();
   }
