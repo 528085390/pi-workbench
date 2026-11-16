@@ -493,18 +493,21 @@ export class TakeoverEngine {
 
     // C1 / C2：INSERT OR IGNORE 原子占位，同 key 并发只有一个赢家
     const { record, created } = this.#dispatches.reserve(idempotencyKey, hash, new Date(this.#now()));
+    // 普通预留的 claimToken 为 null；回收赢家会从记录里拿到新换发的 claim token。
+    let claimToken: string | null = record.sessionKey;
     if (!created) {
       const outcome = await this.#resolveReserved(record, hash, idempotencyKey);
       if (outcome.kind === "ref") {
         return outcome.ref;
       }
       // kind === "retry"：本调用赢下超时回收，继续走下面的 newSession 路径
+      claimToken = outcome.claimToken;
     }
 
     // C02：newSession 可能超过 reserved TTL；按 TTL/3 续约，避免被并发调用回收后重复执行。
     const renew = setInterval(() => {
       try {
-        this.#dispatches.touch(idempotencyKey, new Date(this.#now()));
+        this.#dispatches.touch(idempotencyKey, new Date(this.#now()), claimToken ?? undefined);
       } catch {
         // 续约失败下个周期重试；真丢了预留会被 complete/fail 的 fencing 拦住
       }
@@ -529,7 +532,7 @@ export class TakeoverEngine {
         sessionId = opened.sessionId;
       }
     } catch (err) {
-      throw this.#dispatchFailed(idempotencyKey, "newSession", err);
+      throw this.#dispatchFailed(idempotencyKey, "newSession", err, claimToken ?? undefined);
     } finally {
       clearInterval(renew);
     }
@@ -570,17 +573,18 @@ export class TakeoverEngine {
     // Minor（round 2）：newSession 已经成功，之后任一步失败都必须先回收 adapter 侧会话，
     // 再把幂等键标成 failed —— 否则会话泄漏在 adapter 里，且这个 key 永远停在 reserved。
     try {
-      this.#registry.upsert(ref);
-      // C02：先写 dispatch_key（唯一索引兜底防双会话），再把幂等记录标成 done；
-      // 等待方（并发 / 重启 / 回收）才能按 key 复用或补记。
-      this.#registry.setDispatchKey(ref.key, idempotencyKey, new Date(this.#now()));
-      if (!this.#dispatches.complete(idempotencyKey, ref.key, new Date(this.#now()))) {
+      // C02 fix 2：落库前再确认一次预留归属。旧 owner 被回收后没有 claim token，必须在
+      // 写 registry / sessions.dispatch_key 之前退出；否则它会先占用唯一索引，导致回收赢家撞键。
+      if (!this.#dispatches.touch(idempotencyKey, new Date(this.#now()), claimToken ?? undefined)) {
         throw new WorkbenchError(
           "E_DISPATCH_IN_PROGRESS",
-          "dispatch 预留已被回收，拒绝覆盖： " + idempotencyKey,
+          "dispatch 预留已被回收，拒绝落库： " + idempotencyKey,
           { idempotencyKey },
         );
       }
+      this.#registry.upsert(ref);
+      // C02：先写 dispatch_key（唯一索引兜底防双会话），等待方（并发 / 重启 / 回收）才能按 key 复用。
+      this.#registry.setDispatchKey(ref.key, idempotencyKey, new Date(this.#now()));
 
       this.#store.append({
         sessionKey: ref.key,
@@ -591,6 +595,16 @@ export class TakeoverEngine {
       });
       // M6：dispatch 让会话进入 running，除 notice 外再发一条 state_update，按状态分发的消费者才看得到
       this.#appendState(ref, { state: "running", driver: "pi", kind: "dispatch", idempotencyKey }, "dispatch");
+
+      // C02 fix 2：事件落库成功后才标 done。若 append/appendState 抛错，记录仍是 reserved，
+      // 失败路径才能落 failed，重试不会拿到指向已关闭会话的 done 记录。
+      if (!this.#dispatches.complete(idempotencyKey, ref.key, new Date(this.#now()), claimToken ?? undefined)) {
+        throw new WorkbenchError(
+          "E_DISPATCH_IN_PROGRESS",
+          "dispatch 预留已被回收，拒绝覆盖： " + idempotencyKey,
+          { idempotencyKey },
+        );
+      }
     } catch (err) {
       await this.#discardRef(ref, driver);
       // Minor（round 3 / N1）：adapter 会话已经关掉，会话行不能继续停在 running 指向它 ——
@@ -604,7 +618,7 @@ export class TakeoverEngine {
       } catch {
         // 状态回收失败不影响止损：幂等记录仍会被标成 failed
       }
-      throw this.#dispatchFailed(idempotencyKey, "upsert/attach", err);
+      throw this.#dispatchFailed(idempotencyKey, "upsert/attach", err, claimToken ?? undefined);
     }
 
     try {
@@ -825,7 +839,7 @@ export class TakeoverEngine {
     record: DispatchRecord,
     hash: string,
     idempotencyKey: string,
-  ): Promise<{ kind: "ref"; ref: SessionRef } | { kind: "retry" }> {
+  ): Promise<{ kind: "ref"; ref: SessionRef } | { kind: "retry"; claimToken: string | null }> {
     if (record.payloadHash !== hash) {
       throw new WorkbenchError("E_IDEMPOTENCY_CONFLICT", "幂等键已用于另一个任务：" + idempotencyKey, {
         idempotencyKey,
@@ -836,7 +850,7 @@ export class TakeoverEngine {
     if (current.status === "failed") {
       // C02：failed + 同 payload 允许原子重试（failed→reserved，清 session_key/error、重置时间戳）。
       if (this.#dispatches.retryFailed(idempotencyKey, new Date(this.#now()))) {
-        return { kind: "retry" };
+        return this.#retryOutcome(idempotencyKey);
       }
       const latest = this.#dispatches.get(idempotencyKey);
       if (latest === null) {
@@ -866,13 +880,45 @@ export class TakeoverEngine {
     // 命中就直接补记 done 并返回，绝不重复 newSession。
     const linked = this.#registry.findByDispatchKey(idempotencyKey);
     if (linked !== null) {
-      this.#dispatches.complete(idempotencyKey, linked.key, new Date(this.#now()));
-      return { kind: "ref", ref: linked };
+      // C02 fix 2：补记 done 也必须过 fencing；false 说明预留已被回收/改属，不能返回旧会话。
+      if (
+        this.#dispatches.complete(
+          idempotencyKey,
+          linked.key,
+          new Date(this.#now()),
+          current.sessionKey ?? undefined,
+        )
+      ) {
+        return { kind: "ref", ref: linked };
+      }
+      const latest = this.#dispatches.get(idempotencyKey);
+      if (latest === null) {
+        throw new WorkbenchError("E_ADAPTER_DOWN", "dispatch 的预留记录在补记时消失： " + idempotencyKey, {
+          idempotencyKey,
+        });
+      }
+      if (latest.payloadHash !== hash) {
+        throw new WorkbenchError("E_IDEMPOTENCY_CONFLICT", "幂等键已用于另一个任务： " + idempotencyKey, {
+          idempotencyKey,
+          sessionKey: latest.sessionKey,
+        });
+      }
+      if (latest.status === "done") {
+        return { kind: "ref", ref: this.#refOf(latest, idempotencyKey) };
+      }
+      if (latest.status === "failed") {
+        throw dispatchFailedError(idempotencyKey, latest.error);
+      }
+      throw new WorkbenchError(
+        "E_DISPATCH_IN_PROGRESS",
+        "dispatch 预留已被回收，拒绝复用旧会话： " + idempotencyKey,
+        { idempotencyKey },
+      );
     }
 
     // reserved：另一个调用方正在跑 newSession；只有超 TTL 的预留才允许回收（C02）。
     if (this.#dispatches.reclaim(idempotencyKey, this.#dispatchTtlMs, new Date(this.#now()))) {
-      return { kind: "retry" };
+      return this.#retryOutcome(idempotencyKey);
     }
     // Minor（round 2）：不再用墙钟 Date.now 算截止时间 —— 改成「次数 × 间隔」封顶，
     // 时间源就只剩 deps.now，注入固定时钟时这个循环也不会永远退不出去。
@@ -899,10 +945,21 @@ export class TakeoverEngine {
       }
       // 等待期间预留可能刚好过期：再抢一次，赢家继续 newSession
       if (this.#dispatches.reclaim(idempotencyKey, this.#dispatchTtlMs, new Date(this.#now()))) {
-        return { kind: "retry" };
+        return this.#retryOutcome(idempotencyKey);
       }
     }
     throw new WorkbenchError("E_DISPATCH_IN_PROGRESS", "dispatch 仍在进行中：" + idempotencyKey, { idempotencyKey });
+  }
+
+  /** 回收/重试赢家重新读取 claim token（reclaim 会换发；retryFailed 清空为 null）。 */
+  #retryOutcome(idempotencyKey: string): { kind: "retry"; claimToken: string | null } {
+    const record = this.#dispatches.get(idempotencyKey);
+    if (record === null) {
+      throw new WorkbenchError("E_ADAPTER_DOWN", "dispatch 的预留记录在回收后消失： " + idempotencyKey, {
+        idempotencyKey,
+      });
+    }
+    return { kind: "retry", claimToken: record.sessionKey };
   }
 
   /** 幂等命中：会话必须仍在注册表里，否则是库与注册表不一致（C1） */
@@ -925,9 +982,26 @@ export class TakeoverEngine {
   }
 
   /** newSession / upsert 失败：先落 failed 记录再抛（C1），同键后续调用不会永远停在 reserved */
-  #dispatchFailed(idempotencyKey: string, where: string, err: unknown): WorkbenchError {
+  #dispatchFailed(
+    idempotencyKey: string,
+    where: string,
+    err: unknown,
+    claimToken?: string,
+  ): WorkbenchError {
     const message = err instanceof Error ? err.message : String(err);
-    this.#dispatches.fail(idempotencyKey, where + "：" + message, new Date(this.#now()));
+    const marked = this.#dispatches.fail(
+      idempotencyKey,
+      where + "：" + message,
+      new Date(this.#now()),
+      claimToken,
+    );
+    if (!marked) {
+      return new WorkbenchError(
+        "E_DISPATCH_IN_PROGRESS",
+        "dispatch 预留已失效，失败未落库（" + where + "）： " + message,
+        { idempotencyKey, cause: message },
+      );
+    }
     if (isWorkbenchError(err)) {
       return err;
     }

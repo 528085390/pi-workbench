@@ -166,3 +166,30 @@ test("pruneStaleReserved 只删过期 reserved", () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("reclaim 换发 claim token：旧 owner 的 complete/fail/touch 全部失效（fencing）", () => {
+  const { db, dir } = fresh();
+  try {
+    const store = new DispatchStore(db);
+    store.reserve("k-reclaim-fence", "h", new Date("2026-11-17T00:00:00.000Z"));
+    assert.equal(store.reclaim("k-reclaim-fence", 120_000, new Date("2026-11-17T00:02:01.000Z")), true);
+
+    const claim = store.get("k-reclaim-fence")?.sessionKey;
+    assert.ok(claim != null && claim.length > 0, "reclaim 必须换发 claim token");
+
+    assert.equal(store.complete("k-reclaim-fence", "claude:stale"), false, "旧 owner 不能落 done");
+    assert.equal(store.fail("k-reclaim-fence", "late failure"), false, "旧 owner 不能落 failed");
+    store.touch("k-reclaim-fence", new Date("2026-11-17T00:02:30.000Z"));
+    assert.equal(store.get("k-reclaim-fence")?.updatedAt, "2026-11-17T00:02:01.000Z", "旧 owner 不能续约");
+
+    assert.equal(
+      store.complete("k-reclaim-fence", "claude:fresh", new Date("2026-11-17T00:03:00.000Z"), claim ?? undefined),
+      true,
+      "回收赢家凭 claim token 才能落 done",
+    );
+    assert.equal(store.get("k-reclaim-fence")?.sessionKey, "claude:fresh");
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

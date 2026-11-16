@@ -4,6 +4,7 @@
  * 语义：`reserve` 用 INSERT OR IGNORE 做**原子占位**，同 key 并发只有一个赢家；
  * 赢家继续 newSession，输家读到已有记录按 payload hash 判定冲突或复用。
  */
+import { randomUUID } from "node:crypto";
 import type { DatabaseSync, StatementSync } from "node:sqlite";
 
 export type DispatchStatus = "reserved" | "done" | "failed";
@@ -81,15 +82,39 @@ export class DispatchStore {
     return row === undefined ? null : toRecord(row);
   }
 
-  /** 只有仍持有 reserved 预留的调用者才能落 done（ fencing，防止覆盖已被回收/完成的记录）。 */
-  complete(idempotencyKey: string, sessionKey: string, now = new Date()): boolean {
-    const result = this.#completes().run("done", sessionKey, null, now.toISOString(), idempotencyKey);
+  /**
+   * 只有仍持有 reserved 预留的调用者才能落 done（fencing，防止覆盖已被回收/完成的记录）。
+   * 普通预留的 session_key 为 NULL；被回收过的预留会换发 claim token，旧 owner 不复权。
+   */
+  complete(
+    idempotencyKey: string,
+    sessionKey: string,
+    now = new Date(),
+    claimToken?: string,
+  ): boolean {
+    const result = this.#completes().run(
+      "done",
+      sessionKey,
+      null,
+      now.toISOString(),
+      idempotencyKey,
+      claimToken ?? null,
+      claimToken ?? null,
+    );
     return Number(result.changes) === 1;
   }
 
   /** 只有仍持有 reserved 预留的调用者才能落 failed（fencing，防止覆盖 done）。 */
-  fail(idempotencyKey: string, reason: string, now = new Date()): boolean {
-    const result = this.#completes().run("failed", null, reason, now.toISOString(), idempotencyKey);
+  fail(idempotencyKey: string, reason: string, now = new Date(), claimToken?: string): boolean {
+    const result = this.#completes().run(
+      "failed",
+      null,
+      reason,
+      now.toISOString(),
+      idempotencyKey,
+      claimToken ?? null,
+      claimToken ?? null,
+    );
     return Number(result.changes) === 1;
   }
 
@@ -102,18 +127,25 @@ export class DispatchStore {
 
   /**
    * 回收超 TTL 的 reserved：只有一条原子 UPDATE 抢到才算赢家（changes === 1）。
+   * 同时换发 claim token 写回 session_key —— 旧 owner 的 complete/fail/touch 会因此 no-op。
    * 赢家负责重新 newSession；输家继续轮询。
    */
   reclaim(idempotencyKey: string, ttlMs: number, now = new Date()): boolean {
     const cutoff = new Date(now.getTime() - ttlMs).toISOString();
     const ts = now.toISOString();
-    const result = this.#reclaim().run(ts, ts, idempotencyKey, cutoff);
+    const result = this.#reclaim().run(randomUUID(), ts, ts, idempotencyKey, cutoff);
     return Number(result.changes) === 1;
   }
 
-  /** 续约 reserved 预留窗口（长 newSession 心跳）。 */
-  touch(idempotencyKey: string, now = new Date()): void {
-    this.#touch().run(now.toISOString(), idempotencyKey);
+  /** 续约 reserved 预留窗口；被回收后旧 owner 没有 claim token，不能续约。返回是否续约成功。 */
+  touch(idempotencyKey: string, now = new Date(), claimToken?: string): boolean {
+    const result = this.#touch().run(
+      now.toISOString(),
+      idempotencyKey,
+      claimToken ?? null,
+      claimToken ?? null,
+    );
+    return Number(result.changes) === 1;
   }
 
   /** 删除超过保留期的 done/failed 记录，返回删除行数；同一事务清掉对应 sessions.dispatch_key。 */
@@ -149,7 +181,7 @@ export class DispatchStore {
 
   #completes(): StatementSync {
     this.#completesStmt ??= this.#db.prepare(
-      "UPDATE dispatches SET status = ?, session_key = ?, error = ?, updated_at = ? WHERE idempotency_key = ? AND status = 'reserved'",
+      "UPDATE dispatches SET status = ?, session_key = ?, error = ?, updated_at = ? WHERE idempotency_key = ? AND status = 'reserved' AND ((session_key IS NULL AND ? IS NULL) OR session_key = ?)",
     );
     return this.#completesStmt;
   }
@@ -163,14 +195,14 @@ export class DispatchStore {
 
   #reclaim(): StatementSync {
     this.#reclaimStmt ??= this.#db.prepare(
-      "UPDATE dispatches SET status = 'reserved', created_at = ?, updated_at = ? WHERE idempotency_key = ? AND status = 'reserved' AND updated_at <= ?",
+      "UPDATE dispatches SET status = 'reserved', session_key = ?, created_at = ?, updated_at = ? WHERE idempotency_key = ? AND status = 'reserved' AND updated_at <= ?",
     );
     return this.#reclaimStmt;
   }
 
   #touch(): StatementSync {
     this.#touchStmt ??= this.#db.prepare(
-      "UPDATE dispatches SET updated_at = ? WHERE idempotency_key = ? AND status = 'reserved'",
+      "UPDATE dispatches SET updated_at = ? WHERE idempotency_key = ? AND status = 'reserved' AND ((session_key IS NULL AND ? IS NULL) OR session_key = ?)",
     );
     return this.#touchStmt;
   }

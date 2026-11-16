@@ -972,6 +972,127 @@ test("dispatch: 两个并发调用同时回收超时预留，只有一个 newSes
   }
 });
 
+test("dispatch: 慢 newSession 被回收后旧 owner 不能落库或占用 dispatch_key（C02 fix 2）", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let firstEnteredResolve!: () => void;
+  let secondEnteredResolve!: () => void;
+  const firstEntered = new Promise<void>((resolve) => {
+    firstEnteredResolve = resolve;
+  });
+  const secondEntered = new Promise<void>((resolve) => {
+    secondEnteredResolve = resolve;
+  });
+  let entries = 0;
+  const h = fresh({
+    dispatchReservedTtlMs: 60,
+    newSessionGate: gate,
+    newSessionIds: ["sess-stale", "sess-fresh"],
+    onNewSession: () => {
+      entries += 1;
+      if (entries === 1) firstEnteredResolve();
+      if (entries === 2) secondEnteredResolve();
+    },
+  });
+  try {
+    // 只让「没有 claim token 的旧 owner」续约失败；回收赢家仍可用新 token 续约。
+    const originalTouch = h.dispatches.touch.bind(h.dispatches);
+    h.dispatches.touch = (idempotencyKey, now, claimToken): boolean => {
+      if (claimToken === undefined) return false;
+      return originalTouch(idempotencyKey, now, claimToken);
+    };
+
+    const input = { agent: "claude" as const, task: "旧 owner fencing", cwd: CWD, idempotencyKey: "idem-stale-owner" };
+    const stale = h.engine.dispatch(input);
+    await firstEntered;
+    h.clock.advance(60_000);
+    const winner = h.engine.dispatch(input);
+    await secondEntered;
+    release();
+
+    const [a, b] = await Promise.allSettled([stale, winner]);
+    assert.equal(a.status, "rejected");
+    if (a.status === "rejected") {
+      assert.ok(isWorkbenchError(a.reason));
+      assert.equal(a.reason.code, "E_DISPATCH_IN_PROGRESS", "旧 owner 必须被 fencing 拒绝");
+    }
+    assert.equal(b.status, "fulfilled");
+    if (b.status === "fulfilled") {
+      assert.equal(b.value.key, "claude:sess-fresh", "回收赢家拿到新会话");
+    }
+    assert.deepEqual(h.fake.argsOf("close"), [["sess-stale"]], "旧会话必须被回收");
+    assert.equal(h.dispatches.get(input.idempotencyKey)?.sessionKey, "claude:sess-fresh");
+    const staleRow = h.db.prepare("SELECT dispatch_key FROM sessions WHERE key = ?").get("claude:sess-stale") as
+      | { dispatch_key?: string | null }
+      | undefined;
+    assert.equal(staleRow?.dispatch_key ?? null, null, "旧 owner 不得占用 sessions.dispatch_key");
+  } finally {
+    release();
+    h.close();
+  }
+});
+
+test("dispatch: append 抛错 → 不落 done，回收会话并落 failed，同键重试可建新会话（C02 fix 2）", async () => {
+  const h = fresh({ newSessionIds: ["sess-append-old", "sess-append-new"] });
+  try {
+    const originalAppend = h.store.append.bind(h.store);
+    let firstAppend = true;
+    h.store.append = (event) => {
+      if (firstAppend) {
+        firstAppend = false;
+        throw new Error("append boom");
+      }
+      return originalAppend(event);
+    };
+
+    const input = { agent: "claude" as const, task: "事件落库失败", cwd: CWD, idempotencyKey: "idem-append-fail" };
+    await expectRejectCode(() => h.engine.dispatch(input), "E_ADAPTER_DOWN");
+
+    assert.deepEqual(h.fake.argsOf("close"), [["sess-append-old"]], "必须回收刚起的会话");
+    assert.equal(h.registry.get("claude:sess-append-old")?.status, "idle", "会话行不能停在 running");
+    const failed = h.dispatches.get(input.idempotencyKey);
+    assert.equal(failed?.status, "failed", "append 失败时幂等记录不能停在 done");
+    assert.equal(failed?.sessionKey, null, "失败记录不能指向已关闭会话");
+    assert.ok((failed?.error ?? "").includes("append boom"), "失败原因要落库：" + String(failed?.error));
+
+    const retried = await h.engine.dispatch(input);
+    assert.equal(retried.key, "claude:sess-append-new", "同键重试必须新建会话");
+    assert.equal(h.fake.count("newSession"), 2);
+    assert.equal(h.dispatches.get(input.idempotencyKey)?.status, "done");
+  } finally {
+    h.close();
+  }
+});
+
+test("dispatch: linked 分支 complete 失败时不返回陈旧 ref（C02 fix 2）", async () => {
+  const h = fresh();
+  try {
+    const input = { agent: "claude" as const, task: "linked fencing", cwd: CWD, idempotencyKey: "idem-linked-fence" };
+    h.registry.upsert(makeRef({ key: "claude:sess-linked", nativeId: "sess-linked", status: "idle" }));
+    h.registry.setDispatchKey("claude:sess-linked", input.idempotencyKey, new Date(h.clock.now()));
+    h.dispatches.reserve(input.idempotencyKey, dispatchHash(input.agent, input.task, input.cwd), new Date(h.clock.now()));
+    h.dispatches.complete = (): boolean => false;
+
+    await expectRejectCode(() => h.engine.dispatch(input), "E_DISPATCH_IN_PROGRESS");
+    assert.equal(h.fake.count("newSession"), 0, "linked 分支失败时不得抢跑 newSession");
+  } finally {
+    h.close();
+  }
+});
+
+test("dispatch: fail 返回 false 时抛 E_DISPATCH_IN_PROGRESS，不伪装失败已落库（C02 fix 2）", async () => {
+  const h = fresh({ newSessionError: new Error("spawn failed") });
+  try {
+    h.dispatches.fail = (): boolean => false;
+    const input = { agent: "claude" as const, task: "fail fencing", cwd: CWD, idempotencyKey: "idem-fail-fence" };
+    await expectRejectCode(() => h.engine.dispatch(input), "E_DISPATCH_IN_PROGRESS");
+  } finally {
+    h.close();
+  }
+});
+
 test("dispatch: pruneRetained 清理幂等记录时同步清 sessions.dispatch_key，24h 后可复用同 key（C02 fix）", async () => {
   const h = fresh({ newSessionIds: ["sess-prune-1", "sess-prune-2"] });
   try {
