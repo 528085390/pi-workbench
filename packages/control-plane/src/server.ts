@@ -14,7 +14,7 @@
  */
 import { timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
-import { isAbsolute } from "node:path";
+import { isAbsolute, join } from "node:path";
 
 import type { Checkpoint, Driver, SessionCaps, SessionEvent, SessionRef, UnifiedMessage } from "@pi-workbench/shared";
 import { WORKBENCH_VERSION } from "@pi-workbench/shared";
@@ -25,6 +25,7 @@ import type { FastifyError, FastifyInstance, FastifyRequest } from "fastify";
 import type { AdapterUpdate, AgentAdapter } from "./adapters/types.ts";
 import type { AgentRouter } from "./agents/router.ts";
 import type { AgentStatus } from "./agents/types.ts";
+import { loadAssets } from "./assets.ts";
 import type { AuditStore } from "./audit.ts";
 import { capsOf, CLAUDE_CAPABILITIES } from "./capabilities.ts";
 import type { CheckpointStore } from "./checkpoints.ts";
@@ -91,6 +92,8 @@ export type ServerDeps = {
    * 生产装配可显式注入以便共享 / 观测。
    */
   writeQueue?: SessionWriteQueue;
+  /** C05 资产清单文件；缺省用 config.home/assets.json（index.ts 显式注入 paths.home 拼出的路径） */
+  assetsPath?: string;
   readTranscript?: ServerTranscriptReader;
   /**
    * GET /agents 的动态数据源（启动探测 / 周期刷新）。
@@ -159,6 +162,7 @@ export const STATUS_BY_CODE: Readonly<Record<WorkbenchErrorCode, number>> = {
   E_IDEMPOTENCY_CONFLICT: 409,
   E_DISPATCH_IN_PROGRESS: 409,
   E_SESSION_BUSY: 429,
+  E_ASSET_CONFIG_INVALID: 400,
   E_CAP_UNSUPPORTED: 422,
   E_AGENT_UNAVAILABLE: 422,
   E_ADAPTER_DOWN: 503,
@@ -413,6 +417,9 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
             }) ?? [],
         };
       });
+
+      // C05 资产只读清单（spec §7.5）：不写回、不做双向同步、不启动 MCP server。
+      api.get("/assets", async () => loadAssets(deps.assetsPath ?? join(config.home, "assets.json")));
 
       // 0.5-B B08（评审 M4）：发现层必须有产品出口，否则用户无法让 daemon 认识既有原生会话。
       // GET /sessions/discover?agent=codex&cwd=...&limit=... → 发现并登记（幂等 upsert），返回登记后的 SessionRef。

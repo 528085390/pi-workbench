@@ -524,6 +524,7 @@ export async function main(): Promise<void> {
       checkpoints,
       cursors,
       audit,
+      assetsPath: join(config.home, "assets.json"),
       pipeline,
     });
   } catch (err) {
