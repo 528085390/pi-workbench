@@ -195,6 +195,44 @@ export class TakeoverEngine {
   }
 
   /**
+   * 懒解析并持久化 transcript 路径。
+   *
+   * Codex ACP 的 rollout 文件在 session/new 返回后才落盘，dispatch 时的一次性解析会
+   * 抢在文件创建前失败；如果只把路径缓存在 driver 内部，sessions 表仍是 NULL，
+   * /sessions 的 unread 就会恒为 0，回合结束通知也会被当成「已经读完」丢掉。
+   * 这里在读取列表 / 未读 / transcript 前给驱动一次补解析机会，并把结果写回注册表。
+   */
+  async refreshTranscriptPath(key: string): Promise<string | undefined> {
+    const ref = this.#requireSession(key);
+    const existing = ref.transcriptPath;
+    if (existing !== undefined && existing.length > 0) {
+      return existing;
+    }
+    const driver = this.#driverOf(ref);
+    if (driver === null) {
+      return undefined;
+    }
+    const resolve = (driver as DriverRuntime).resolveTranscriptPath;
+    if (resolve === undefined) {
+      return undefined;
+    }
+    try {
+      const path = await resolve.call(driver, ref);
+      if (path === undefined || path.trim().length === 0) {
+        return undefined;
+      }
+      const normalized = path.trim();
+      const current = this.#registry.get(key);
+      if (current !== null && (current.transcriptPath === undefined || current.transcriptPath.length === 0)) {
+        this.#registry.upsert({ ...current, transcriptPath: normalized });
+      }
+      return normalized;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
    * 投递一条用户消息。回合进行中（status=running）的注入不改变当前回合，
    * 只在下一个 turn 边界生效 —— 响应据此标 effective: next_turn（spec §11 降级口径）。
    */

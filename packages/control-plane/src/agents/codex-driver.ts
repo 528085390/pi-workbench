@@ -256,12 +256,12 @@ export class CodexDriver implements AgentDriver {
   // ---- 供 T8 / e2e 使用的扩展入口（不属于 AgentDriver 六方法，但同属 Codex 驱动能力） ----
 
   /** 让 T8 的 dispatch 路径能开 ACP 新会话；返回 codex 原生 thread id */
-  async newSession(cwd: string): Promise<{ sessionId: string }> {
+  async newSession(cwd: string): Promise<{ sessionId: string; transcriptPath?: string }> {
     this.#assertLive("newSession");
     const adapter = await this.#ensureAdapter();
     const { sessionId } = await adapter.newSession(cwd);
     this.#activeSessions.add(sessionId);
-    await this.resolveTranscriptPath({
+    const ref: SessionRef = {
       key: "codex:" + sessionId,
       agent: "codex",
       nativeId: sessionId,
@@ -270,8 +270,11 @@ export class CodexDriver implements AgentDriver {
       driver: "pi",
       capabilities: this.caps,
       kind: "interactive",
-    });
-    return { sessionId };
+    };
+    const transcriptPath = await this.resolveTranscriptPath(ref);
+    return transcriptPath === undefined || transcriptPath.length === 0
+      ? { sessionId }
+      : { sessionId, transcriptPath };
   }
 
   async waitForTurn(ref: SessionRef, timeoutMs: number = DEFAULT_CODEX_TURN_TIMEOUT_MS): Promise<{ stopReason: string }> {

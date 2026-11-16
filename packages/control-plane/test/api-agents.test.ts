@@ -72,6 +72,7 @@ function makeFake(): Fake {
 type DriverOverrides = Partial<AgentDriver> & {
   newSession?: (cwd: string) => Promise<{ sessionId: string }>;
   close?: (ref: SessionRef) => Promise<void>;
+  resolveTranscriptPath?: (ref: SessionRef) => Promise<string | undefined>;
 };
 type DriverBox = { driver: AgentDriver; calls: string[] };
 function makeDriver(agent: AgentName, caps: SessionCaps, overrides: DriverOverrides = {}): DriverBox {
@@ -502,6 +503,48 @@ test("Pi 的 inject/interrupt/handoff/handback 在共享 LeaseManager 上临时�
     assert.equal(returned.statusCode, 200, returned.body);
     assert.equal(h.leases.current(key)?.clientId, "pi:7", "handback 后租约回到扩展身份");
     assert.deepEqual(holders, ["pi", "pi", "pi", "pi"], "每次写操作 driver 内部看到的租约持有人都必须是 pi");
+  } finally {
+    await h.close();
+  }
+});
+
+test("GET /sessions 会补解析 Codex 的 transcriptPath 并计算 unread（唤醒修复）", async () => {
+  let resolves = 0;
+  const codex = makeDriver("codex", CODEX_CAPABILITIES, {
+    resolveTranscriptPath: async () => {
+      resolves += 1;
+      return CODEX_SAMPLE;
+    },
+  });
+  const h = await makeHarness({
+    drivers: [{ driver: codex.driver }],
+    seed: [sessionRef("codex", "sess-lazy")],
+  });
+  try {
+    const first = await h.app.inject({ method: "GET", url: API + "/sessions?clientId=pi:7" });
+    assert.equal(first.statusCode, 200, first.body);
+    const rows = first.json<Array<SessionRef & { unread: number }>>();
+    const row = rows.find((item) => item.key === "codex:sess-lazy");
+    assert.ok(row, "列表应包含补解析的 codex 会话");
+    assert.equal(row.transcriptPath, CODEX_SAMPLE, "读取列表时应把懒解析路径写回会话");
+    assert.ok(row.unread > 0, "路径补上后 unread 必须能读到真实消息数，否则 TurnNotifier 会丢弃回合结束事件");
+
+    const detail = await h.app.inject({
+      method: "GET",
+      url: API + "/sessions/" + encodeURIComponent("codex:sess-lazy") + "?clientId=pi:7",
+    });
+    assert.equal(detail.statusCode, 200, detail.body);
+    const detailSession = detail.json<{ session: SessionRef & { unread: number } }>().session;
+    assert.equal(detailSession.transcriptPath, CODEX_SAMPLE);
+    assert.ok(detailSession.unread > 0);
+
+    const unread = await h.app.inject({
+      method: "GET",
+      url: API + "/sessions/" + encodeURIComponent("codex:sess-lazy") + "/unread?clientId=pi:7",
+    });
+    assert.equal(unread.statusCode, 200, unread.body);
+    assert.ok(unread.json<{ unread: number }>().unread > 0);
+    assert.equal(resolves, 1, "路径已持久化后不应重复扫描 rollout");
   } finally {
     await h.close();
   }

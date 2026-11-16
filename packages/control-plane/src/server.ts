@@ -255,6 +255,23 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
     }
   };
 
+  /**
+   * 0.5-B 唤醒修复：Codex 的 rollout 路径可能在 dispatch 之后才落盘。
+   * 列表/未读/transcript 在路径为空时尝试让 engine 补解析一次，并更新注册表；
+   * 这样 unread 与 TurnNotifier 才能看到真实消息数，而不是永远为 0。
+   */
+  const ensureTranscriptPath = async (session: SessionRef): Promise<SessionRef> => {
+    const path = session.transcriptPath;
+    if (path !== undefined && path.length > 0) {
+      return session;
+    }
+    if (typeof deps.engine.refreshTranscriptPath !== "function") {
+      return session;
+    }
+    const resolved = await deps.engine.refreshTranscriptPath(session.key).catch(() => undefined);
+    return resolved === undefined || resolved.length === 0 ? session : { ...session, transcriptPath: resolved };
+  };
+
   const app = Fastify({ logger: false });
   const logError = deps.logError ?? ((error: unknown): void => { console.error("[pi-workbenchd] 未处理异常", error); });
 
@@ -388,7 +405,11 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         const sessions = deps.registry.list(filter);
         // 不带 clientId 时保持 v1 的形状（纯 SessionRef 数组），带则每项附读状态（spec §6.5）
         const clientId = optionalString(query, "clientId", ROUTE_LIST);
-        return clientId === undefined ? sessions : sessions.map((session) => viewOf(session, clientId));
+        if (clientId === undefined) {
+          return sessions;
+        }
+        const views = await Promise.all(sessions.map(async (session) => viewOf(await ensureTranscriptPath(session), clientId)));
+        return views;
       });
 
       // B08 M4：登记一个已存在的原生会话（发现结果 / 外部扫描器都走这里，不再直接写库）。
@@ -424,8 +445,9 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         const key = paramOf(request, "key");
         const session = requireSession(deps.registry, key);
         const clientId = optionalString(queryOf(request), "clientId", ROUTE_DETAIL);
+        const resolved = clientId === undefined ? session : await ensureTranscriptPath(session);
         return {
-          session: clientId === undefined ? session : viewOf(session, clientId),
+          session: clientId === undefined ? resolved : viewOf(resolved, clientId),
           lease: deps.leases.current(key),
         };
       });
@@ -436,18 +458,19 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         const query = queryOf(request);
         const after = optionalString(query, "after", ROUTE_TRANSCRIPT) ?? "0";
         const limit = optionalPositiveInt(query, "limit", ROUTE_TRANSCRIPT);
-        const path = session.transcriptPath;
+        const resolved = await ensureTranscriptPath(session);
+        const path = resolved.transcriptPath;
         if (path === undefined || path.length === 0) {
           // 0.5-B：Codex/Pi 的会话文件由各自驱动懒解析（spec §7.1）。路径未解析出来时
           // 委派 driver.see；驱动没有 see 或解析不到，才返回空页（游标停在调用方给的位置）。
-          const driver = deps.router?.get(session.agent) ?? null;
+          const driver = deps.router?.get(resolved.agent) ?? null;
           if (driver !== null && typeof driver.see === "function") {
-            const page = await driver.see(session, after, limit);
+            const page = await driver.see(resolved, after, limit);
             return { messages: page.messages, nextCursor: page.nextCursor, pending: page.pending };
           }
           return { messages: [] as UnifiedMessage[], nextCursor: after };
         }
-        const page = readPage(session.agent, path, after, limit);
+        const page = readPage(resolved.agent, path, after, limit);
         return { messages: page.messages, nextCursor: page.nextCursor };
       });
 
@@ -460,11 +483,12 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         const limit = optionalPositiveInt(query, "limit", ROUTE_UNREAD);
         const ack = optionalBoolean(query, "ack", ROUTE_UNREAD) ?? false;
         const lastReadCursor = deps.cursors.cursorOf(key, clientId);
-        const path = session.transcriptPath;
+        const resolved = await ensureTranscriptPath(session);
+        const path = resolved.transcriptPath;
         const page =
           path === undefined || path.length === 0
             ? { messages: [] as UnifiedMessage[], nextCursor: lastReadCursor, pending: true }
-            : readPage(session.agent, path, lastReadCursor, limit);
+            : readPage(resolved.agent, path, lastReadCursor, limit);
         if (ack) {
           deps.cursors.set(key, clientId, page.nextCursor);
         }
@@ -474,14 +498,14 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         const remaining =
           path === undefined || path.length === 0
             ? 0
-            : readToEnd(session.agent, path, baseCursor).messages.length;
+            : readToEnd(resolved.agent, path, baseCursor).messages.length;
         return {
           messages: page.messages,
           nextCursor: page.nextCursor,
           lastReadCursor: ack ? page.nextCursor : lastReadCursor,
           unread: remaining,
           pageCount: page.messages.length,
-          awaiting: session.status === "needs-input",
+          awaiting: resolved.status === "needs-input",
           acked: ack,
         };
       });
@@ -493,14 +517,15 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         const body = bodyOf(request.body, ROUTE_READ);
         const clientId = requireString(body, "clientId", ROUTE_READ);
         const explicit = optionalCursor(body, "cursor", ROUTE_READ);
+        const resolved = await ensureTranscriptPath(session);
         let target = explicit;
         if (target === undefined) {
-          const path = session.transcriptPath;
+          const path = resolved.transcriptPath;
           // B1：不给游标 = 读到 EOF（全部已读），不能用分页默认上限
           target =
             path === undefined || path.length === 0
               ? deps.cursors.cursorOf(key, clientId)
-              : readToEnd(session.agent, path, deps.cursors.cursorOf(key, clientId)).nextCursor;
+              : readToEnd(resolved.agent, path, deps.cursors.cursorOf(key, clientId)).nextCursor;
         }
         const cursor = deps.cursors.set(key, clientId, target);
         return { sessionKey: key, clientId: cursor.clientId, lastReadCursor: cursor.lastReadCursor, updatedAt: cursor.updatedAt };
