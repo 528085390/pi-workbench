@@ -247,3 +247,27 @@ test("同一 seq 重放不会二次唤醒", async () => {
   await notifier.flush();
   assert.equal(sent.length, 1);
 });
+
+test("唤醒预算 per-session：a 触顶后 b 的首次唤醒仍投递", async () => {
+  const { sent, sink } = recorder();
+  const notifier = new TurnNotifier({
+    sink,
+    now: () => NOW,
+    maxConsecutiveWakes: 2,
+    listSessions: async () => [session({ key: "claude:a", unread: 1 }), session({ key: "claude:b", unread: 1 })],
+  });
+
+  for (let index = 0; index < 2; index += 1) {
+    notifier.handleEvent({ seq: 100 + index, sessionKey: "claude:a", type: "state_update", payload: { status: "idle" }, ts: LATER });
+    await notifier.flush();
+  }
+  assert.equal(sent.length, 2, "a 用满自己的预算");
+  assert.equal(notifier.consecutiveWakes, 2);
+
+  notifier.handleEvent({ seq: 200, sessionKey: "claude:b", type: "state_update", payload: { status: "idle" }, ts: LATER });
+  await notifier.flush();
+  assert.equal(sent.length, 3, "b 的首次唤醒不得被 a 的预算挡住");
+  const content = (sent[2]!.message as { content: string }).content;
+  assert.match(content, /claude:b/);
+  assert.ok(!content.includes("claude:a"), "a 已触顶，不应混进 b 的唤醒消息");
+});

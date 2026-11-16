@@ -494,3 +494,27 @@ test("R18 未知会话: 所有 kind 都丢弃且不抛，每个会话只记一�
     h.close();
   }
 });
+
+test("会话隔离: 同一 adapter 挂两个会话，事件与状态各归各", () => {
+  const h = makeHarness({
+    seed: [
+      { key: "claude:sess-1", nativeId: "sess-1" },
+      { key: "claude:sess-2", nativeId: "sess-2" },
+    ],
+  });
+  try {
+    h.pipeline.attach(h.adapter, "claude:sess-1");
+    h.pipeline.attach(h.adapter, "claude:sess-2");
+
+    h.adapter.emit({ kind: "text", id: "a-1", text: "for a", sessionId: "sess-1" });
+    h.adapter.emit({ kind: "text", id: "b-1", text: "for b", sessionId: "sess-2" });
+    h.adapter.emit({ kind: "state", id: "b-idle", state: "idle", sessionId: "sess-2" });
+
+    assert.deepEqual(h.store.list("claude:sess-1").map((event) => event.payload), [{ text: "for a" }]);
+    assert.deepEqual(h.store.list("claude:sess-2").map((event) => event.type), ["token", "state_update"]);
+    assert.equal(h.registry.get("claude:sess-2")?.status, "idle", "state 只落到来源会话");
+    assert.equal(h.registry.get("claude:sess-1")?.status, "running", "另一个会话的状态不得被串改");
+  } finally {
+    h.close();
+  }
+});
