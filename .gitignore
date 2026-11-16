@@ -10,3 +10,4 @@ tmp/
 scratch/
 *.log
 .DS_Store
+AGENTS.md
