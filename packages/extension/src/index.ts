@@ -279,9 +279,9 @@ export function createWorkbenchClient(options: WorkbenchClientOptions = {}): Wor
   // 想跨进程保持同一"读者/租约持有人"（例如 Pi 常驻但每次重启都换 pid）就设环境变量。
   const clientId = options.clientId ?? process.env["PI_WORKBENCH_CLIENT_ID"] ?? `pi:${process.pid}`;
   const explicitToken = options.authToken ?? options.token;
-  // C2：daemon 侧历史上认 PI_WORKBENCH_AUTH_TOKEN（config.ts 的旧名），客户端只读 PI_WORKBENCH_TOKEN
-  // → 用旧名启动 daemon 时插件静默无鉴权。两个名字都认，主名仍是 PI_WORKBENCH_TOKEN。
-  const envToken = process.env["PI_WORKBENCH_TOKEN"] ?? process.env["PI_WORKBENCH_AUTH_TOKEN"];
+  // C2/R3：两个 token 环境变量都认，且**优先级必须与 daemon 一致**（config.ts 是 AUTH ?? TOKEN）——
+  // 否则双名同时存在且值不同时，daemon 用 AUTH 校验、客户端发 TOKEN → 401。
+  const envToken = process.env["PI_WORKBENCH_AUTH_TOKEN"] ?? process.env["PI_WORKBENCH_TOKEN"];
   const authToken = explicitToken ?? envToken ?? null;
   const doFetch: typeof fetch = options.fetch ?? fetch;
 
@@ -669,13 +669,14 @@ export function registerWorkbenchTools(
       type: "object",
       properties: {
         key: { type: "string", description: "会话 key（必填）" },
+        clientId: { type: "string", description: "Pi 重启后换 pid 时，用 handoff 前那个读者身份交回（可选）" },
       },
       required: ["key"],
     },
     handler: async (input: unknown): Promise<string> => {
       try {
         const key = requireField(input, "key");
-        const result = await client.handback(key);
+        const result = await client.handback(key, fieldOf(input, "clientId"));
         return "handback " + key + " (resumed=" + String(result.resumed) + "); 增量：\n" + result.deltaSummary;
       } catch (error) {
         return formatToolError(error);

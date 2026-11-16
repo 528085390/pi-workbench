@@ -265,6 +265,28 @@ test("cp_handback 以本 client 身份打到 /handback 并回显增量摘要（I
   assert.match(out, /receiving|收到/);
   assert.equal(calls[0]?.url, "http://h:1/api/cp/sessions/claude%3Aabc/handback");
   assert.deepEqual(calls[0]?.body, { clientId: "pi:7" });
+
+  // R4：Pi 重启换 pid 后，用 handoff 前那个身份交回
+  await handback.def.handler({ key: "claude:abc", clientId: "pi:old" });
+  assert.deepEqual(calls[1]?.body, { clientId: "pi:old" });
+});
+
+test("R3：两个 token 环境变量同时存在时，客户端与 daemon 一样优先用 AUTH_TOKEN", async () => {
+  const { calls, fetchImpl } = recorder(() => ({ body: {} }));
+  const savedAuth = process.env["PI_WORKBENCH_AUTH_TOKEN"];
+  const savedToken = process.env["PI_WORKBENCH_TOKEN"];
+  process.env["PI_WORKBENCH_AUTH_TOKEN"] = "auth-wins";
+  process.env["PI_WORKBENCH_TOKEN"] = "token-loses";
+  try {
+    const client = createWorkbenchClient({ baseUrl: "http://h:1", fetch: fetchImpl });
+    await client.agents();
+    assert.equal(calls[0]?.headers["authorization"], "Bearer auth-wins", "优先级必须与 config.ts 一致，否则双名不同值 → 401");
+  } finally {
+    if (savedAuth === undefined) delete process.env["PI_WORKBENCH_AUTH_TOKEN"];
+    else process.env["PI_WORKBENCH_AUTH_TOKEN"] = savedAuth;
+    if (savedToken === undefined) delete process.env["PI_WORKBENCH_TOKEN"];
+    else process.env["PI_WORKBENCH_TOKEN"] = savedToken;
+  }
 });
 
 test("wrapToolExecute：工具执行前清连击；不执行就不清（B2：beforeCall 不再清账）", async () => {

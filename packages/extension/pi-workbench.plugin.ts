@@ -29,7 +29,8 @@ export default function piWorkbench(pi: ExtensionAPI): void {
   const autostart = process.env["PI_WORKBENCH_AUTOSTART"] !== "0";
   const notifyEnabled = process.env["PI_WORKBENCH_NOTIFY"] !== "0";
   const mode = normalizeNotifyMode(process.env["PI_WORKBENCH_NOTIFY_MODE"]);
-  const token = process.env["PI_WORKBENCH_TOKEN"] ?? process.env["PI_WORKBENCH_AUTH_TOKEN"];
+  // R3：与 daemon 的优先级保持一致（config.ts: AUTH ?? TOKEN）
+  const token = process.env["PI_WORKBENCH_AUTH_TOKEN"] ?? process.env["PI_WORKBENCH_TOKEN"];
 
   // 故意不 await：Pi 启动不该被 daemon 冷启动（约 1–3s）拖住。
   // I3：失败要留证据——beforeCall 会把它抛给工具层，LLM 看到 E_DAEMON_DOWN 而不是 E_INTERNAL: fetch failed。

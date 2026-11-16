@@ -1413,7 +1413,7 @@ test("读语义：GET /unread 默认只读不推进（peek），ack=1 才推进�
     assert.equal(peeked.messages.length, 2);
     assert.equal(peeked.nextCursor, "2");
     assert.equal(peeked.lastReadCursor, "0", "peek 不推进");
-    assert.equal(peeked.unread, 3, "I1：unread 是剩余总数（5-2），不是本页 2 条");
+    assert.equal(peeked.unread, 5, "R2：peek 没推进游标，剩余仍是全部 5 条（不是本页之后的 3）");
     assert.equal(peeked.pageCount, 2, "本页条数单列");
     assert.equal(peeked.acked, false);
 
@@ -1503,7 +1503,7 @@ test("读语义：>200 条未读不被默认分页上限截断（B1：未读总�
     const peeked = peek.json<{ messages: unknown[]; unread: number; pageCount: number }>();
     assert.equal(peeked.messages.length, 2);
     assert.equal(peeked.pageCount, 2);
-    assert.equal(peeked.unread, 248, "分页只看 2 条，剩余仍是 248");
+    assert.equal(peeked.unread, 250, "R2：peek 只看 2 条但没标记已读，剩余仍是 250");
 
     const readAll = await h.app.inject({ method: "POST", url: SESSIONS + "/read", payload: { clientId: "pi:1" } });
     assert.equal(readAll.json<{ lastReadCursor: string }>().lastReadCursor, "250", "读到底要跨过 200 上限");

@@ -124,14 +124,6 @@ export function readClaudeTranscript(
 }
 
 /**
- * 读到 EOF：用于「还剩几条未读」「POST /read 不给游标 = 全部已读」。
- * 与 readClaudeTranscript 同一套归一化，因此条数与分页口径完全一致（B1）。
- */
-export function readClaudeTranscriptToEnd(jsonlPath: string, cursor: string): ClaudeTranscriptPage {
-  return readClaudeTranscript(jsonlPath, cursor, Number.POSITIVE_INFINITY);
-}
-
-/**
  * 列出 Claude 会话：解析 `claude agents --json --all` 并映射成 SessionRef。
  * - `run` 可注入（测试用 fake），默认 execa
  * - `cwd` 可选过滤（Windows 下大小写不敏感、忽略尾部分隔符）

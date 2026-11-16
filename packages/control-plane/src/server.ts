@@ -33,7 +33,7 @@ import type { WorkbenchErrorCode } from "./errors.ts";
 import type { EventStore } from "./events.ts";
 import type { LeaseManager } from "./lease.ts";
 import type { SessionFilter, SessionRegistry } from "./registry.ts";
-import { readClaudeTranscript, readClaudeTranscriptToEnd } from "./transcript/claude.ts";
+import { readClaudeTranscript } from "./transcript/claude.ts";
 import type { UnifiedMessage } from "./transcript/claude.ts";
 import type { TakeoverEngine } from "./takeover.ts";
 
@@ -327,9 +327,11 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         if (ack) {
           deps.cursors.set(key, clientId, page.nextCursor);
         }
-        // I1：unread 是"还剩几条"，不是"本页几条"——分页 limit 不该改变未读口径
+        // I1 + R2：unread 是"从我已读位置起还剩几条"，不是"本页几条"，也不该被 limit 改变。
+        // peek（ack=0）游标没动 → 必须从 lastReadCursor 数；只有真推进了才从 nextCursor 数。
+        const baseCursor = ack ? page.nextCursor : lastReadCursor;
         const remaining =
-          path === undefined || path.length === 0 ? 0 : readToEnd(path, page.nextCursor).messages.length;
+          path === undefined || path.length === 0 ? 0 : readToEnd(path, baseCursor).messages.length;
         return {
           messages: page.messages,
           nextCursor: page.nextCursor,

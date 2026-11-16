@@ -373,4 +373,5 @@ $ git check-ignore -v spike/acp-probe/evidence/claude-full.jsonl          → .g
 独立分支评审（`review-branch-2026-11-16.md`，master...HEAD 30 commits）结论 FIX-FIRST：
 2 阻塞（B1 未读被 200 上限截断、B2 通知器复核清空连击计数）+ 4 Important（I1 未读口径、I2 徽标被静音、I3 自动拉起错误码、I4 缺 `cp_handback`/租约身份不匹配）+ 3 Minor（C1 旧 schema、C2 token 双名、C3 端口优先级）。
 已全部修复并补回归用例；另补显式游标校验。全量：control-plane 229（228 pass / 1 skip）、extension 47 全绿；`pnpm -r build` 三包 Done。
+复审 r2（`review-branch-2026-11-16-r2.md`）再补 5 项：R1 无 `schemaVersion` 的旧 daemon 也判过旧、R2 peek 的 unread 不再按本页之后计、R3 token 双名优先级两侧统一、R4 `cp_handback` 支持指定 clientId、R5 清死代码。
 逐项清单与验证输出：`docs/evidence/phase-0.5a/review-fixes-2026-11-16.md`。九条 Gate 结论不变（修复只加强未读/通知路径）。

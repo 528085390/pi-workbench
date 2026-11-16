@@ -110,7 +110,6 @@ function sleep(ms: number): Promise<void> {
  * 超时抛 `E_DAEMON_DOWN: ...`（message 里带怎么手工启动）。
  */
 export async function ensureDaemon(options: EnsureDaemonOptions): Promise<EnsureDaemonResult> {
-  const probe = options.probe ?? probeHealth;
   const spawnImpl = options.spawnImpl ?? spawn;
   const timeoutMs = options.timeoutMs ?? DEFAULT_START_TIMEOUT_MS;
   const pollMs = options.pollMs ?? DEFAULT_POLL_INTERVAL_MS;
@@ -127,7 +126,9 @@ export async function ensureDaemon(options: EnsureDaemonOptions): Promise<Ensure
       return "down";
     }
     const version = body.schemaVersion;
-    if (typeof version === "number" && version < REQUIRED_SCHEMA_VERSION) {
+    // R1：没有 schemaVersion 字段本身就是"旧 daemon"（新 daemon 一定带），
+    // 只判 number 会把"字段缺失"当健康 → 插件连上去后 cp_see /unread 全 404。
+    if (typeof version !== "number" || version < REQUIRED_SCHEMA_VERSION) {
       return "outdated";
     }
     return "ok";

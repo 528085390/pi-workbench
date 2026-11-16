@@ -157,6 +157,32 @@ test("C1：健康但 schema 版本过旧 → 报 E_DAEMON_DOWN，不 spawn、不
   }
 });
 
+test("R1：/health 没有 schemaVersion 字段（旧 daemon）→ 同样算过旧，不静默放行", async () => {
+  const server = createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    // 修复前的 daemon 就长这样：{ok,name,version,pid,uptimeMs}，没有 schemaVersion
+    res.end(JSON.stringify({ ok: true, name: "pi-workbenchd", version: "0.0.1", pid: 1, uptimeMs: 5 }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = String((server.address() as AddressInfo).port);
+  const calls: SpawnCall[] = [];
+  try {
+    await assert.rejects(
+      () =>
+        ensureDaemon({
+          baseUrl: "http://127.0.0.1:" + port,
+          entry: entryFile(),
+          spawnImpl: fakeSpawn(calls),
+        }),
+      (err: unknown) =>
+        err instanceof Error && err.message.includes("控制面版本过旧") && (err as { code?: string }).code === "E_DAEMON_DOWN",
+    );
+    assert.equal(calls.length, 0);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
 test("C1：健康且 schema 版本够新 → 直接用，started=false", async () => {
   const server = createServer((_req, res) => {
     res.writeHead(200, { "content-type": "application/json" });
