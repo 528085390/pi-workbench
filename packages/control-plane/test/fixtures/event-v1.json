@@ -1,0 +1,69 @@
+{
+  "apiVersion": "1",
+  "schemaVersion": 4,
+  "note": "C06 golden fixture：同一 db 重建 server 后，after=resumeAfterSeq 的 WS 回放必须恰好是 expectedReplay（seq 单调、不重复、不断档）。seq 由 SQLite AUTOINCREMENT 分配，空库首次写入从 1 开始。",
+  "events": [
+    {
+      "sessionKey": "claude:sess-a",
+      "type": "token",
+      "payload": {
+        "text": "hello"
+      },
+      "source": "claude",
+      "idempotencyKey": "golden-1"
+    },
+    {
+      "sessionKey": "claude:sess-a",
+      "type": "tool_call",
+      "payload": {
+        "name": "Read",
+        "input": {
+          "path": "a.ts"
+        }
+      },
+      "source": "claude",
+      "idempotencyKey": "golden-2"
+    },
+    {
+      "sessionKey": "codex:sess-b",
+      "type": "state_update",
+      "payload": {
+        "state": "running"
+      },
+      "source": "codex",
+      "idempotencyKey": "golden-3"
+    },
+    {
+      "sessionKey": "claude:sess-a",
+      "type": "state_update",
+      "payload": {
+        "state": "idle",
+        "stopReason": "end_turn"
+      },
+      "source": "claude",
+      "idempotencyKey": "golden-4"
+    },
+    {
+      "sessionKey": "codex:sess-b",
+      "type": "notice",
+      "payload": {
+        "text": "restart"
+      },
+      "source": "codex",
+      "idempotencyKey": "golden-5"
+    }
+  ],
+  "resumeAfterSeq": 3,
+  "expectedReplay": [
+    {
+      "seq": 4,
+      "sessionKey": "claude:sess-a",
+      "type": "state_update"
+    },
+    {
+      "seq": 5,
+      "sessionKey": "codex:sess-b",
+      "type": "notice"
+    }
+  ]
+}

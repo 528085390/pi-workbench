@@ -3,6 +3,8 @@
  * 字段口径见 docs/PRD.md §3.0 与 docs/agent-control-plane-v0.3.md §5.2。
  */
 
+export * from "./api.ts";
+
 export const WORKBENCH_VERSION = "0.0.1";
 
 /** 控制面默认端口（PRD FR-5.3） */

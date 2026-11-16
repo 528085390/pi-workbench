@@ -16,8 +16,8 @@ import { timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 
-import type { Checkpoint, Driver, SessionCaps, SessionEvent, SessionRef, UnifiedMessage } from "@pi-workbench/shared";
-import { WORKBENCH_VERSION } from "@pi-workbench/shared";
+import type { Checkpoint, Driver, SessionCaps, SessionEvent, SessionRef, UnifiedMessage, VersionResponse } from "@pi-workbench/shared";
+import { API_VERSION, WORKBENCH_VERSION } from "@pi-workbench/shared";
 import fastifyWebsocket from "@fastify/websocket";
 import Fastify from "fastify";
 import type { FastifyError, FastifyInstance, FastifyRequest } from "fastify";
@@ -70,6 +70,8 @@ export type PipelineLike = {
 /** createServer 的依赖（R38 / R46：比 brief 多 adapter 与 checkpoints） */
 export type ServerDeps = {
   config: Config;
+  /** daemon 实例 id（index.ts 取自 InstanceStore.begin()）；GET /api/cp/version 原样返回 */
+  instanceId?: string;
   store: EventStore;
   leases: LeaseManager;
   registry: SessionRegistry;
@@ -378,6 +380,17 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
       });
 
       api.get(HEALTH_PATH, health);
+
+      /**
+       * spec §6.2：API v1 版本端点。api / schemaVersion 必须与 @pi-workbench/shared
+       * 的契约常量一致（contract test 覆盖）；instanceId 由 index.ts 从 InstanceStore.begin() 传入。
+       */
+      api.get("/version", async (): Promise<VersionResponse> => ({
+        api: API_VERSION,
+        schemaVersion: SCHEMA_VERSION,
+        daemon: WORKBENCH_VERSION,
+        instanceId: deps.instanceId ?? "",
+      }));
 
       // 0.5-B B01-b：有注册表时由 router.list() 动态生成；缺省保留 0.5-A 的 claude-only 描述
       api.get("/agents", async () => await currentAgents());

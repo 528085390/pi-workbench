@@ -517,6 +517,7 @@ export async function main(): Promise<void> {
       store,
       leases,
       registry,
+      instanceId: instances.id ?? "",
       engine,
       adapter,
       router,
