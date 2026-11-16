@@ -14,6 +14,8 @@ import type { CodexWriteAction } from "./agents/codex-driver.ts";
 import { PiDriver, resolvePiPackageDir } from "./agents/pi-driver.ts";
 import { AgentRouter } from "./agents/router.ts";
 import type { AgentDriver } from "./agents/types.ts";
+import { reconcileSessions } from "./boot-recovery.ts";
+import type { RecoveryReport } from "./boot-recovery.ts";
 import { hideWindowsChildProcesses } from "./child-process.ts";
 import { CheckpointStore } from "./checkpoints.ts";
 import type { Config } from "./config.ts";
@@ -308,7 +310,7 @@ export async function main(): Promise<void> {
     process.exitCode = 1;
     return;
   }
-  const { db, store, leases, registry, restored, checkpoints, dispatches, cursors, instances } = boot;
+  const { db, store, leases, registry, restored, recovery, checkpoints, dispatches, cursors, instances } = boot;
 
   // spec §7.1：15s 心跳刷新 instances.heartbeat_at，让「这个 daemon 还活着」可被外部观测。
   // 心跳失败只告警：DB 偶发错误不该打崩 daemon，下个周期重试。
@@ -457,6 +459,16 @@ export async function main(): Promise<void> {
   if (restored > 0) {
     console.log("[pi-workbenchd] 已从库里恢复 " + String(restored) + " 个会话");
   }
+  // spec §7.1：启动对账结果写进启动日志，便于重启验收与故障排查。
+  console.log(
+    "[pi-workbenchd] 重启对账：共 " +
+      String(recovery.total) +
+      " 个会话，" +
+      String(recovery.markedUnknown) +
+      " 个置为 unknown，" +
+      String(recovery.keptHandoff) +
+      " 个保持 handoff",
+  );
 
   let closing = false;
   async function shutdown(signal: NodeJS.Signals): Promise<void> {
@@ -501,6 +513,8 @@ type Boot = {
   registry: SessionRegistry;
   /** R34：loadFromDb 恢复出来的会话条数 */
   restored: number;
+  /** Task 4：启动对账结果（main 写启动日志） */
+  recovery: RecoveryReport;
   checkpoints: CheckpointStore;
   dispatches: DispatchStore;
   cursors: ReadCursorStore;
@@ -534,6 +548,16 @@ function bootStores(config: Config, paths: WorkbenchPaths, lock: InstanceLock): 
     // spec §7.1 第 3 步：迁移成功后立刻登记本次实例，心跳与收尾由 main 装配。
     const instances = new InstanceStore(db);
     const instance = instances.begin();
+    // spec §7.1 第 8 步：单实例锁保证上一个实例已死，启动时补齐它的 ended_at。
+    // unfinished() 会包含本实例行，按 id 跳过；多个历史失败行一并收尾。
+    const staleInstances = instances.unfinished().filter((row) => row.id !== instance.id);
+    if (staleInstances.length > 0) {
+      const endedAt = new Date().toISOString();
+      const finishStmt = db.prepare("UPDATE instances SET ended_at = ? WHERE instance_id = ?");
+      for (const stale of staleInstances) {
+        finishStmt.run(endedAt, stale.id);
+      }
+    }
     const store = new EventStore(db);
     // spec §7.1 第 4 步：租约按实例归属；启动清扫必须早于 loadFromDb，避免恢复出别家实例的租约。
     const leases = new LeaseManager(db, { ttlMs: config.leaseTtlMs, instanceId: instance.id });
@@ -541,10 +565,13 @@ function bootStores(config: Config, paths: WorkbenchPaths, lock: InstanceLock): 
     const registry = new SessionRegistry(db);
     // R34：冷启动恢复 —— 否则重启后 /sessions 与 dispatch 幂等复用都看不到历史会话
     const restored = registry.loadFromDb();
+    // spec §7.1 第 6 步：恢复后立即对账，driver 会话不按 transcript 猜状态（决策 2），
+    // 一律置 unknown 等显式 attach；必须早于 startServer，避免对外短暂暴露 running。
+    const recovery = reconcileSessions({ registry, store, instanceId: instance.id });
     const checkpoints = new CheckpointStore(db);
     const dispatches = new DispatchStore(db);
     const cursors = new ReadCursorStore(db);
-    return { db, store, leases, registry, restored, checkpoints, dispatches, cursors, instances };
+    return { db, store, leases, registry, restored, recovery, checkpoints, dispatches, cursors, instances };
   } catch (err) {
     if (db !== null) {
       try {
