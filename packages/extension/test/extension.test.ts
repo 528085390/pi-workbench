@@ -545,3 +545,176 @@ test("beforeCall 抛错 → 不发请求", async () => {
   await assert.rejects(() => client.agents(), /E_DAEMON_DOWN/);
   assert.equal(calls.length, 0);
 });
+
+test("cp_dispatch 显式 agent：先按 /agents 预检 caps，再透传 agent", async () => {
+  const { api, tools } = fakeApi();
+  const { calls, fetchImpl } = recorder((call) => {
+    if (call.url.endsWith("/api/cp/agents")) {
+      return {
+        body: [
+          {
+            agent: "codex",
+            available: true,
+            version: "0.167.0",
+            caps: {
+              stream: true,
+              inject: true,
+              interrupt: true,
+              attach: false,
+              resume: true,
+              transcript: true,
+              permissions: false,
+              background: false,
+            },
+          },
+        ],
+      };
+    }
+    return { body: { key: "codex:abc", status: "running", cwd: "/w", driver: "pi" } };
+  });
+  registerWorkbenchTools(api, { baseUrl: "http://h:1", clientId: "pi:7", fetch: fetchImpl });
+  const dispatch = tools.find((tool) => tool.name === "cp_dispatch");
+  assert.ok(dispatch !== undefined);
+
+  const out = await dispatch.def.handler({ task: "跑测试", cwd: "/w", agent: "codex" });
+  assert.equal(out, "dispatched codex:abc (running) cwd=/w");
+  assert.equal(calls.length, 2);
+  assert.ok(calls[0]?.url.endsWith("/api/cp/agents"), calls[0]?.url);
+  assert.equal(calls[1]?.url.endsWith("/api/cp/dispatch"), true);
+  assert.equal(fieldOf(calls[1]?.body, "agent"), "codex");
+});
+
+test("cp_dispatch 缺能力时结构化报错且不发 HTTP dispatch（假 client 计数）", async () => {
+  const { api, tools } = fakeApi();
+  const { calls, fetchImpl } = recorder((call) => {
+    if (call.url.endsWith("/api/cp/agents")) {
+      return {
+        body: [
+          {
+            agent: "pi",
+            available: true,
+            caps: {
+              stream: true,
+              inject: false,
+              interrupt: true,
+              attach: false,
+              resume: true,
+              transcript: true,
+              permissions: false,
+              background: false,
+            },
+          },
+        ],
+      };
+    }
+    return { body: { key: "pi:abc", status: "running", cwd: "/w", driver: "pi" } };
+  });
+  registerWorkbenchTools(api, { baseUrl: "http://h:1", clientId: "pi:7", fetch: fetchImpl });
+  const dispatch = tools.find((tool) => tool.name === "cp_dispatch");
+  assert.ok(dispatch !== undefined);
+
+  const out = await dispatch.def.handler({ task: "跑测试", agent: "pi" });
+  assert.match(String(out), /^E_CAP_UNSUPPORTED: /);
+  assert.equal(calls.length, 1, "预检失败不得再发 /dispatch");
+  assert.ok(calls[0]?.url.endsWith("/api/cp/agents"));
+});
+
+test("cp_dispatch 显式 agent 未注册 / 不可用时结构化报错且不发 dispatch", async () => {
+  const { api, tools } = fakeApi();
+  const { calls, fetchImpl } = recorder((call) => {
+    if (call.url.endsWith("/api/cp/agents")) {
+      return {
+        body: [
+          {
+            agent: "codex",
+            available: false,
+            reason: "E_AGENT_UNAVAILABLE: codex 未登录",
+            caps: {
+              stream: true,
+              inject: true,
+              interrupt: true,
+              attach: false,
+              resume: true,
+              transcript: true,
+              permissions: false,
+              background: false,
+            },
+          },
+        ],
+      };
+    }
+    return { body: { key: "codex:abc", status: "running", cwd: "/w", driver: "pi" } };
+  });
+  registerWorkbenchTools(api, { baseUrl: "http://h:1", clientId: "pi:7", fetch: fetchImpl });
+  const dispatch = tools.find((tool) => tool.name === "cp_dispatch");
+  assert.ok(dispatch !== undefined);
+
+  const out = await dispatch.def.handler({ task: "跑测试", agent: "codex" });
+  assert.match(String(out), /^E_AGENT_UNAVAILABLE: /);
+  assert.equal(calls.length, 1, "不可用预检失败不得再发 /dispatch");
+});
+
+test("cp_dispatch 的 /agents 预检有 30s 缓存：连续两次只探测一次", async () => {
+  const { api, tools } = fakeApi();
+  const { calls, fetchImpl } = recorder((call) => {
+    if (call.url.endsWith("/api/cp/agents")) {
+      return {
+        body: [
+          {
+            agent: "codex",
+            available: true,
+            caps: {
+              stream: true,
+              inject: true,
+              interrupt: true,
+              attach: false,
+              resume: true,
+              transcript: true,
+              permissions: false,
+              background: false,
+            },
+          },
+        ],
+      };
+    }
+    return { body: { key: "codex:abc", status: "running", cwd: "/w", driver: "pi" } };
+  });
+  registerWorkbenchTools(api, { baseUrl: "http://h:1", clientId: "pi:7", fetch: fetchImpl });
+  const dispatch = tools.find((tool) => tool.name === "cp_dispatch");
+  assert.ok(dispatch !== undefined);
+
+  await dispatch.def.handler({ task: "第一次", agent: "codex" });
+  await dispatch.def.handler({ task: "第二次", agent: "codex" });
+  assert.equal(calls.filter((call) => call.url.endsWith("/api/cp/agents")).length, 1);
+  assert.equal(calls.filter((call) => call.url.endsWith("/api/cp/dispatch")).length, 2);
+});
+
+test("createWorkbenchClient：excludeSessionKeys 过滤自身会话（cp_sessions 与通知器共用）", async () => {
+  const { fetchImpl } = recorder(() => ({
+    body: [
+      { key: "pi:self", agent: "pi", status: "idle", driver: "pi", cwd: "/w", unread: 0 },
+      { key: "claude:a", agent: "claude", status: "idle", driver: "pi", cwd: "/w", unread: 1 },
+    ],
+  }));
+  let self: string | undefined = "pi:self";
+  const client = createWorkbenchClient({
+    baseUrl: "http://h:1",
+    clientId: "pi:7",
+    fetch: fetchImpl,
+    excludeSessionKeys: () => (self === undefined ? [] : [self]),
+  });
+  assert.deepEqual((await client.sessions()).map((item) => item.key), ["claude:a"]);
+  self = undefined;
+  assert.deepEqual((await client.sessions()).map((item) => item.key), ["pi:self", "claude:a"]);
+});
+
+test("wrapToolExecute：把工具名传给 noteToolActivity（供 cp_sessions 识别观察动作）", async () => {
+  const names: Array<string | undefined> = [];
+  const activity = {
+    noteToolActivity(toolName?: string): void {
+      names.push(toolName);
+    },
+  };
+  await wrapToolExecute(activity, async () => "ok", "cp_sessions");
+  assert.deepEqual(names, ["cp_sessions"]);
+});

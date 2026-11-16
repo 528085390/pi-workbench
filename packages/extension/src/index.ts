@@ -65,6 +65,11 @@ export type WorkbenchClientOptions = {
    * 同一轮里 Pi 自己读过的，绝不能再收到过期提醒（spec §6.6 规则 3）。
    */
   onSessionRead?: (sessionKey: string) => void;
+  /**
+   * 当前 Pi 自己的会话 key（数组或动态读取函数）。列表接口会在客户端侧过滤掉这些 key，
+   * 防止 Pi 把自己当成远程会话：cp_sessions 不展示自身，通知器也不会叫醒自己。
+   */
+  excludeSessionKeys?: readonly string[] | (() => readonly string[]);
 };
 
 /**
@@ -101,7 +106,9 @@ export type HealthBody = {
 export type AgentDescriptor = {
   agent: AgentName;
   available?: boolean;
-  version?: string;
+  version?: string | null;
+  /** available=false 时的机器可读原因（与控制面 AgentStatus.reason 同源） */
+  reason?: string;
   caps: SessionCaps;
 };
 
@@ -284,6 +291,13 @@ export function createWorkbenchClient(options: WorkbenchClientOptions = {}): Wor
   const envToken = process.env["PI_WORKBENCH_AUTH_TOKEN"] ?? process.env["PI_WORKBENCH_TOKEN"];
   const authToken = explicitToken ?? envToken ?? null;
   const doFetch: typeof fetch = options.fetch ?? fetch;
+  const excludedSessionKeys = (): Set<string> => {
+    const value =
+      typeof options.excludeSessionKeys === "function"
+        ? options.excludeSessionKeys()
+        : options.excludeSessionKeys;
+    return new Set(value ?? []);
+  };
 
   async function call(method: "GET" | "POST", path: string, body?: unknown): Promise<unknown> {
     if (options.beforeCall !== undefined) {
@@ -315,8 +329,8 @@ export function createWorkbenchClient(options: WorkbenchClientOptions = {}): Wor
     clientId,
     health: async () => (await call("GET", "/health")) as HealthBody,
     agents: async () => (await call("GET", "/api/cp/agents")) as AgentDescriptor[],
-    sessions: async (filter) =>
-      (await call(
+    sessions: async (filter) => {
+      const list = (await call(
         "GET",
         "/api/cp/sessions" +
           queryOf({
@@ -324,7 +338,10 @@ export function createWorkbenchClient(options: WorkbenchClientOptions = {}): Wor
             status: filter?.status,
             clientId: filter?.clientId ?? clientId,
           }),
-      )) as SessionView[],
+      )) as SessionView[];
+      const excluded = excludedSessionKeys();
+      return excluded.size === 0 ? list : list.filter((session) => !excluded.has(session.key));
+    },
     unread: async (key, readOptions) => {
       const page = (await call(
         "GET",
@@ -396,10 +413,11 @@ export function createWorkbenchClient(options: WorkbenchClientOptions = {}): Wor
  * 每次复核都清一次，连击上限永远不触发（评审实测 6 次发 6 条）。
  */
 export function wrapToolExecute(
-  activity: { noteToolActivity(): void } | undefined,
+  activity: { noteToolActivity(toolName?: string): void } | undefined,
   run: () => Promise<unknown>,
+  toolName?: string,
 ): Promise<unknown> {
-  activity?.noteToolActivity();
+  activity?.noteToolActivity(toolName);
   return run();
 }
 
@@ -411,6 +429,19 @@ class ToolInputError extends Error {
     super(message);
     this.name = "ToolInputError";
     this.code = "E_BAD_REQUEST";
+  }
+}
+
+/** 扩展侧按 /agents 预检失败：不产生任何 dispatch HTTP 请求，只把结构化错误交给 LLM */
+class ToolGateError extends Error {
+  readonly code: string;
+  readonly details?: unknown;
+
+  constructor(code: string, message: string, details?: unknown) {
+    super(message);
+    this.name = "ToolGateError";
+    this.code = code;
+    this.details = details;
   }
 }
 
@@ -482,13 +513,47 @@ export function registerWorkbenchTools(
 ): WorkbenchClient {
   const client = isClient(clientOrOptions) ? clientOrOptions : createWorkbenchClient(clientOrOptions);
 
+  /** spec §11.1：/agents 的 30s 缓存（探测器可能跑子进程，不能每次工具调用都打一遍） */
+  const AGENT_STATUS_CACHE_MS = 30_000;
+  let agentStatusCache: { at: number; statuses: AgentDescriptor[] } | null = null;
+  const statusesForPrecheck = async (): Promise<AgentDescriptor[]> => {
+    const at = Date.now();
+    if (agentStatusCache !== null && at - agentStatusCache.at < AGENT_STATUS_CACHE_MS) {
+      return agentStatusCache.statuses;
+    }
+    const statuses = await client.agents();
+    agentStatusCache = { at, statuses };
+    return statuses;
+  };
+
+  /** caps.inject 是 cp_dispatch 的最低能力；不满足时在本地拒绝，绝不空跑一次 /dispatch */
+  const assertAgentInjectable = async (agent: string): Promise<void> => {
+    const statuses = await statusesForPrecheck();
+    const status = statuses.find((item) => item.agent === agent);
+    if (status === undefined || status.available === false) {
+      const reason = status?.reason;
+      throw new ToolGateError(
+        "E_AGENT_UNAVAILABLE",
+        "Agent 未注册或不可用：" + agent + (reason === undefined ? "" : "（" + reason + "）"),
+        { agent, reason: reason ?? null },
+      );
+    }
+    if (status.caps.inject !== true) {
+      throw new ToolGateError("E_CAP_UNSUPPORTED", "Agent " + agent + " 不支持能力 inject", {
+        agent,
+        cap: "inject",
+      });
+    }
+  };
+
   api.registerTool("cp_dispatch", {
     description:
-      "在控制面新起一个 Claude 会话并立刻投递任务。返回会话 key（claude:<nativeId>）、状态与 cwd。",
+      "在控制面新起一个 agent 会话（缺省 claude）并立刻投递任务。显式 agent 会先按 /agents 的 caps 预检；返回会话 key、状态与 cwd。",
     inputSchema: {
       type: "object",
       properties: {
-        task: { type: "string", description: "要交给 Claude 的完整任务描述（必填）" },
+        task: { type: "string", description: "要交给 agent 的完整任务描述（必填）" },
+        agent: { type: "string", description: "目标 agent：claude|codex|pi；显式传入时先按 /agents 的 caps 预检，缺省 claude" },
         cwd: { type: "string", description: "会话工作目录；缺省用 daemon 的 cwd" },
         idempotencyKey: { type: "string", description: "幂等键；同键同任务只会起一个会话" },
       },
@@ -496,8 +561,12 @@ export function registerWorkbenchTools(
     },
     handler: async (input: unknown): Promise<string> => {
       try {
+        const agent = fieldOf(input, "agent");
+        if (agent !== undefined) {
+          await assertAgentInjectable(agent);
+        }
         const ref = await client.dispatch({
-          agent: "claude",
+          agent: agent ?? "claude",
           task: requireField(input, "task"),
           cwd: fieldOf(input, "cwd"),
           idempotencyKey: fieldOf(input, "idempotencyKey"),
@@ -511,7 +580,7 @@ export function registerWorkbenchTools(
 
   api.registerTool("cp_sessions", {
     description:
-      "列出控制面里的会话（可按 agent / status 过滤），每行一个 key + 状态 + driver + 未读数 + cwd。unread>0 表示有你没读过的消息。",
+      "列出控制面里的会话（可按 agent / status 过滤），每行一个 key + 状态 + driver + 未读数 + cwd。unread>0 表示有你没读过的消息。当前 Pi 自己的会话不会列出。",
     inputSchema: {
       type: "object",
       properties: {

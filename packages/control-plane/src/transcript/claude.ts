@@ -15,17 +15,10 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { execa } from "execa";
-import type { SessionCaps, SessionRef, SessionStatus } from "@pi-workbench/shared";
+import type { SessionCaps, SessionRef, SessionStatus, UnifiedMessage } from "@pi-workbench/shared";
 
-/** 归一化后的单条消息片段（一条 Claude 记录可能拆成多条） */
-export type UnifiedMessage = {
-  id: string;
-  role: "user" | "assistant" | "system";
-  kind: "text" | "thinking" | "tool_call" | "tool_result";
-  text: string;
-  ts: string;
-  toolName?: string;
-};
+// 0.5-B D4：UnifiedMessage 上移到 @pi-workbench/shared；这里 re-export 保持旧 import 路径兼容。
+export type { UnifiedMessage } from "@pi-workbench/shared";
 
 /** 一次增量读取的结果；nextCursor 可直接作为下次的 cursor */
 export type ClaudeTranscriptPage = {
@@ -84,14 +77,24 @@ export function readClaudeTranscript(
     if (size === 0) {
       return emptyPage(CURSOR_ZERO);
     }
-    // 游标越过文件末尾说明文件被截断/轮转，回退到 0 重新读，避免永久读不到内容
-    const from = start > size ? 0 : start;
+    // 游标越过文件末尾说明文件被截断/轮转，回退到 0 重新读，并给出 notice（规格 §10.4）
+    const reset = start > size;
+    const from = reset ? 0 : start;
     if (from === size) {
       return emptyPage(String(from));
     }
 
     const chunk = readBytes(fd, from, size - from);
     const messages: UnifiedMessage[] = [];
+    if (reset) {
+      messages.push({
+        id: "claude:cursor-reset:" + String(start),
+        kind: "notice",
+        role: "system",
+        text: "transcript 文件比游标短（可能被截断或轮转），已从头重读",
+        ts: new Date().toISOString(),
+      });
+    }
     let consumed = 0;
     let pos = 0;
     let lineNumber = 0;

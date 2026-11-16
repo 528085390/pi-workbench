@@ -193,3 +193,57 @@ test("notifierUrl：http→ws、保留路径前缀、带 after", () => {
   assert.equal(notifierUrl("http://127.0.0.1:7331", 0), "ws://127.0.0.1:7331/api/cp/ws?after=0");
   assert.equal(notifierUrl("https://box.local:8443/prefix/", 42), "wss://box.local:8443/prefix/api/cp/ws?after=42");
 });
+
+test("cp_sessions/cp_see 是观察型工具，不重置连击上限", async () => {
+  const { sent, sink } = recorder();
+  const notifier = new TurnNotifier({
+    sink,
+    now: () => NOW,
+    listSessions: async () => [session({ key: "claude:a", unread: 1 })],
+  });
+  for (let index = 0; index < 5; index += 1) {
+    notifier.handleEvent({ seq: 100 + index, sessionKey: "claude:a", type: "state_update", payload: { status: "idle" }, ts: LATER });
+    await notifier.flush();
+  }
+  assert.equal(sent.length, 5);
+  notifier.noteToolActivity("cp_sessions");
+  notifier.noteToolActivity("cp_see");
+  assert.equal(notifier.consecutiveWakes, 5, "纯观察工具不能重置上限");
+  notifier.noteToolActivity("cp_inject");
+  assert.equal(notifier.consecutiveWakes, 0, "推进型工具才清零");
+});
+
+test("唤醒计数超过窗口后自动恢复", async () => {
+  const { sent, sink } = recorder();
+  let clock = NOW;
+  const notifier = new TurnNotifier({
+    sink,
+    now: () => clock,
+    wakeWindowMs: 1000,
+    listSessions: async () => [session({ key: "claude:a", unread: 1 })],
+  });
+  for (let index = 0; index < 5; index += 1) {
+    notifier.handleEvent({ seq: 100 + index, sessionKey: "claude:a", type: "state_update", payload: { status: "idle" }, ts: LATER });
+    await notifier.flush();
+  }
+  assert.equal(sent.length, 5);
+  clock += 1001;
+  notifier.handleEvent({ seq: 200, sessionKey: "claude:a", type: "state_update", payload: { status: "idle" }, ts: LATER });
+  await notifier.flush();
+  assert.equal(sent.length, 6, "窗口过期后应恢复一次唤醒");
+});
+
+test("同一 seq 重放不会二次唤醒", async () => {
+  const { sent, sink } = recorder();
+  const notifier = new TurnNotifier({
+    sink,
+    now: () => NOW,
+    listSessions: async () => [session({ key: "claude:a", unread: 1 })],
+  });
+  const event = { seq: 9, sessionKey: "claude:a", type: "state_update", payload: { status: "idle" }, ts: LATER };
+  notifier.handleEvent(event);
+  await notifier.flush();
+  notifier.handleEvent(event);
+  await notifier.flush();
+  assert.equal(sent.length, 1);
+});

@@ -6,7 +6,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,7 +30,10 @@ function makeConfig(permissionMode: PermissionMode = "auto_allow"): Config {
     claude: {
       adapterCmd: [process.execPath, FIXTURE],
       permissionMode,
+      initialPermissionMode: "auto",
     },
+    codex: { adapterCmd: [process.execPath, FIXTURE], permissionMode, initialAgentMode: "workspace-write" },
+    pi: { rpcCmd: ["pi", "--mode", "rpc"] },
   };
 }
 
@@ -111,6 +114,50 @@ test("newSession 返回 ACP sessionId", async () => {
   }
 });
 
+test("newSession 显式 initialPermissionMode 会调用 session/set_config_option", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-workbench-mode-"));
+  const record = join(dir, "set-config.jsonl");
+  const adapter = await ClaudeAdapter.spawn(makeConfig(), {
+    adapterCmd: [process.execPath, FIXTURE, "--record-config", record],
+    cwd: WORKSPACE,
+    initialPermissionMode: "bypassPermissions",
+  });
+  try {
+    const { sessionId } = await adapter.newSession(WORKSPACE);
+    const calls = readFileSync(record, "utf8")
+      .trim()
+      .split(/\r?\n/)
+      .filter((line) => line.length > 0)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    assert.deepEqual(calls, [
+      { sessionId, configId: "mode", type: "id", value: "bypassPermissions" },
+    ]);
+  } finally {
+    await adapter.dispose();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("resume 不重置 initialPermissionMode（保留 handoff 期间的人类设置）", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-workbench-resume-mode-"));
+  const record = join(dir, "set-config.jsonl");
+  const adapter = await ClaudeAdapter.spawn(makeConfig(), {
+    adapterCmd: [process.execPath, FIXTURE, "--record-config", record],
+    cwd: WORKSPACE,
+    initialPermissionMode: "bypassPermissions",
+  });
+  try {
+    const { sessionId } = await adapter.newSession(WORKSPACE);
+    const count = (): number => readFileSync(record, "utf8").trim().split(/\r?\n/).filter((line) => line.length > 0).length;
+    const beforeResume = count();
+    await adapter.resume(sessionId, WORKSPACE);
+    assert.equal(count(), beforeResume, "resume 不应再次发送 session/set_config_option");
+  } finally {
+    await adapter.dispose();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("prompt 立即返回 messageId，并把 session/update 映射成 text", async () => {
   const adapter = await spawnFakeAdapter();
   try {
@@ -129,6 +176,7 @@ test("prompt 立即返回 messageId，并把 session/update 映射成 text", asy
 
     const text = await waitForUpdate(updates, (u) => u.kind === "text");
     assert.equal(text.text, "pong");
+    assert.equal(text.sessionId, sessionId, "update 必须带来源 sessionId（跨会话隔离依赖它）");
 
     // thought / tool_call / tool_result / state 都要映射出来
     await waitForUpdate(updates, (u) => u.kind === "thought");
@@ -420,7 +468,7 @@ test("resolveDefaultAdapterCmd：默认解析用本地入口（依赖已装）",
 test("真 adapter 冒烟（默认跳过，PI_WORKBENCH_REAL_ADAPTER=1 才跑）", { skip: process.env.PI_WORKBENCH_REAL_ADAPTER !== "1" }, async () => {
   const adapter = await ClaudeAdapter.spawn({
     ...makeConfig(),
-    claude: { adapterCmd: resolveDefaultAdapterCmd(), permissionMode: "auto_allow" },
+    claude: { adapterCmd: resolveDefaultAdapterCmd(), permissionMode: "auto_allow", initialPermissionMode: "auto" },
   });
   try {
     const { sessionId } = await adapter.newSession(WORKSPACE);

@@ -6,7 +6,7 @@ import { WebSocket as WsWebSocket } from "ws";
  * 三条硬规则（用户 m02516 批准）：
  * 1. 投递前复核：真正发消息之前再查一次未读，unread === 0 直接丢弃——避免"提醒你去看已经看完的东西"。
  * 2. 指针而非断言：消息只说"某会话在游标 X 之后有 N 条"，不说"任务完成了"。
- * 3. 自己的工具动作清账：cp_see / cp_read 成功后清掉该会话待发通知；任意 cp_* 调用把连击计数清零。
+ * 3. 自己的工具动作清账：cp_see / cp_read 成功后清掉该会话待发通知；只有推进型 cp_* 调用才清零连击计数（cp_sessions / cp_see 是观察）。
  *
  * 这里不 import Pi SDK：NotifySink 是最小结构化契约，宿主（Pi 插件 / 测试）自己实现。
  */
@@ -68,8 +68,10 @@ export type TurnNotifierOptions = {
   mode?: NotifyMode;
   /** 合并窗口：窗口内多个会话的结束信号合成一条 */
   debounceMs?: number;
-  /** 连续自动唤醒上限（期间没有工具调用则累加） */
+  /** 连续自动唤醒上限（期间没有推进型工具调用则累加） */
   maxConsecutiveWakes?: number;
+  /** 唤醒计数的滑动窗口：窗口内没有新唤醒就清零（缺省 60s） */
+  wakeWindowMs?: number;
   /** 只对 driver=pi 的会话唤醒（人接管中不吵） */
   wakeDrivers?: readonly string[];
   /**
@@ -83,6 +85,7 @@ export type TurnNotifierOptions = {
 
 const DEFAULT_DEBOUNCE_MS = 300;
 const DEFAULT_MAX_WAKES = 5;
+const DEFAULT_WAKE_WINDOW_MS = 60_000;
 const CUSTOM_TYPE = "pi-workbench";
 
 /** 从一条事件里读出"需要叫醒"的原因；不需要唤醒的返回 null */
@@ -111,11 +114,19 @@ type Pending = { reason: NotifyReason; seq: number };
 
 /** 回合结束通知器：纯内存 + 注入时钟，不碰 IO（除了注入的 listSessions / sink） */
 export class TurnNotifier {
-  readonly #options: TurnNotifierOptions & { debounceMs: number; maxConsecutiveWakes: number };
+  readonly #options: TurnNotifierOptions & {
+    debounceMs: number;
+    maxConsecutiveWakes: number;
+    wakeWindowMs: number;
+  };
   readonly #pending = new Map<string, Pending>();
   readonly #startedAt: number;
+  readonly #now: () => number;
+  readonly #lastEventSeq = new Map<string, number>();
+  readonly #lastNotifiedSeq = new Map<string, number>();
   #timer: ReturnType<typeof setTimeout> | null = null;
   #wakes = 0;
+  #wakeWindowStartedAt = 0;
   #flushing: Promise<void> | null = null;
   #badge: string | undefined;
   #disposed = false;
@@ -125,13 +136,15 @@ export class TurnNotifier {
       ...options,
       debounceMs: options.debounceMs ?? DEFAULT_DEBOUNCE_MS,
       maxConsecutiveWakes: options.maxConsecutiveWakes ?? DEFAULT_MAX_WAKES,
+      wakeWindowMs: options.wakeWindowMs ?? DEFAULT_WAKE_WINDOW_MS,
     };
-    const now = options.now ?? (() => Date.now());
-    this.#startedAt = now();
+    this.#now = options.now ?? (() => Date.now());
+    this.#startedAt = this.#now();
   }
 
-  /** 连击计数（测试/诊断用） */
+  /** 连击计数（测试/诊断用；读取会触发过期窗口归零，符合时间窗语义） */
   get consecutiveWakes(): number {
+    this.#resetWakeBudgetIfStale();
     return this.#wakes;
   }
 
@@ -154,6 +167,14 @@ export class TurnNotifier {
         return;
       }
     }
+    // 同一 session 的 seq 单调递增；重放/重复事件直接跳过。
+    if (typeof event.seq === "number") {
+      const previous = this.#lastEventSeq.get(event.sessionKey);
+      if (previous !== undefined && event.seq <= previous) {
+        return;
+      }
+      this.#lastEventSeq.set(event.sessionKey, event.seq);
+    }
     const reason = reasonOf(event);
     if (reason === null) {
       return;
@@ -162,9 +183,16 @@ export class TurnNotifier {
     this.#scheduleFlush();
   }
 
-  /** 任意 cp_* 工具调用：连击计数清零（Pi 动了，说明这不是自激循环） */
-  noteToolActivity(): void {
+  /**
+   * 推进型工具调用才清零连击计数。cp_sessions / cp_see 是纯观察：
+   * 如果把它们也当成“Pi 动了”，自激循环每轮都能重置上限，上限永远不生效。
+   */
+  noteToolActivity(toolName?: string): void {
+    if (toolName === "cp_sessions" || toolName === "cp_see") {
+      return;
+    }
     this.#wakes = 0;
+    this.#wakeWindowStartedAt = 0;
   }
 
   /** cp_see / cp_read 读完某会话：把它的待发通知删掉 */
@@ -206,6 +234,8 @@ export class TurnNotifier {
       this.#timer = null;
     }
     this.#pending.clear();
+    this.#lastEventSeq.clear();
+    this.#lastNotifiedSeq.clear();
   }
 
   async #flushOnce(): Promise<void> {
@@ -228,7 +258,7 @@ export class TurnNotifier {
     const byKey = new Map(sessions.map((s) => [s.key, s]));
     const drivers = this.#options.wakeDrivers ?? ["pi"];
 
-    const actionable: Array<{ session: NotifySession; reason: NotifyReason }> = [];
+    const actionable: Array<{ session: NotifySession; reason: NotifyReason; seq: number }> = [];
     for (const [key, pending] of entries) {
       const session = byKey.get(key);
       const unread = session && typeof session.unread === "number" ? session.unread : 0;
@@ -240,10 +270,16 @@ export class TurnNotifier {
         this.#log("[notify] 跳过 " + key + "（driver=" + session.driver + "）");
         continue;
       }
-      actionable.push({ session, reason: pending.reason });
+      const lastNotified = this.#lastNotifiedSeq.get(key);
+      if (lastNotified !== undefined && pending.seq <= lastNotified) {
+        this.#log("[notify] 跳过重复通知 " + key + "（seq=" + String(pending.seq) + "）");
+        continue;
+      }
+      actionable.push({ session, reason: pending.reason, seq: pending.seq });
     }
 
     if (actionable.length > 0) {
+      this.#resetWakeBudgetIfStale();
       if (this.#wakes >= this.#options.maxConsecutiveWakes) {
         this.#log("[notify] 连续唤醒达上限（" + String(this.#wakes) + "），只更新徽标");
       } else {
@@ -254,6 +290,12 @@ export class TurnNotifier {
             { deliverAs: mode, triggerTurn: mode !== "nextTurn" },
           );
           this.#wakes += 1;
+          if (this.#wakeWindowStartedAt === 0) {
+            this.#wakeWindowStartedAt = this.#now();
+          }
+          for (const item of actionable) {
+            this.#lastNotifiedSeq.set(item.session.key, item.seq);
+          }
         } catch (err) {
           this.#log("[notify] 发送失败：" + (err instanceof Error ? err.message : String(err)));
         }
@@ -261,6 +303,16 @@ export class TurnNotifier {
     }
 
     await this.refreshBadge();
+  }
+
+  #resetWakeBudgetIfStale(): void {
+    if (this.#wakes === 0) {
+      return;
+    }
+    if (this.#now() - this.#wakeWindowStartedAt >= this.#options.wakeWindowMs) {
+      this.#wakes = 0;
+      this.#wakeWindowStartedAt = 0;
+    }
   }
 
   #scheduleFlush(): void {

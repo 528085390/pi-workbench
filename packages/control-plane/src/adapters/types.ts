@@ -8,6 +8,8 @@
  */
 import type { SessionStatus } from "@pi-workbench/shared";
 
+import type { ClaudeInitialPermissionMode } from "../config.ts";
+
 /** 归一化后的 update 种类（映射表见 claude.ts 的 mapSessionUpdate） */
 export type AdapterUpdateKind =
   | "text"
@@ -26,6 +28,8 @@ export type AdapterUpdate = {
   text?: string;
   toolName?: string;
   state?: SessionStatus;
+  /** 产生此 update 的 agent 原生会话 id；缺省表示无法归属（如 adapter 整体挂掉） */
+  sessionId?: string;
   /** 原始 ACP 负载，未识别的字段都靠它兜底 */
   raw?: unknown;
 };
@@ -38,6 +42,8 @@ export type AdapterSpawnOptions = {
   env?: NodeJS.ProcessEnv;
   /** 子进程 cwd，默认继承当前进程 */
   cwd?: string;
+  /** 新会话建立后要设置的 Claude 权限模式；仅 Claude adapter 使用 */
+  initialPermissionMode?: ClaudeInitialPermissionMode;
 };
 
 /** 一个回合的结束信息 */
@@ -56,6 +62,8 @@ export interface AgentAdapter {
   close(sessionId: string): Promise<void>;
   /** 等本回合结束；超时抛 `E_ADAPTER_DOWN`（turn timeout），不挂起 */
   waitForTurn?(sessionId: string, timeoutMs?: number): Promise<AdapterTurnResult>;
+  /** 进程是否仍可用；可选，driver 用它决定是否重建缓存（B08 S5） */
+  isAlive?(): boolean;
   onUpdate(cb: (update: AdapterUpdate) => void): () => void;
   dispose(): Promise<void>;
 }

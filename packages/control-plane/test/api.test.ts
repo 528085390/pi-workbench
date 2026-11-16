@@ -102,8 +102,10 @@ function makeConfig(home: string, overrides: Partial<Config> = {}): Config {
     home,
     authToken: null,
     leaseTtlMs: 30_000,
-    claude: { adapterCmd: [process.execPath], permissionMode: "auto_allow" },
+    claude: { adapterCmd: [process.execPath], permissionMode: "auto_allow", initialPermissionMode: "auto" },
     ...overrides,
+    codex: overrides.codex ?? { adapterCmd: [process.execPath], permissionMode: "auto_allow", initialAgentMode: "workspace-write" },
+    pi: overrides.pi ?? { rpcCmd: ["pi", "--mode", "rpc"] },
   };
 }
 
@@ -276,7 +278,7 @@ test("GET /agents 复用能力矩阵常量（R37）", async () => {
 
 test("GET /agents：adapter 命令解析不到 → available:false（R37）", async () => {
   const h = await makeHarness({
-    config: { claude: { adapterCmd: ["C:/nonexistent/pi-workbench-nope.exe"], permissionMode: "auto_allow" } },
+    config: { claude: { adapterCmd: ["C:/nonexistent/pi-workbench-nope.exe"], permissionMode: "auto_allow", initialPermissionMode: "auto" } },
   });
   try {
     const res = await h.app.inject({ method: "GET", url: API + "/agents" });
@@ -736,6 +738,7 @@ test("错误码 → 状态码映射覆盖 R35 全表", () => {
     E_NO_LEASE: 409,
     E_IDEMPOTENCY_CONFLICT: 409,
     E_CAP_UNSUPPORTED: 422,
+    E_AGENT_UNAVAILABLE: 422,
     E_ADAPTER_DOWN: 503,
     E_RESUME_REJECTED: 503,
   });

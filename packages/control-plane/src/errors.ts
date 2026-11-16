@@ -13,7 +13,8 @@ export type WorkbenchErrorCode =
   | "E_CAP_UNSUPPORTED"
   | "E_ADAPTER_DOWN"
   | "E_RESUME_REJECTED"
-  | "E_IDEMPOTENCY_CONFLICT";
+  | "E_IDEMPOTENCY_CONFLICT"
+  | "E_AGENT_UNAVAILABLE";
 
 /**
  * 带错误码的控制面异常。

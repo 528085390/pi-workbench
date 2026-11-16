@@ -20,6 +20,11 @@ import type { EventStore } from "./events.ts";
 import type { SessionRegistry } from "./registry.ts";
 import type { UnifiedMessage } from "./transcript/claude.ts";
 
+/** 事件源：ACP adapter 与 AgentDriver 都满足这个结构（B08 M2） */
+export type UpdateSource = {
+  onUpdate(cb: (update: AdapterUpdate) => void): () => void;
+};
+
 /**
  * 管线日志口（可注入；默认写 stderr）。
  * 只用 debug / error 两档：前者是「丢弃了什么」的噪声，后者是必须被看见的问题。
@@ -55,6 +60,7 @@ const TRANSCRIPT_KIND_TO_TYPE: ReadonlyMap<string, SessionEventType> = new Map<s
   ["thinking", "thought"],
   ["tool_call", "tool_call"],
   ["tool_result", "tool_result"],
+  ["notice", "notice"],
 ]);
 
 type Attachment = {
@@ -90,10 +96,10 @@ export class EventPipeline {
    * 同一 sessionKey 重复 attach 会先退订旧的，避免两条链同时写同一会话。
    * 返回只退订本次订阅的函数（可重复调用）。
    */
-  attach(adapter: AgentAdapter, sessionKey: string): () => void {
+  attach(source: UpdateSource, sessionKey: string): () => void {
     this.#attachments.get(sessionKey)?.detach();
 
-    const unsubscribe = adapter.onUpdate((update: AdapterUpdate) => {
+    const unsubscribe = source.onUpdate((update: AdapterUpdate) => {
       this.#handleUpdate(sessionKey, update);
     });
 
@@ -187,6 +193,15 @@ export class EventPipeline {
       const ref = this.#registry.get(sessionKey);
       if (ref === null) {
         this.#warnUnknownSession(sessionKey);
+        return;
+      }
+
+      // ACP 一个 adapter 进程可能服务多个会话；事件必须按来源 sessionId 过滤，
+      // 否则 A 会话的 token/tool_call 会被写进 B 会话，制造假未读和重复唤醒。
+      if (update.sessionId !== undefined && update.sessionId !== ref.nativeId) {
+        this.#logger.debug(
+          "AdapterUpdate 属于其他会话（" + update.sessionId + "），已从 " + sessionKey + " 丢弃",
+        );
         return;
       }
 

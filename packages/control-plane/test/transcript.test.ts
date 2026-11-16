@@ -330,3 +330,20 @@ test("listClaudeSessions: 输出不是数组时返回空数组（不抛异常）
   const refs = await listClaudeSessions({ run: fakeRunner("{}").run });
   assert.deepEqual(refs, []);
 });
+
+
+test("readClaudeTranscript: 文件变短时游标归零并产出 notice（P2-1）", (t) => {
+  const file = tempFile(t);
+  const firstLine = textLine("u1", "第一行" + "x".repeat(400));
+  const secondLine = textLine("a1", "第二行", "assistant");
+  writeFileSync(file, firstLine + "\n" + secondLine + "\n", "utf8");
+  const first = readClaudeTranscript(file, "0");
+
+  writeFileSync(file, textLine("u2", "替换后的短文件") + "\n", "utf8");
+  const page = readClaudeTranscript(file, first.nextCursor);
+
+  assert.equal(page.messages[0]?.kind, "notice");
+  assert.equal(page.messages[0]?.role, "system");
+  assert.ok(page.messages.some((message) => message.text === "替换后的短文件"));
+  assert.ok(page.messages.every((message) => message.id.length > 0));
+});

@@ -123,6 +123,8 @@ export interface CliOptions {
   fetch?: typeof fetch;
   /** 注入环境变量（隔离测试） */
   env?: NodeJS.ProcessEnv;
+  /** 注入 spawn（测试用；默认 node:child_process.spawn） */
+  spawnImpl?: typeof spawn;
 }
 
 interface Deps {
@@ -226,11 +228,15 @@ export async function start(options: CliOptions = {}): Promise<number> {
   const logPath = join(paths.logs, "daemon.log");
   const logFd = openSync(logPath, "a");
   try {
-    const child = spawn(process.execPath, [daemonEntry()], {
+    const spawnImpl = options.spawnImpl ?? spawn;
+    const child = spawnImpl(process.execPath, [daemonEntry()], {
       detached: true,
       stdio: ["ignore", logFd, logFd],
       env: process.env,
       cwd: process.cwd(),
+      // Windows：detached 子进程若不带 windowsHide，会新建一个控制台窗口。
+      // daemon 是后台常驻进程，必须完全隐藏；否则每次 Pi 自动拉起都会弹窗。
+      windowsHide: true,
     });
     child.unref();
   } finally {

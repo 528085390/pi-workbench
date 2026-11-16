@@ -147,6 +147,22 @@ test("attach: 3 条 update → seq 单调递增且全部落到该会话", () => 
   }
 });
 
+test("会话隔离: 带其他 sessionId 的 AdapterUpdate 不写入当前会话", () => {
+  const h = makeHarness();
+  try {
+    h.pipeline.attach(h.adapter, "claude:sess-1");
+    h.adapter.emit({ kind: "text", id: "foreign-1", text: "别串台", sessionId: "sess-2", raw: { messageId: "foreign-1" } });
+    h.adapter.emit({ kind: "text", id: "own-1", text: "自己的", sessionId: "sess-1", raw: { messageId: "own-1" } });
+
+    const events = h.store.list("claude:sess-1");
+    assert.deepEqual(events.map((event) => event.payload), [{ text: "自己的" }]);
+    assert.equal(eventCount(h.db), 1);
+    assert.ok(h.logs.some((message) => message.includes("其他会话") && message.includes("sess-2")));
+  } finally {
+    h.close();
+  }
+});
+
 test("R16 映射: 每个 AdapterUpdate.kind 对应唯一的 SessionEventType 与 payload", () => {
   const h = makeHarness();
   try {
@@ -272,6 +288,21 @@ test("R19 transcript 映射: text→token、thinking→thought、tool_call/tool_
     assert.deepEqual(events[2].payload, { text: "{\"path\":\"a\"}", toolName: "Read" });
     assert.deepEqual(events[3].payload, { text: "file body" });
     assert.deepEqual(events.map((e) => e.source), ["claude", "claude", "claude", "claude"]);
+  } finally {
+    h.close();
+  }
+});
+
+test("R19 transcript 映射: notice→notice（P2-1）", () => {
+  const h = makeHarness();
+  try {
+    const added = h.pipeline.ingestTranscript("claude:sess-1", [
+      transcriptMessage({ id: "t-notice", kind: "notice", role: "system", text: "游标归零" }),
+    ]);
+    assert.equal(added, 1);
+    const events = h.store.list("claude:sess-1");
+    assert.equal(events[0]?.type, "notice");
+    assert.deepEqual(events[0]?.payload, { text: "游标归零" });
   } finally {
     h.close();
   }

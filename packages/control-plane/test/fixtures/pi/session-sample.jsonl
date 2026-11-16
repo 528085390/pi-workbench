@@ -1,0 +1,3 @@
+{"type":"session","version":3,"id":"01a1e005-f219-7337-baa4-9470afbc39b3","timestamp":"2026-11-15T16:24:08.473Z","cwd":"E:\\pi-workbench"}
+{"type":"message","id":"5363d9c6","timestamp":"2026-11-15T16:24:08.676Z","message":{"role":"user","content":[{"type":"text","text":"只回复 OK"}]}}
+{"type":"message","id":"eb076c0e","timestamp":"2026-11-15T16:24:09.707Z","message":{"role":"assistant","content":[{"type":"text","text":"OK"}]}}

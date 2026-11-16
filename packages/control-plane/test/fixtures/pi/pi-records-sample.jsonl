@@ -1,0 +1,9 @@
+{"type":"session","version":3,"id":"01a1e005-f219-7337-baa4-9470afbc39b3","timestamp":"2026-11-15T16:24:08.473Z","cwd":"E:\\pi-workbench"}
+{"type":"model_change","id":"m1","parentId":null,"timestamp":"2026-11-15T16:24:08.500Z","provider":"zz","modelId":"deepseek-v4.1-flash"}
+{"type":"thinking_level_change","id":"t1","parentId":"m1","timestamp":"2026-11-15T16:24:08.501Z","thinkingLevel":"medium"}
+{"type":"message","id":"s1","parentId":"t1","timestamp":"2026-11-15T16:24:08.502Z","message":{"role":"system","content":"You are a coding assistant running inside pi."}}
+{"type":"message","id":"u1","parentId":"s1","timestamp":"2026-11-15T16:24:08.676Z","message":{"role":"user","content":[{"type":"text","text":"只回复 OK"}],"timestamp":1763223848676}}
+{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-11-15T16:24:09.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"先看看目录","thinkingSignature":"reasoning_content"},{"type":"toolCall","id":"call_00_abc","name":"bash","arguments":{"command":"ls"}}],"provider":"zz","model":"deepseek-v4.1-flash","stopReason":"toolUse"}}
+{"type":"message","id":"r1","parentId":"a1","timestamp":"2026-11-15T16:24:09.500Z","message":{"role":"toolResult","toolCallId":"call_00_abc","toolName":"bash","content":[{"type":"text","text":"file.txt"}],"details":{},"isError":false,"durationMs":120,"timestamp":1763223849500}}
+{"type":"message","id":"a2","parentId":"r1","timestamp":"2026-11-15T16:24:10.000Z","message":{"role":"assistant","content":[{"type":"text","text":"OK"}],"provider":"zz","model":"deepseek-v4.1-flash","stopReason":"stop"}}
+{"type":"custom_message","customType":"pi-workbench","content":"[pi-workbench] 1 个会话有更新","display":true,"id":"c1","parentId":"a2","timestamp":"2026-11-15T16:24:10.500Z"}

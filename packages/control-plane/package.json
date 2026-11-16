@@ -17,6 +17,7 @@
   },
   "dependencies": {
     "@agentclientprotocol/claude-agent-acp": "0.107.0",
+    "@agentclientprotocol/codex-acp": "2.6.0",
     "@agentclientprotocol/sdk": "2.6.0",
     "@fastify/websocket": "^11.3.7",
     "@pi-workbench/shared": "workspace:*",

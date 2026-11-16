@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "noEmit": true
+  },
+  "include": [
+    "pi-workbench.plugin.ts",
+    "src/**/*.ts",
+    "types/**/*.d.ts"
+  ]
+}

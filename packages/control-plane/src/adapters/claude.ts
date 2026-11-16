@@ -32,7 +32,7 @@ import type {
 import { WORKBENCH_VERSION } from "@pi-workbench/shared";
 import type { SessionStatus } from "@pi-workbench/shared";
 
-import type { Config, PermissionMode } from "../config.ts";
+import type { ClaudeInitialPermissionMode, Config, PermissionMode } from "../config.ts";
 import { isWorkbenchError, WorkbenchError } from "../errors.ts";
 import type { AdapterSpawnOptions, AdapterTurnResult, AdapterUpdate, AgentAdapter } from "./types.ts";
 
@@ -74,6 +74,7 @@ export class ClaudeAdapter implements AgentAdapter {
   readonly #child: ChildProcess;
   readonly #conn: ClientConnection;
   readonly #permissionMode: PermissionMode;
+  readonly #initialPermissionMode: ClaudeInitialPermissionMode | undefined;
   readonly #exit: Deferred<void>;
   readonly #stderr: string[];
   readonly #listeners = new Set<(update: AdapterUpdate) => void>();
@@ -85,9 +86,14 @@ export class ClaudeAdapter implements AgentAdapter {
   #downReason = PLACEHOLDER_DOWN_REASON;
   #disposed = false;
 
-  private constructor(child: ChildProcess, permissionMode: PermissionMode) {
+  private constructor(
+    child: ChildProcess,
+    permissionMode: PermissionMode,
+    initialPermissionMode?: ClaudeInitialPermissionMode,
+  ) {
     this.#child = child;
     this.#permissionMode = permissionMode;
+    this.#initialPermissionMode = initialPermissionMode;
     this.#exit = createDeferred<void>();
     this.#stderr = [];
 
@@ -147,14 +153,20 @@ export class ClaudeAdapter implements AgentAdapter {
 
     let child: ChildProcess;
     try {
-      child = spawnProcess(file, args, { cwd: options.cwd, env, stdio: ["pipe", "pipe", "pipe"] });
+      child = spawnProcess(file, args, {
+        cwd: options.cwd,
+        env,
+        stdio: ["pipe", "pipe", "pipe"],
+        // daemon 是后台进程，ACP 子进程也不能在 Windows 弹控制台窗口。
+        windowsHide: true,
+      });
     } catch (error) {
       throw new WorkbenchError("E_ADAPTER_DOWN", "启动 adapter 子进程失败：" + describeError(error), {
         adapterCmd: command,
       });
     }
 
-    const adapter = new ClaudeAdapter(child, cfg.claude.permissionMode);
+    const adapter = new ClaudeAdapter(child, cfg.claude.permissionMode, options.initialPermissionMode);
     try {
       await adapter.#handshake();
     } catch (error) {
@@ -171,6 +183,7 @@ export class ClaudeAdapter implements AgentAdapter {
       () => this.#conn.agent.request(methods.agent.session.new, { cwd }),
       SESSION_CALL_TIMEOUT_MS,
     );
+    await this.#applyInitialPermissionMode(response.sessionId);
     return { sessionId: response.sessionId };
   }
 
@@ -181,6 +194,7 @@ export class ClaudeAdapter implements AgentAdapter {
         () => this.#conn.agent.request(methods.agent.session.resume, { sessionId, cwd }),
         SESSION_CALL_TIMEOUT_MS,
       );
+      // 不在 resume 时重置权限模式：handback 必须保留人类在原生 TUI 里改过的模式。
     } catch (error) {
       const adapted = this.#adaptError(error, "resume");
       if (adapted.code === "E_ADAPTER_DOWN") {
@@ -191,6 +205,24 @@ export class ClaudeAdapter implements AgentAdapter {
         cause: adapted.message,
       });
     }
+  }
+
+  /** 新会话后显式设置权限模式；不依赖 settings.defaultMode（可能被信任过滤器降级）。 */
+  async #applyInitialPermissionMode(sessionId: string): Promise<void> {
+    const mode = this.#initialPermissionMode;
+    if (mode === undefined) {
+      return;
+    }
+    await this.#await(
+      "setPermissionMode",
+      () => this.#conn.agent.request(methods.agent.session.setConfigOption, {
+        sessionId,
+        configId: "mode",
+        type: "id",
+        value: mode,
+      }),
+      SESSION_CALL_TIMEOUT_MS,
+    );
   }
 
   /**
@@ -279,6 +311,11 @@ export class ClaudeAdapter implements AgentAdapter {
     } catch (error) {
       throw this.#adaptError(error, "waitForTurn");
     }
+  }
+
+  /** 子进程存活且未 markDown / dispose。 */
+  isAlive(): boolean {
+    return !this.#disposed && !this.#down && this.#child.exitCode === null && this.#child.signalCode === null;
   }
 
   onUpdate(cb: (update: AdapterUpdate) => void): () => void {
@@ -406,7 +443,7 @@ export class ClaudeAdapter implements AgentAdapter {
     const update = params.update;
     const mapped = mapSessionUpdate(update, () => this.#nextId());
     if (mapped !== null) {
-      this.#emit(mapped);
+      this.#emit({ ...mapped, sessionId: params.sessionId });
     }
     const record = asRecord(update);
     if (record === null || record["sessionUpdate"] !== "state_update" || record["state"] !== "idle") {
@@ -416,7 +453,7 @@ export class ClaudeAdapter implements AgentAdapter {
     if (stopReason === "error") {
       // C1：回合失败绝不能被当成成功。先 emit kind:"error"（监听者先看到原因），再 reject 该回合。
       const failure = turnFailureMessage(record);
-      this.#emit({ kind: "error", id: this.#nextId(), text: failure, raw: update });
+      this.#emit({ kind: "error", id: this.#nextId(), text: failure, sessionId: params.sessionId, raw: update });
       this.#failTurn(
         params.sessionId,
         new WorkbenchError("E_BAD_REQUEST", "回合失败：" + failure, {
@@ -434,6 +471,7 @@ export class ClaudeAdapter implements AgentAdapter {
       kind: "permission_request",
       id: this.#nextId(),
       text: params.title,
+      sessionId: params.sessionId,
       raw: params,
     });
     return permissionOutcome(this.#permissionMode, params.options);

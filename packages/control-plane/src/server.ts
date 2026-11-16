@@ -16,14 +16,16 @@ import { timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
 
-import type { Checkpoint, Driver, SessionCaps, SessionEvent, SessionRef } from "@pi-workbench/shared";
+import type { Checkpoint, Driver, SessionCaps, SessionEvent, SessionRef, UnifiedMessage } from "@pi-workbench/shared";
 import { WORKBENCH_VERSION } from "@pi-workbench/shared";
 import fastifyWebsocket from "@fastify/websocket";
 import Fastify from "fastify";
 import type { FastifyError, FastifyInstance, FastifyRequest } from "fastify";
 
-import type { AgentAdapter } from "./adapters/types.ts";
-import { CLAUDE_CAPABILITIES } from "./capabilities.ts";
+import type { AdapterUpdate, AgentAdapter } from "./adapters/types.ts";
+import type { AgentRouter } from "./agents/router.ts";
+import type { AgentStatus } from "./agents/types.ts";
+import { capsOf, CLAUDE_CAPABILITIES } from "./capabilities.ts";
 import type { CheckpointStore } from "./checkpoints.ts";
 import type { Config } from "./config.ts";
 import { SCHEMA_VERSION } from "./db.ts";
@@ -33,8 +35,7 @@ import type { WorkbenchErrorCode } from "./errors.ts";
 import type { EventStore } from "./events.ts";
 import type { LeaseManager } from "./lease.ts";
 import type { SessionFilter, SessionRegistry } from "./registry.ts";
-import { readClaudeTranscript } from "./transcript/claude.ts";
-import type { UnifiedMessage } from "./transcript/claude.ts";
+import { readTranscript } from "./transcript/index.ts";
 import type { TakeoverEngine } from "./takeover.ts";
 
 /** 路由前缀（spec §6：统一 /api/cp；T1 的裸 /health 保留为别名） */
@@ -57,10 +58,10 @@ export type ServerTranscriptReader = (
 
 /**
  * 事件管线的结构依赖：只要求 attach，不 import pipeline 模块（避免 server 与 pipeline 双向耦合）。
- * EventPipeline.attach(adapter, sessionKey) 正好满足。
+ * EventPipeline.attach(source, sessionKey) 对 AgentAdapter 与 AgentDriver 都成立（B08 M2）。
  */
 export type PipelineLike = {
-  attach(adapter: AgentAdapter, sessionKey: string): () => void;
+  attach(source: { onUpdate(cb: (update: AdapterUpdate) => void): () => void }, sessionKey: string): () => void;
 };
 
 /** createServer 的依赖（R38 / R46：比 brief 多 adapter 与 checkpoints） */
@@ -72,11 +73,20 @@ export type ServerDeps = {
   engine: TakeoverEngine;
   /** /agents 的可用性判定 + 上层优雅关闭（本层不 dispose 它） */
   adapter: AgentAdapter;
+  /** Agent 注册表（0.5-B B01-b）：传入时 /agents 与 dispatch 走注册表；缺省保持 0.5-A 行为 */
+  router?: AgentRouter;
   /** GET /sessions/:key/checkpoint 直接读它（R46，不经 engine） */
   checkpoints: CheckpointStore;
   /** 每读者未读游标（spec §6.5） */
   cursors: ReadCursorStore;
   readTranscript?: ServerTranscriptReader;
+  /**
+   * GET /agents 的动态数据源（启动探测 / 周期刷新）。
+   * 传入时按 30s 缓存；缺省直接用 router.list()（或 0.5-A 的单行描述）。
+   */
+  agentStatuses?: () => Promise<AgentStatus[]>;
+  /** 注入时钟（测试缓存过期），默认 Date.now */
+  now?: () => number;
   pipeline?: PipelineLike;
   /**
    * 内部错误（500）的落点。Fastify 以 logger:false 建实例，`app.log.error` 是 no-op，
@@ -136,6 +146,7 @@ export const STATUS_BY_CODE: Readonly<Record<WorkbenchErrorCode, number>> = {
   E_NO_LEASE: 409,
   E_IDEMPOTENCY_CONFLICT: 409,
   E_CAP_UNSUPPORTED: 422,
+  E_AGENT_UNAVAILABLE: 422,
   E_ADAPTER_DOWN: 503,
   E_RESUME_REJECTED: 503,
 };
@@ -149,11 +160,15 @@ export const INTERNAL_ERROR_CODE = "E_INTERNAL";
 export const INTERNAL_ERROR_MESSAGE = "internal error";
 
 const ROUTE_LIST = "GET /sessions";
+const ROUTE_DISCOVER = "GET /sessions/discover";
+/** 发现路由默认上限：避免上千 rollout 一次性登记/挂管线；显式 limit 可覆盖。 */
+const DEFAULT_DISCOVER_LIMIT = 100;
 const ROUTE_DETAIL = "GET /sessions/:key";
 const ROUTE_TRANSCRIPT = "GET /sessions/:key/transcript";
 const ROUTE_LEASE = "POST /sessions/:key/lease";
 const ROUTE_INJECT = "POST /sessions/:key/inject";
 const ROUTE_INTERRUPT = "POST /sessions/:key/interrupt";
+const ROUTE_ATTACH = "POST /sessions/:key/attach";
 const ROUTE_CHECKPOINT = "POST /sessions/:key/checkpoint";
 const ROUTE_HANDOFF = "POST /sessions/:key/handoff";
 const ROUTE_HANDBACK = "POST /sessions/:key/handback";
@@ -161,8 +176,12 @@ const ROUTE_DISPATCH = "POST /dispatch";
 const ROUTE_UNREAD = "GET /sessions/:key/unread";
 const ROUTE_READ = "POST /sessions/:key/read";
 
+/** GET /agents 的缓存窗口（spec §11.1：30s 内不重复探测） */
+export const AGENT_STATUS_CACHE_MS = 30_000;
+
+/** 默认读取器：按会话 agent 走统一的 transcript 路由器，缺省参数保持 0.5-A 的 Claude 语义 */
 const defaultReader: ServerTranscriptReader = (path, cursor, limit) =>
-  readClaudeTranscript(path, cursor ?? "0", limit);
+  readTranscript("claude", path, cursor ?? "0", limit);
 
 /**
  * 装配 Fastify 实例：不 listen（R38）。
@@ -173,15 +192,85 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
   assertAuthConfig(deps.config);
 
   const { config } = deps;
-  const readTranscript = deps.readTranscript ?? defaultReader;
+  /**
+   * 统一读路径（0.5-B B06）：按会话 agent 选择 transcript parser。
+   * 0.5-A 注入的 ServerTranscriptReader 仍是 path-only 旧签名，优先调用它，
+   * 保证既有 Claude 测试与字节游标语义逐字不变。
+   */
+  const readPage = (
+    agent: SessionRef["agent"],
+    path: string,
+    cursor: string,
+    limit?: number,
+  ): { messages: UnifiedMessage[]; nextCursor: string; pending: boolean } => {
+    if (deps.readTranscript !== undefined) {
+      return deps.readTranscript(path, cursor, limit);
+    }
+    return readTranscript(agent, path, cursor, limit);
+  };
   /**
    * "还剩几条"专用读取（B1）：limit=Infinity，读到 EOF。
    * viewOf / POST /read 过去漏传 limit，被生产默认 200 截断 → unread 封顶、/read 读不完。
    * 走注入的 reader，测试里的假 reader 也要按"读到底"返回。
    */
-  const readToEnd = (path: string, cursor: string): { messages: UnifiedMessage[]; nextCursor: string } =>
-    readTranscript(path, cursor, Number.POSITIVE_INFINITY);
+  const readToEnd = (
+    agent: SessionRef["agent"],
+    path: string,
+    cursor: string,
+  ): { messages: UnifiedMessage[]; nextCursor: string } =>
+    readPage(agent, path, cursor, Number.POSITIVE_INFINITY);
   const startedAt = Date.now();
+  const now = deps.now ?? Date.now;
+  /** GET /agents 的 30s 缓存（spec §11.1）：探测器可能跑子进程，不能每个请求都打一遍 */
+  let agentCache: { at: number; statuses: AgentStatus[] } | null = null;
+  const currentAgents = async (): Promise<AgentStatus[] | AgentDescriptor[]> => {
+    if (deps.agentStatuses === undefined) {
+      return deps.router === undefined ? [describeAgent(config, deps.adapter)] : deps.router.list();
+    }
+    const at = now();
+    if (agentCache !== null && at - agentCache.at < AGENT_STATUS_CACHE_MS) {
+      return agentCache.statuses;
+    }
+    try {
+      const statuses = await deps.agentStatuses();
+      agentCache = { at, statuses };
+      return statuses;
+    } catch {
+      // 探测层异常不能把 /agents 拖成 500：回退到注册表最后一次快照
+      return deps.router?.list() ?? [describeAgent(config, deps.adapter)];
+    }
+  };
+
+  /** 任意已登记会话接入事件流（B08 M2/P2-3）：dispatch、发现、登记、handback 共用。 */
+  const attachPipeline = (session: SessionRef): void => {
+    try {
+      const driver = deps.router?.get(session.agent) ?? null;
+      if (driver !== null) {
+        deps.pipeline?.attach(driver, session.key);
+      } else if (session.agent === "claude") {
+        deps.pipeline?.attach(deps.adapter, session.key);
+      }
+    } catch (err) {
+      process.stderr.write("[pi-workbench] 挂事件管线失败（不影响请求返回）：" + String(err) + "\n");
+    }
+  };
+
+  /**
+   * 0.5-B 唤醒修复：Codex 的 rollout 路径可能在 dispatch 之后才落盘。
+   * 列表/未读/transcript 在路径为空时尝试让 engine 补解析一次，并更新注册表；
+   * 这样 unread 与 TurnNotifier 才能看到真实消息数，而不是永远为 0。
+   */
+  const ensureTranscriptPath = async (session: SessionRef): Promise<SessionRef> => {
+    const path = session.transcriptPath;
+    if (path !== undefined && path.length > 0) {
+      return session;
+    }
+    if (typeof deps.engine.refreshTranscriptPath !== "function") {
+      return session;
+    }
+    const resolved = await deps.engine.refreshTranscriptPath(session.key).catch(() => undefined);
+    return resolved === undefined || resolved.length === 0 ? session : { ...session, transcriptPath: resolved };
+  };
 
   const app = Fastify({ logger: false });
   const logError = deps.logError ?? ((error: unknown): void => { console.error("[pi-workbenchd] 未处理异常", error); });
@@ -198,7 +287,7 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
     if (path !== undefined && path.length > 0) {
       try {
         // B1：必须是"读到 EOF 的消息数"，不能受分页默认上限影响
-        unread = readToEnd(path, lastReadCursor).messages.length;
+        unread = readToEnd(session.agent, path, lastReadCursor).messages.length;
       } catch {
         unread = 0;
       }
@@ -266,7 +355,41 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
 
       api.get(HEALTH_PATH, health);
 
-      api.get("/agents", async () => [describeAgent(config, deps.adapter)]);
+      // 0.5-B B01-b：有注册表时由 router.list() 动态生成；缺省保留 0.5-A 的 claude-only 描述
+      api.get("/agents", async () => await currentAgents());
+
+      // 0.5-B B08（评审 M4）：发现层必须有产品出口，否则用户无法让 daemon 认识既有原生会话。
+      // GET /sessions/discover?agent=codex&cwd=...&limit=... → 发现并登记（幂等 upsert），返回登记后的 SessionRef。
+      api.get("/sessions/discover", async (request) => {
+        const query = queryOf(request);
+        const agent = optionalString(query, "agent", ROUTE_DISCOVER);
+        if (agent === undefined || agent.trim().length === 0) {
+          throw new WorkbenchError("E_BAD_REQUEST", ROUTE_DISCOVER + " 必须带 agent", { route: ROUTE_DISCOVER });
+        }
+        const driver = deps.router?.get(agent) ?? null;
+        if (driver === null) {
+          throw new WorkbenchError("E_AGENT_UNAVAILABLE", "Agent 未注册或不可用：" + agent, { agent });
+        }
+        const cwd = optionalString(query, "cwd", ROUTE_DISCOVER);
+        const rawLimit = query["limit"];
+        let limit = DEFAULT_DISCOVER_LIMIT;
+        if (typeof rawLimit === "string" && rawLimit.trim().length > 0) {
+          limit = Number(rawLimit);
+          if (!Number.isInteger(limit) || limit <= 0) {
+            throw new WorkbenchError("E_BAD_REQUEST", ROUTE_DISCOVER + " 的 limit 必须是正整数", { limit: rawLimit });
+          }
+        }
+        const refs = await driver.discover({
+          ...(cwd === undefined || cwd.length === 0 ? {} : { cwd }),
+          limit,
+        });
+        // P1-1：发现结果只做「缺失时插入 / 补 transcriptPath」，绝不把活跃会话打回 idle。
+        const registered = refs.map((ref) => deps.registry.registerDiscovered(ref).session);
+        for (const session of registered) {
+          attachPipeline(session);
+        }
+        return { sessions: registered, count: registered.length };
+      });
 
       api.get("/sessions", async (request) => {
         const query = queryOf(request);
@@ -282,15 +405,49 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         const sessions = deps.registry.list(filter);
         // 不带 clientId 时保持 v1 的形状（纯 SessionRef 数组），带则每项附读状态（spec §6.5）
         const clientId = optionalString(query, "clientId", ROUTE_LIST);
-        return clientId === undefined ? sessions : sessions.map((session) => viewOf(session, clientId));
+        if (clientId === undefined) {
+          return sessions;
+        }
+        const views = await Promise.all(sessions.map(async (session) => viewOf(await ensureTranscriptPath(session), clientId)));
+        return views;
+      });
+
+      // B08 M4：登记一个已存在的原生会话（发现结果 / 外部扫描器都走这里，不再直接写库）。
+      api.post("/sessions", async (request) => {
+        const routeName = "POST /sessions";
+        const body = bodyOf(request.body, routeName);
+        const agent = requireString(body, "agent", routeName);
+        const nativeId = requireString(body, "nativeId", routeName);
+        const cwd = requireString(body, "cwd", routeName);
+        const key = optionalString(body, "key", routeName) ?? agent + ":" + nativeId;
+        const transcriptPath = optionalString(body, "transcriptPath", routeName);
+        const driver = deps.router?.get(agent) ?? null;
+        if (driver === null && deps.router !== undefined) {
+          throw new WorkbenchError("E_AGENT_UNAVAILABLE", "Agent 未注册或不可用：" + agent, { agent });
+        }
+        const ref: SessionRef = {
+          key,
+          agent,
+          nativeId,
+          cwd,
+          ...(transcriptPath === undefined || transcriptPath.length === 0 ? {} : { transcriptPath }),
+          status: "idle",
+          driver: "none",
+          capabilities: driver === null ? capsOf(agent) : driver.caps,
+          kind: "interactive",
+        };
+        const registered = deps.registry.registerDiscovered(ref);
+        attachPipeline(registered.session);
+        return { session: registered.session, created: registered.created };
       });
 
       api.get("/sessions/:key", async (request) => {
         const key = paramOf(request, "key");
         const session = requireSession(deps.registry, key);
         const clientId = optionalString(queryOf(request), "clientId", ROUTE_DETAIL);
+        const resolved = clientId === undefined ? session : await ensureTranscriptPath(session);
         return {
-          session: clientId === undefined ? session : viewOf(session, clientId),
+          session: clientId === undefined ? resolved : viewOf(resolved, clientId),
           lease: deps.leases.current(key),
         };
       });
@@ -301,12 +458,19 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         const query = queryOf(request);
         const after = optionalString(query, "after", ROUTE_TRANSCRIPT) ?? "0";
         const limit = optionalPositiveInt(query, "limit", ROUTE_TRANSCRIPT);
-        const path = session.transcriptPath;
+        const resolved = await ensureTranscriptPath(session);
+        const path = resolved.transcriptPath;
         if (path === undefined || path.length === 0) {
-          // 没有 transcript 路径（会话刚建 / 非 Claude）→ 空页，游标停在调用方给的位置
+          // 0.5-B：Codex/Pi 的会话文件由各自驱动懒解析（spec §7.1）。路径未解析出来时
+          // 委派 driver.see；驱动没有 see 或解析不到，才返回空页（游标停在调用方给的位置）。
+          const driver = deps.router?.get(resolved.agent) ?? null;
+          if (driver !== null && typeof driver.see === "function") {
+            const page = await driver.see(resolved, after, limit);
+            return { messages: page.messages, nextCursor: page.nextCursor, pending: page.pending };
+          }
           return { messages: [] as UnifiedMessage[], nextCursor: after };
         }
-        const page = readTranscript(path, after, limit);
+        const page = readPage(resolved.agent, path, after, limit);
         return { messages: page.messages, nextCursor: page.nextCursor };
       });
 
@@ -319,11 +483,12 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         const limit = optionalPositiveInt(query, "limit", ROUTE_UNREAD);
         const ack = optionalBoolean(query, "ack", ROUTE_UNREAD) ?? false;
         const lastReadCursor = deps.cursors.cursorOf(key, clientId);
-        const path = session.transcriptPath;
+        const resolved = await ensureTranscriptPath(session);
+        const path = resolved.transcriptPath;
         const page =
           path === undefined || path.length === 0
             ? { messages: [] as UnifiedMessage[], nextCursor: lastReadCursor, pending: true }
-            : readTranscript(path, lastReadCursor, limit);
+            : readPage(resolved.agent, path, lastReadCursor, limit);
         if (ack) {
           deps.cursors.set(key, clientId, page.nextCursor);
         }
@@ -331,14 +496,16 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         // peek（ack=0）游标没动 → 必须从 lastReadCursor 数；只有真推进了才从 nextCursor 数。
         const baseCursor = ack ? page.nextCursor : lastReadCursor;
         const remaining =
-          path === undefined || path.length === 0 ? 0 : readToEnd(path, baseCursor).messages.length;
+          path === undefined || path.length === 0
+            ? 0
+            : readToEnd(resolved.agent, path, baseCursor).messages.length;
         return {
           messages: page.messages,
           nextCursor: page.nextCursor,
           lastReadCursor: ack ? page.nextCursor : lastReadCursor,
           unread: remaining,
           pageCount: page.messages.length,
-          awaiting: session.status === "needs-input",
+          awaiting: resolved.status === "needs-input",
           acked: ack,
         };
       });
@@ -350,14 +517,15 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         const body = bodyOf(request.body, ROUTE_READ);
         const clientId = requireString(body, "clientId", ROUTE_READ);
         const explicit = optionalCursor(body, "cursor", ROUTE_READ);
+        const resolved = await ensureTranscriptPath(session);
         let target = explicit;
         if (target === undefined) {
-          const path = session.transcriptPath;
+          const path = resolved.transcriptPath;
           // B1：不给游标 = 读到 EOF（全部已读），不能用分页默认上限
           target =
             path === undefined || path.length === 0
               ? deps.cursors.cursorOf(key, clientId)
-              : readToEnd(path, deps.cursors.cursorOf(key, clientId)).nextCursor;
+              : readToEnd(resolved.agent, path, deps.cursors.cursorOf(key, clientId)).nextCursor;
         }
         const cursor = deps.cursors.set(key, clientId, target);
         return { sessionKey: key, clientId: cursor.clientId, lastReadCursor: cursor.lastReadCursor, updatedAt: cursor.updatedAt };
@@ -384,6 +552,39 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         deps.leases.release(key, clientId);
         // spec §6 该行标的是 Lease，但 release 之后已无租约可返回：回 {released:true} 供调用方断言
         return { released: true, sessionKey: key, clientId };
+      });
+
+      /**
+       * 建立控制通道（规格 §6.1 attach / §14 Gate #4）。
+       * 能力裁决用**会话声明的 caps**：Claude 的 attach 随 kind 变化（交互式 false / 后台 true），
+       * driver.caps 只是交互式快照；Codex/Pi 两者都是 false。缺能力时在调用 driver 之前 422，
+       * 不产生任何 ACP / RPC 子进程调用。
+       */
+      api.post("/sessions/:key/attach", async (request) => {
+        const key = paramOf(request, "key");
+        const session = requireSession(deps.registry, key);
+        if (deps.router === undefined) {
+          throw new WorkbenchError("E_AGENT_UNAVAILABLE", "Agent 注册表未启用，无法 attach：" + session.agent, {
+            agent: session.agent,
+            cap: "attach",
+          });
+        }
+        const driver = deps.router.get(session.agent);
+        if (driver === null) {
+          throw new WorkbenchError("E_AGENT_UNAVAILABLE", "Agent 未注册或不可用：" + session.agent, {
+            agent: session.agent,
+            cap: "attach",
+          });
+        }
+        const declared = session.capabilities;
+        if (declared.attach !== true) {
+          throw new WorkbenchError("E_CAP_UNSUPPORTED", "Agent " + session.agent + " 不支持能力 attach", {
+            agent: session.agent,
+            cap: "attach",
+          });
+        }
+        await driver.attach(session);
+        return { attached: true, sessionKey: key, agent: session.agent };
       });
 
       api.post("/sessions/:key/inject", async (request) => {
@@ -447,25 +648,32 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         requireSession(deps.registry, key);
         const body = bodyOf(request.body, ROUTE_HANDBACK);
         const clientId = requireString(body, "clientId", ROUTE_HANDBACK);
-        return await deps.engine.handback(key, clientId);
+        const result = await deps.engine.handback(key, clientId);
+        const session = deps.registry.get(key);
+        if (session !== null) {
+          attachPipeline(session);
+        }
+        return result;
       });
 
       api.post("/dispatch", async (request) => {
-        const body = bodyOf(request.body, ROUTE_DISPATCH);
-        const agent = requireString(body, "agent", ROUTE_DISPATCH);
-        if (agent !== "claude") {
-          throw new WorkbenchError("E_BAD_REQUEST", "v1 只支持 dispatch claude 会话", { agent });
+        // 0.5-B：启动探测是后台跑的，探测未完成时 codex/pi 会以 available=false + reason 注册；
+        // 首次 dispatch 前先等这一次探测（3s 上限、in-flight 复用），避免刚启动就误报 E_AGENT_UNAVAILABLE。
+        try {
+          // 复用 /agents 的 30s 缓存；deps.agentStatuses 缺省时 currentAgents() 直接读注册表
+          await currentAgents();
+        } catch {
+          // 探测失败照常走注册表快照，由下面的可用性判定给出结构化错误
         }
+        const body = bodyOf(request.body, ROUTE_DISPATCH);
+        // 0.5-B B01-b：agent 缺省 claude（保持 0.5-A 调用方兼容），透传给引擎按注册表判可用
+        const agent = optionalString(body, "agent", ROUTE_DISPATCH) ?? "claude";
         const task = requireString(body, "task", ROUTE_DISPATCH);
         const idempotencyKey = requireString(body, "idempotencyKey", ROUTE_DISPATCH);
         const cwd = optionalString(body, "cwd", ROUTE_DISPATCH);
-        const ref = await deps.engine.dispatch({ agent: "claude", task, cwd, idempotencyKey });
+        const ref = await deps.engine.dispatch({ agent, task, cwd, idempotencyKey });
         // 新会话挂事件管线，后续 ACP update 才会被归一化成事件（R39 的 pipeline 接线落点）
-        try {
-          deps.pipeline?.attach(deps.adapter, ref.key);
-        } catch (err) {
-          process.stderr.write("[pi-workbench] 挂事件管线失败（不影响 dispatch 返回）：" + String(err) + "\n");
-        }
+        attachPipeline(ref);
         return ref;
       });
 

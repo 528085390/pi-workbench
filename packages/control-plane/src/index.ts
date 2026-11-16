@@ -1,16 +1,27 @@
-import { realpathSync } from "node:fs";
-import { resolve } from "node:path";
+import { execFile } from "node:child_process";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+import type { AgentName, SessionRef } from "@pi-workbench/shared";
 
 import { ClaudeAdapter } from "./adapters/claude.ts";
+import { ClaudeDriver } from "./agents/claude-driver.ts";
+import { CodexDriver } from "./agents/codex-driver.ts";
+import type { CodexWriteAction } from "./agents/codex-driver.ts";
+import { PiDriver, resolvePiPackageDir } from "./agents/pi-driver.ts";
+import { AgentRouter } from "./agents/router.ts";
+import type { AgentDriver } from "./agents/types.ts";
+import { hideWindowsChildProcesses } from "./child-process.ts";
 import { CheckpointStore } from "./checkpoints.ts";
 import type { Config } from "./config.ts";
 import { loadConfig } from "./config.ts";
 import { ReadCursorStore } from "./cursors.ts";
 import { migrate, openDb } from "./db.ts";
 import { DispatchStore } from "./dispatch-store.ts";
-import { isWorkbenchError } from "./errors.ts";
+import { isWorkbenchError, WorkbenchError } from "./errors.ts";
 import { EventStore } from "./events.ts";
 import { LeaseManager } from "./lease.ts";
 import { InstanceLockError, acquireInstanceLock, ensureDirs, resolvePaths } from "./paths.ts";
@@ -21,12 +32,245 @@ import { startServer } from "./server.ts";
 import type { ServerHandle } from "./server.ts";
 import { TakeoverEngine } from "./takeover.ts";
 
+/** 与 index 装配的 PiDriver 保持一致的写者身份（takeover.ts 的 piClientId 必须同值） */
+export const PI_AGENT_CLIENT_ID = "pi";
+
+/**
+ * Codex 写守卫（B08 S6/P0-1）：TakeoverEngine 在 driver 写操作期间把租约临时换到
+ * PI_AGENT_CLIENT_ID，因此这里比较的是引擎身份，而不是 HTTP 调用方的 pi:<pid>。
+ * handoff/close 发生在租约转交给 human 之后，不能按 writer 身份拦截。
+ */
+export function makeCodexWriteGuard(
+  leases: LeaseManager,
+): (ref: SessionRef, action: CodexWriteAction) => void {
+  return (ref, action) => {
+    if (action === "handoff" || action === "close") {
+      return;
+    }
+    const lease = leases.current(ref.key);
+    if (lease !== null && lease.clientId !== PI_AGENT_CLIENT_ID) {
+      throw new WorkbenchError("E_LEASE_CONFLICT", "租约被其他客户端持有：" + lease.clientId, {
+        sessionKey: ref.key,
+        heldBy: lease.clientId,
+      });
+    }
+  };
+}
+
+/** spec §11.1：单个探测子进程 / 动态 import 的硬超时 */
+export const PROBE_TIMEOUT_MS = 3000;
+
+export type AgentProbe = {
+  agent: AgentName;
+  available: boolean;
+  version: string | null;
+  /** available=false 时以 E_AGENT_UNAVAILABLE: 开头，机器可读 */
+  reason?: string;
+};
+
+export type ProbeCommandRunner = (command: string, args: string[], timeoutMs: number) => Promise<string>;
+
+export type ProbeOptions = {
+  /** 覆盖子进程执行（测试注入；默认 execFile） */
+  runCommand?: ProbeCommandRunner;
+  /** 覆盖文件存在判断（测试注入） */
+  fileExists?: (path: string) => boolean;
+  /** 覆盖 package.json 版本读取（测试注入） */
+  readPackageVersion?: (entry: string) => string;
+  /** 覆盖 pi 包动态 import（测试注入） */
+  importPi?: () => Promise<unknown>;
+  /** 覆盖 home（默认 homedir；测试可指向临时目录） */
+  home?: string;
+};
+
+/**
+ * 启动探测（spec §11.1）：三个探测器并行、各自 3s 超时，任何失败只返回
+ * available=false + reason，绝不抛出、绝不阻塞 daemon 启动。
+ */
+export async function probeAgents(config: Config, options: ProbeOptions = {}): Promise<AgentProbe[]> {
+  const run = options.runCommand ?? runProbeCommand;
+  const fileExists = options.fileExists ?? existsSync;
+  const readVersion = options.readPackageVersion ?? readPackageVersionOf;
+  const importPi = options.importPi ?? importPiPackage;
+  const home = options.home ?? homedir();
+  return await Promise.all([
+    safeProbe("claude", async () => await probeClaude(config, fileExists, readVersion)),
+    safeProbe("codex", async () => await probeCodex(home, fileExists, run)),
+    safeProbe("pi", async () => await probePi(importPi, run)),
+  ]);
+}
+
+async function safeProbe(agent: AgentName, probe: () => Promise<AgentProbe>): Promise<AgentProbe> {
+  try {
+    return await probe();
+  } catch (err) {
+    return unavailable(agent, errorMessage(err));
+  }
+}
+
+async function probeClaude(
+  config: Config,
+  fileExists: (path: string) => boolean,
+  readVersion: (entry: string) => string,
+): Promise<AgentProbe> {
+  const cmd = config.claude.adapterCmd;
+  if (cmd.length === 0) {
+    return unavailable("claude", "claude.adapterCmd 为空");
+  }
+  const head = cmd[0] ?? "";
+  if (isAbsolute(head) && !fileExists(head)) {
+    return unavailable("claude", "适配器可执行文件不存在：" + head);
+  }
+  const entry = cmd.length > 1 && isNodeLike(head) ? cmd[1] : head;
+  if (entry !== undefined && isAbsolute(entry) && !fileExists(entry)) {
+    return unavailable("claude", "适配器入口不存在：" + entry);
+  }
+  return { agent: "claude", available: true, version: entry === undefined ? "unknown" : readVersion(entry) };
+}
+
+async function probeCodex(
+  home: string,
+  fileExists: (path: string) => boolean,
+  run: ProbeCommandRunner,
+): Promise<AgentProbe> {
+  const authPath = join(home, ".codex", "auth.json");
+  if (!fileExists(authPath)) {
+    return unavailable("codex", "codex 未登录（~/.codex/auth.json 不存在）");
+  }
+  try {
+    const output = await run("codex", ["--version"], PROBE_TIMEOUT_MS);
+    return { agent: "codex", available: true, version: parseVersion(output) };
+  } catch (err) {
+    return unavailable("codex", "codex --version 失败：" + timeoutReason(err, "codex --version"));
+  }
+}
+
+async function probePi(importPi: () => Promise<unknown>, run: ProbeCommandRunner): Promise<AgentProbe> {
+  try {
+    await withProbeTimeout(importPi(), PROBE_TIMEOUT_MS, "pi 包动态 import");
+  } catch (err) {
+    return unavailable("pi", "pi 包动态 import 失败：" + timeoutReason(err, "pi 包动态 import"));
+  }
+  try {
+    const output = await run("pi", ["--version"], PROBE_TIMEOUT_MS);
+    return { agent: "pi", available: true, version: parseVersion(output) };
+  } catch (err) {
+    return unavailable("pi", "pi --version 失败：" + timeoutReason(err, "pi --version"));
+  }
+}
+
+function unavailable(agent: AgentName, reason: string): AgentProbe {
+  return {
+    agent,
+    available: false,
+    version: null,
+    reason: reason.startsWith("E_AGENT_UNAVAILABLE:") ? reason : "E_AGENT_UNAVAILABLE: " + reason,
+  };
+}
+
+function runProbeCommand(command: string, args: string[], timeoutMs: number): Promise<string> {
+  return new Promise<string>((resolvePromise, rejectPromise) => {
+    // Windows 上 npm 全局安装的 codex / pi 只有 .cmd shim，execFile 直接调用会 ENOENT；
+    // 经 cmd.exe /d /s /c 解析（命令与参数都来自固定探测，不接受用户输入）。
+    const file = process.platform === "win32" ? "cmd.exe" : command;
+    const finalArgs = process.platform === "win32" ? ["/d", "/s", "/c", command, ...args] : args;
+    execFile(
+      file,
+      finalArgs,
+      { timeout: timeoutMs, killSignal: "SIGKILL", windowsHide: true, maxBuffer: 1024 * 1024, encoding: "utf8" },
+      (error, stdout) => {
+        if (error !== null) {
+          rejectPromise(error);
+          return;
+        }
+        resolvePromise(String(stdout).trim());
+      },
+    );
+  });
+}
+
+async function importPiPackage(): Promise<unknown> {
+  const dir = resolvePiPackageDir();
+  if (dir === null) {
+    throw new Error("找不到 @earendil-works/pi-coding-agent");
+  }
+  return await import(pathToFileURL(join(dir, "dist", "index.js")).href);
+}
+
+function readPackageVersionOf(entry: string): string {
+  let dir = dirname(entry);
+  for (let depth = 0; depth < 6; depth += 1) {
+    const manifest = join(dir, "package.json");
+    if (existsSync(manifest)) {
+      try {
+        const pkg: unknown = JSON.parse(readFileSync(manifest, "utf8"));
+        if (typeof pkg === "object" && pkg !== null && typeof (pkg as { version?: unknown }).version === "string") {
+          return (pkg as { version: string }).version;
+        }
+      } catch {
+        return "unknown";
+      }
+    }
+    const parent = dirname(dir);
+    if (parent === dir) {
+      break;
+    }
+    dir = parent;
+  }
+  return "unknown";
+}
+
+function parseVersion(output: string): string {
+  const match = output.match(/\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?/);
+  if (match !== null) {
+    return match[0];
+  }
+  const first = output.split(/\r?\n/, 1)[0]?.trim() ?? "";
+  return first.length === 0 ? "unknown" : first;
+}
+
+function isNodeLike(command: string): boolean {
+  return /node(?:\.exe)?$/i.test(command);
+}
+
+function isTimeoutError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) {
+    return false;
+  }
+  const record = error as { killed?: unknown; code?: unknown; signal?: unknown };
+  return record.killed === true || record.code === "ETIMEDOUT" || record.signal === "SIGKILL";
+}
+
+function timeoutReason(error: unknown, label: string): string {
+  return isTimeoutError(error) ? label + " 探测超时（" + String(PROBE_TIMEOUT_MS) + "ms）" : errorMessage(error);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function withProbeTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(label + " 超时（" + String(timeoutMs) + "ms）"));
+    }, timeoutMs);
+    timer.unref();
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  });
+}
+
 /**
  * daemon 主流程（R39）：读配置 → 抢单实例锁 → 开库迁移 → 装配 store / adapter / 管线 / 引擎 →
  * startServer → 打印监听地址；SIGINT / SIGTERM 时 app.close + adapter.dispose + 释放锁。
  * 抽成函数是为了让本模块可被导入而不产生副作用（测试 / 复用），只有直接执行时才启动。
  */
 export async function main(): Promise<void> {
+  hideWindowsChildProcesses();
   const config = loadConfig();
   const paths = resolvePaths(config.home);
   ensureDirs(paths);
@@ -61,7 +305,9 @@ export async function main(): Promise<void> {
 
   let adapter: ClaudeAdapter;
   try {
-    adapter = await ClaudeAdapter.spawn(config);
+    adapter = await ClaudeAdapter.spawn(config, {
+      initialPermissionMode: config.claude.initialPermissionMode,
+    });
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     console.error("[pi-workbenchd] E_ADAPTER_DOWN：Claude ACP adapter 启动失败（" + reason + "）");
@@ -73,14 +319,79 @@ export async function main(): Promise<void> {
 
   // 事件管线：dispatch 出新会话时由 server 挂到 adapter（见 server.ts 的 pipeline 依赖）
   const pipeline = new EventPipeline(store, registry);
+
+  // 0.5-B B06：三 Agent 注册表。PiDriver 必须与接管层共用同一个 LeaseManager，
+  // 并用固定 clientId "pi"（引擎在写操作期间临时换租约，见 takeover.ts #driverWrite）。
+  const router = new AgentRouter();
+  const claudeDriver = new ClaudeDriver(adapter);
+  // B08 S6/P0-1：driver 级再兜一层租约检查。dispatch 首轮 inject 没有 lease（0.5-A 口径），放行；
+  // 若已有别的 writer，则在碰 ACP 之前直接 E_LEASE_CONFLICT，不依赖调用方一定走 TakeoverEngine。
+  const codexDriver = new CodexDriver(config, {
+    authorizeWrite: makeCodexWriteGuard(leases),
+  });
+  const piDriver = new PiDriver({
+    lease: leases,
+    clientId: PI_AGENT_CLIENT_ID,
+    rpcCmd: config.pi.rpcCmd,
+    ...(config.pi.provider === undefined ? {} : { provider: config.pi.provider }),
+    ...(config.pi.model === undefined ? {} : { model: config.pi.model }),
+  });
+  const drivers: Record<string, AgentDriver> = {
+    claude: claudeDriver,
+    codex: codexDriver,
+    pi: piDriver,
+  };
+  for (const driver of Object.values(drivers)) {
+    router.register(driver, {
+      available: driver.agent === "claude",
+      version: "unknown",
+      ...(driver.agent === "claude" ? {} : { reason: "E_AGENT_UNAVAILABLE: 启动探测尚未完成" }),
+    });
+  }
+  /**
+   * GET /agents 的 30s 缓存数据源；启动时后台跑第一次，任何探测失败只降级该行。
+   * in-flight Promise 复用：监听后立刻来的 /agents 不会重复拉起第二组探测子进程。
+   */
+  let agentProbe: Promise<ReturnType<AgentRouter["list"]>> | null = null;
+  const refreshAgentStatuses = async (): Promise<ReturnType<AgentRouter["list"]>> => {
+    if (agentProbe !== null) {
+      return await agentProbe;
+    }
+    agentProbe = (async () => {
+      let probes: AgentProbe[] = [];
+      try {
+        probes = await probeAgents(config);
+      } catch {
+        probes = [];
+      }
+      for (const probe of probes) {
+        const driver = drivers[probe.agent];
+        if (driver === undefined) {
+          continue;
+        }
+        router.register(driver, {
+          available: probe.available,
+          version: probe.version,
+          ...(probe.reason === undefined ? {} : { reason: probe.reason }),
+        });
+      }
+      return router.list();
+    })().finally(() => {
+      agentProbe = null;
+    });
+    return await agentProbe;
+  };
+
   const engine = new TakeoverEngine({
     store,
     leases,
     registry,
     adapter,
+    router,
     checkpoints,
     dispatches,
     handoffDir: paths.handoffs,
+    piClientId: PI_AGENT_CLIENT_ID,
   });
 
   let handle: ServerHandle;
@@ -92,13 +403,15 @@ export async function main(): Promise<void> {
       registry,
       engine,
       adapter,
+      router,
+      agentStatuses: refreshAgentStatuses,
       checkpoints,
       cursors,
       pipeline,
     });
   } catch (err) {
     reportStartupFailure(err, config);
-    await disposeQuietly(adapter);
+    await disposeDriversQuietly([claudeDriver, codexDriver, piDriver]);
     await closeQuietly(db);
     lock.release();
     process.exitCode = 1;
@@ -106,6 +419,8 @@ export async function main(): Promise<void> {
   }
 
   console.log("pi-workbenchd listening on " + handle.url);
+  // 探测最长 3s，绝不把监听卡在子进程上；首个 GET /agents 会 await 同一个 in-flight Promise。
+  void refreshAgentStatuses().catch(() => {});
   if (restored > 0) {
     console.log("[pi-workbenchd] 已从库里恢复 " + String(restored) + " 个会话");
   }
@@ -123,7 +438,7 @@ export async function main(): Promise<void> {
     }, 5000);
     force.unref();
     await handle.close();
-    await disposeQuietly(adapter);
+    await disposeDriversQuietly([claudeDriver, codexDriver, piDriver]);
     await closeQuietly(db);
     lock.release();
     process.exit(0);
@@ -198,13 +513,17 @@ function reportStartupFailure(err: unknown, config: Config): void {
   console.error("[pi-workbenchd] 监听失败：" + reason);
 }
 
-/** 关闭 adapter；退出流程里失败不再上报（进程马上就要退） */
-async function disposeQuietly(adapter: ClaudeAdapter): Promise<void> {
-  try {
-    await adapter.dispose();
-  } catch {
-    // 退出流程：吞掉
-  }
+/** 关闭全部 driver（ClaudeDriver 内部即 adapter.dispose）；退出流程里失败不再上报 */
+async function disposeDriversQuietly(drivers: readonly AgentDriver[]): Promise<void> {
+  await Promise.all(
+    drivers.map(async (driver) => {
+      try {
+        await driver.dispose();
+      } catch {
+        // 退出流程：吞掉
+      }
+    }),
+  );
 }
 
 async function closeQuietly(db: { close(): void }): Promise<void> {
