@@ -747,7 +747,7 @@ test("POST /attach：agent available=false → 422 E_AGENT_UNAVAILABLE，先于�
   }
 });
 
-test("GET /health.adapters 与 /agents 共用同一探测缓存（快照语义一致）", async () => {
+test("GET /health 冷缓存立即返回注册表快照并后台预热，/agents 复用同一次探测", async () => {
   const claude = makeDriver("claude", CLAUDE_CAPABILITIES);
   let probes = 0;
   const h = await makeHarness({
@@ -759,12 +759,49 @@ test("GET /health.adapters 与 /agents 共用同一探测缓存（快照语义�
   });
   try {
     const health = await h.app.inject({ method: "GET", url: "/health" });
-    const agents = await h.app.inject({ method: "GET", url: API + "/agents" });
     assert.equal(health.statusCode, 200, health.body);
+    assert.deepEqual(
+      health.json<{ adapters: unknown }>().adapters,
+      [{ agent: "claude", available: true }],
+      "冷缓存 health 只读注册表快照，不等待探测",
+    );
+    const agents = await h.app.inject({ method: "GET", url: API + "/agents" });
     assert.equal(agents.statusCode, 200, agents.body);
-    assert.deepEqual(health.json<{ adapters: unknown }>().adapters, [{ agent: "claude", available: false }]);
     assert.equal(agents.json<AgentStatus[]>()[0]?.available, false);
-    assert.equal(probes, 1, "health 与 agents 必须共享同一次 30s 探测快照");
+    assert.equal(probes, 1, "health 触发的后台探测应被 /agents 复用（30s 内只探测一次）");
+  } finally {
+    await h.close();
+  }
+});
+
+test("GET /health 不阻塞在 2s 探测上；随后 /agents 仍拿到探测结果", async () => {
+  const claude = makeDriver("claude", CLAUDE_CAPABILITIES);
+  let probes = 0;
+  const h = await makeHarness({
+    drivers: [{ driver: claude.driver }],
+    agentStatuses: async () => {
+      probes += 1;
+      await new Promise<void>((resolve) => setTimeout(resolve, 2_000));
+      return [{ agent: "claude", available: false, version: null, caps: CLAUDE_CAPABILITIES, reason: "E_AGENT_UNAVAILABLE: probe down" }];
+    },
+  });
+  try {
+    const started = Date.now();
+    const health = await h.app.inject({ method: "GET", url: "/health" });
+    const elapsedMs = Date.now() - started;
+    assert.equal(health.statusCode, 200, health.body);
+    assert.ok(elapsedMs < 1_000, "GET /health 必须远早于 2s 探测返回，实际 " + String(elapsedMs) + "ms");
+    assert.deepEqual(
+      health.json<{ adapters: unknown }>().adapters,
+      [{ agent: "claude", available: true }],
+      "冷缓存时 health 返回注册表快照",
+    );
+    assert.equal(probes, 1, "health 应在后台触发一次探测");
+
+    const agents = await h.app.inject({ method: "GET", url: API + "/agents" });
+    assert.equal(agents.statusCode, 200, agents.body);
+    assert.equal(agents.json<AgentStatus[]>()[0]?.available, false, "后续 /agents 必须拿到探测结果");
+    assert.equal(probes, 1, "后台探测进行中时 /agents 复用它，不重复探测");
   } finally {
     await h.close();
   }

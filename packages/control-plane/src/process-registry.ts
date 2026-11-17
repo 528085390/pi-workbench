@@ -47,6 +47,8 @@ type Entry = {
 
 const DEFAULT_HISTORY_LIMIT = 100;
 const TREE_KILL_TIMEOUT_MS = 1_000;
+/** SIGKILL 之后的短暂等待上限：给内核投递信号 / 回收进程留时间，不让 killAll 立即返回。 */
+const SIGKILL_SETTLE_MS = 200;
 
 export class ProcessRegistry {
   readonly #entries = new Map<number, Entry>();
@@ -114,18 +116,43 @@ export class ProcessRegistry {
     if (live.length === 0) {
       return;
     }
+    // 先固定「原始存活」的 pid：父进程可能被 SIGTERM 杀掉并触发 exit → 从 #entries 退休，
+    // 但它派生的孙进程可能仍在同一进程组里；超时后的 SIGKILL 必须按这份快照发，不能只看当前 #entries。
+    const originallyLive = live.map((entry) => entry.info.pid);
     for (const entry of live) {
       this.#signalTree(entry, "SIGTERM");
     }
-    await this.#waitForExit(
-      live.map((entry) => entry.info.pid),
-      timeoutMs,
-    );
+    await this.#waitForExit(originallyLive, timeoutMs);
     for (const entry of live) {
-      if (entry.info.exited || !this.#entries.has(entry.info.pid)) {
-        continue;
+      this.#forceKillGroup(entry);
+    }
+    // 有界等待，确保 SIGKILL 已投递/进程组已消失后再返回（daemon 随后会自行退出）。
+    await delay(SIGKILL_SETTLE_MS);
+  }
+
+  /**
+   * 超时兜底：无论父进程是否已经退出，都对它原始 pid 的进程组补 SIGKILL。
+   * POSIX defaultTreeKill 走 kill(-pid)；Windows 走 taskkill /PID <pid> /T /F。
+   * 进程组已消失（ESRCH）/ taskkill 失败 / 无权限一律忽略：shutdown 不能因一个死 pid 抛错。
+   * notify=false，绝不向已经退休的进程补发 onExit。
+   */
+  #forceKillGroup(entry: Entry): void {
+    try {
+      const result = this.#killTree(entry.info.pid, "SIGKILL");
+      if (result === false) {
+        this.#signalDirectQuietly(entry.info.pid);
       }
-      this.#signalTree(entry, "SIGKILL");
+    } catch {
+      this.#signalDirectQuietly(entry.info.pid);
+    }
+    this.#retire(entry, false);
+  }
+
+  #signalDirectQuietly(pid: number): void {
+    try {
+      this.#kill(pid, "SIGKILL");
+    } catch {
+      // 进程已不存在 / 无权限：killAll 已在 shutdown，忽略。
     }
   }
 
@@ -283,6 +310,12 @@ function defaultTreeKill(pid: number, signal: NodeJS.Signals): unknown {
     }
     return process.kill(pid, signal);
   }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 function positiveInteger(value: number, name: string): number {

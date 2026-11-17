@@ -63,7 +63,7 @@ test("track 忽略没有 pid 的子进程", () => {
   assert.deepEqual(registry.list(), []);
 });
 
-test("killAll 先 SIGTERM，超时后只对存活进程 SIGKILL", async () => {
+test("killAll 先 SIGTERM；超时后对原始存活 pid 全部 SIGKILL（含已退出的父进程）", async () => {
   const signals: string[] = [];
   const registry = new ProcessRegistry({
     kill: (pid, signal) => {
@@ -80,7 +80,9 @@ test("killAll 先 SIGTERM，超时后只对存活进程 SIGKILL", async () => {
   setTimeout(() => exited.emit("exit"), 1);
   await done;
 
-  assert.deepEqual(signals, ["101:SIGTERM", "102:SIGTERM", "102:SIGKILL"]);
+  // 101 已按 SIGTERM 退出、entry 已 retire，但它原先所在的进程组可能还有孙进程：
+  // 超时后仍必须对原始 pid 补 SIGKILL，否则孙进程会漏杀。
+  assert.deepEqual(signals, ["101:SIGTERM", "102:SIGTERM", "101:SIGKILL", "102:SIGKILL"]);
   const byPid = new Map(registry.list().map((info) => [info.pid, info]));
   assert.equal(byPid.get(101)?.exited, true);
   assert.equal(byPid.get(102)?.exited, true, "强杀后也标记 exited");
@@ -329,6 +331,65 @@ test("killAll 真杀 POSIX 进程组（detached + kill(-pid)）", { skip: proces
     }
   }
 });
+
+test(
+  "killAll 在父进程先被 SIGTERM 杀掉后仍 SIGKILL 整个进程组（孙进程忽略 SIGTERM）",
+  { skip: process.platform === "win32" },
+  async () => {
+    // 父进程收到 SIGTERM 即退出（默认行为）；孙进程显式忽略 SIGTERM。
+    // SIGTERM 组信号会先杀掉父进程、retire entry，旧实现因此漏掉对孙进程的 SIGKILL。
+    const grandchild =
+      "process.on('SIGTERM',()=>{});process.stdout.write('ready\n');setInterval(()=>{},1000)";
+    const script =
+      "const {spawn}=require('node:child_process');" +
+      "const c=spawn(process.execPath,['-e'," +
+      JSON.stringify(grandchild) +
+      "],{stdio:['ignore','pipe','ignore']});" +
+      "c.stdout.once('data',()=>console.log(c.pid));" +
+      "setInterval(()=>{},1000);";
+    const parent = spawn(process.execPath, ["-e", script], {
+      stdio: ["ignore", "pipe", "ignore"],
+      detached: true,
+    });
+    const parentPid = parent.pid;
+    assert.equal(typeof parentPid, "number");
+    const grandPid = await new Promise<number>((resolve, reject) => {
+      let buffer = "";
+      const timer = setTimeout(() => reject(new Error("等待孙进程 pid 超时")), 3_000);
+      parent.stdout?.on("data", (chunk: Buffer) => {
+        buffer += chunk.toString("utf8");
+        const line = buffer.split(/\r?\n/)[0]?.trim() ?? "";
+        if (line.length > 0) {
+          clearTimeout(timer);
+          resolve(Number(line));
+        }
+      });
+      parent.once("error", (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
+    try {
+      const registry = new ProcessRegistry();
+      registry.track(parent, "adapter:posix-orphan", "pi");
+      await registry.killAll(300);
+      assert.equal(await waitDead(parentPid as number, 3_000), true, "父进程应被 SIGTERM 杀掉");
+      assert.equal(await waitDead(grandPid, 3_000), true, "父进程已退出也要对原进程组补 SIGKILL");
+      assert.throws(
+        () => process.kill(grandPid, 0),
+        (err: unknown) => (err as NodeJS.ErrnoException).code === "ESRCH",
+        "孙进程必须已不存在（kill(pid,0) 抛 ESRCH）",
+      );
+    } finally {
+      if (parentPid !== undefined && isAlive(parentPid)) {
+        try { process.kill(-parentPid, "SIGKILL"); } catch {}
+      }
+      if (isAlive(grandPid)) {
+        process.kill(grandPid, "SIGKILL");
+      }
+    }
+  },
+);
 
 function isAlive(pid: number): boolean {
   try {

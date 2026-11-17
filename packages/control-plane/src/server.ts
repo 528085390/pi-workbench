@@ -257,22 +257,63 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
   const now = deps.now ?? Date.now;
   /** GET /agents 的 30s 缓存（spec §11.1）：探测器可能跑子进程，不能每个请求都打一遍 */
   let agentCache: { at: number; statuses: AgentStatus[] } | null = null;
+  /** 后台探测的 in-flight Promise：/health 预热与 /agents 共用，避免冷启动叠跑两组探测子进程 */
+  let agentProbe: Promise<AgentStatus[]> | null = null;
+  /** 注册表最后一次快照：不触发任何探测，/health 冷缓存时立即返回它 */
+  const snapshotAgents = (): AgentStatus[] | AgentDescriptor[] =>
+    deps.router === undefined ? [describeAgent(config, deps.adapter)] : deps.router.list();
+  /**
+   * 跑一次探测并写入 30s 缓存。同步抛错也转成 rejected Promise，
+   * 让 fire-and-forget 的 /health 预热可以安全 swallow。
+   */
+  const probeAgents = (): Promise<AgentStatus[]> => {
+    if (agentProbe !== null) {
+      return agentProbe;
+    }
+    const at = now();
+    let probe: Promise<AgentStatus[]>;
+    probe = Promise.resolve()
+      .then(() => deps.agentStatuses!())
+      .then((statuses) => {
+        agentCache = { at, statuses };
+        return statuses;
+      })
+      .finally(() => {
+        if (agentProbe === probe) {
+          agentProbe = null;
+        }
+      });
+    agentProbe = probe;
+    return probe;
+  };
   const currentAgents = async (): Promise<AgentStatus[] | AgentDescriptor[]> => {
     if (deps.agentStatuses === undefined) {
-      return deps.router === undefined ? [describeAgent(config, deps.adapter)] : deps.router.list();
+      return snapshotAgents();
     }
     const at = now();
     if (agentCache !== null && at - agentCache.at < AGENT_STATUS_CACHE_MS) {
       return agentCache.statuses;
     }
     try {
-      const statuses = await deps.agentStatuses();
-      agentCache = { at, statuses };
-      return statuses;
+      return await probeAgents();
     } catch {
       // 探测层异常不能把 /agents 拖成 500：回退到注册表最后一次快照
-      return deps.router?.list() ?? [describeAgent(config, deps.adapter)];
+      return snapshotAgents();
     }
+  };
+  /**
+   * C04 收尾：/health 只读快照，绝不 await 探测。
+   * 冷缓存时立即返回 router.list()/describeAgent，并把 3s 探测丢到后台预热；
+   * 否则 /health 会被探测拖慢数秒，还会在每个健康检查上拉起探测子进程。
+   */
+  const healthAgents = (): AgentStatus[] | AgentDescriptor[] => {
+    if (agentCache !== null && now() - agentCache.at < AGENT_STATUS_CACHE_MS) {
+      return agentCache.statuses;
+    }
+    if (deps.agentStatuses !== undefined) {
+      void probeAgents().catch(() => undefined);
+    }
+    return snapshotAgents();
   };
 
   /** 任意已登记会话接入事件流（B08 M2/P2-3）：dispatch、发现、登记、handback 共用。 */
@@ -335,7 +376,8 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
     if (!db.ok) {
       void reply.code(503);
     }
-    const agents = await currentAgents();
+    // 只读缓存/注册表快照；冷缓存探测在后台跑，health 本身不等它。
+    const agents = healthAgents();
     return {
       ok: db.ok,
       name: "pi-workbenchd",
