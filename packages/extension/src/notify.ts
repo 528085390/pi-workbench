@@ -175,7 +175,7 @@ export function renderStatus(sessions: readonly NotifySession[]): string {
     return "[" + statusLabel(session.status) + "] " + label;
   });
   const more = visible.length - shown.length;
-  return "pi-workbench: " + String(visible.length) + " 会话 · " + shown.join(" · ") + (more > 0 ? " · +" + String(more) : "");
+  return "pi-workbench: " + String(visible.length) + " 个会话 · " + shown.join(" · ") + (more > 0 ? " · +" + String(more) : "");
 }
 
 type Pending = { reason: NotifyReason; seq: number };
