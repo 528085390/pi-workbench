@@ -14,17 +14,20 @@
  */
 import { timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
-import { isAbsolute } from "node:path";
+import { isAbsolute, join } from "node:path";
+import type { DatabaseSync } from "node:sqlite";
 
-import type { Checkpoint, Driver, SessionCaps, SessionEvent, SessionRef, UnifiedMessage } from "@pi-workbench/shared";
-import { WORKBENCH_VERSION } from "@pi-workbench/shared";
+import type { Checkpoint, Driver, SessionCaps, SessionEvent, SessionRef, UnifiedMessage, VersionResponse } from "@pi-workbench/shared";
+import { API_VERSION, WORKBENCH_VERSION } from "@pi-workbench/shared";
 import fastifyWebsocket from "@fastify/websocket";
 import Fastify from "fastify";
-import type { FastifyError, FastifyInstance, FastifyRequest } from "fastify";
+import type { FastifyError, FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { AdapterUpdate, AgentAdapter } from "./adapters/types.ts";
 import type { AgentRouter } from "./agents/router.ts";
 import type { AgentStatus } from "./agents/types.ts";
+import { loadAssets } from "./assets.ts";
+import type { AuditStore } from "./audit.ts";
 import { capsOf, CLAUDE_CAPABILITIES } from "./capabilities.ts";
 import type { CheckpointStore } from "./checkpoints.ts";
 import type { Config } from "./config.ts";
@@ -37,6 +40,7 @@ import type { LeaseManager } from "./lease.ts";
 import type { SessionFilter, SessionRegistry } from "./registry.ts";
 import { readTranscript } from "./transcript/index.ts";
 import type { TakeoverEngine } from "./takeover.ts";
+import { SessionWriteQueue } from "./write-queue.ts";
 
 /** 路由前缀（spec §6：统一 /api/cp；T1 的裸 /health 保留为别名） */
 export const API_PREFIX = "/api/cp";
@@ -67,6 +71,10 @@ export type PipelineLike = {
 /** createServer 的依赖（R38 / R46：比 brief 多 adapter 与 checkpoints） */
 export type ServerDeps = {
   config: Config;
+  /** daemon 实例 id（index.ts 取自 InstanceStore.begin()）；GET /api/cp/version 与 /health 原样返回 */
+  instanceId?: string;
+  /** 只用于 /health 的只读 db 探活；缺省（单测 / 裁剪构建）视为 ok。 */
+  db?: DatabaseSync;
   store: EventStore;
   leases: LeaseManager;
   registry: SessionRegistry;
@@ -79,6 +87,18 @@ export type ServerDeps = {
   checkpoints: CheckpointStore;
   /** 每读者未读游标（spec §6.5） */
   cursors: ReadCursorStore;
+  /**
+   * C03 审计日志：写操作留痕 + GET /audit 查询。
+   * 缺省（单测 / 裁剪构建）时 /audit 返回空数组，业务写操作照常进行。
+   */
+  audit?: AuditStore;
+  /**
+   * per-session 写队列（C02）。缺省时由 createServer 自建（单实例一个）；
+   * 生产装配可显式注入以便共享 / 观测。
+   */
+  writeQueue?: SessionWriteQueue;
+  /** C05 资产清单文件；缺省用 config.home/assets.json（index.ts 显式注入 paths.home 拼出的路径） */
+  assetsPath?: string;
   readTranscript?: ServerTranscriptReader;
   /**
    * GET /agents 的动态数据源（启动探测 / 周期刷新）。
@@ -104,13 +124,17 @@ export type ServerHandle = {
 };
 
 type HealthBody = {
-  ok: true;
+  ok: boolean;
   name: string;
   version: string;
   pid: number;
   uptimeMs: number;
   /** C1：客户端（Pi 插件）据此拒绝连旧 daemon，别让插件跑在缺路由的版本上 */
   schemaVersion: number;
+  /** C04 / spec §6.2：实例身份与运行态摘要（additive） */
+  instanceId: string;
+  db: { schemaVersion: number; ok: boolean };
+  adapters: { agent: string; available: boolean }[];
 };
 
 type AgentDescriptor = {
@@ -145,14 +169,21 @@ export const STATUS_BY_CODE: Readonly<Record<WorkbenchErrorCode, number>> = {
   E_LEASE_CONFLICT: 409,
   E_NO_LEASE: 409,
   E_IDEMPOTENCY_CONFLICT: 409,
+  E_DISPATCH_IN_PROGRESS: 409,
+  E_SESSION_BUSY: 429,
+  E_ASSET_CONFIG_INVALID: 400,
   E_CAP_UNSUPPORTED: 422,
   E_AGENT_UNAVAILABLE: 422,
   E_ADAPTER_DOWN: 503,
-  E_RESUME_REJECTED: 503,
+  E_ADAPTER_CRASHED: 503,
+  E_HANDOFF_FAILED: 503,
+  E_CHECKPOINT_FAILED: 500,
+  E_RESUME_REJECTED: 409,
+  E_INTERNAL: 500,
 };
 
 /** 兜底错误码（spec §6 之外，仅「未知异常 → 500」使用） */
-export const INTERNAL_ERROR_CODE = "E_INTERNAL";
+export const INTERNAL_ERROR_CODE: WorkbenchErrorCode = "E_INTERNAL";
 /**
  * 500 的对外固定文案（评审 Minor 2）：真实 message 可能带 SQL 片段 / 绝对路径 / 内部标识，
  * 只写进日志，绝不回传给客户端。
@@ -169,12 +200,14 @@ const ROUTE_LEASE = "POST /sessions/:key/lease";
 const ROUTE_INJECT = "POST /sessions/:key/inject";
 const ROUTE_INTERRUPT = "POST /sessions/:key/interrupt";
 const ROUTE_ATTACH = "POST /sessions/:key/attach";
+const ROUTE_RESUME = "POST /sessions/:key/resume";
 const ROUTE_CHECKPOINT = "POST /sessions/:key/checkpoint";
 const ROUTE_HANDOFF = "POST /sessions/:key/handoff";
 const ROUTE_HANDBACK = "POST /sessions/:key/handback";
 const ROUTE_DISPATCH = "POST /dispatch";
 const ROUTE_UNREAD = "GET /sessions/:key/unread";
 const ROUTE_READ = "POST /sessions/:key/read";
+const ROUTE_AUDIT = "GET /audit";
 
 /** GET /agents 的缓存窗口（spec §11.1：30s 内不重复探测） */
 export const AGENT_STATUS_CACHE_MS = 30_000;
@@ -192,6 +225,9 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
   assertAuthConfig(deps.config);
 
   const { config } = deps;
+  /** C02：同一 sessionKey 的写操作串行；不同 sessionKey 各自并行。 */
+  const writeQueue = deps.writeQueue ?? new SessionWriteQueue();
+  const runWrite = <T>(key: string, fn: () => Promise<T>): Promise<T> => writeQueue.run(key, fn);
   /**
    * 统一读路径（0.5-B B06）：按会话 agent 选择 transcript parser。
    * 0.5-A 注入的 ServerTranscriptReader 仍是 path-only 旧签名，优先调用它，
@@ -223,22 +259,63 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
   const now = deps.now ?? Date.now;
   /** GET /agents 的 30s 缓存（spec §11.1）：探测器可能跑子进程，不能每个请求都打一遍 */
   let agentCache: { at: number; statuses: AgentStatus[] } | null = null;
+  /** 后台探测的 in-flight Promise：/health 预热与 /agents 共用，避免冷启动叠跑两组探测子进程 */
+  let agentProbe: Promise<AgentStatus[]> | null = null;
+  /** 注册表最后一次快照：不触发任何探测，/health 冷缓存时立即返回它 */
+  const snapshotAgents = (): AgentStatus[] | AgentDescriptor[] =>
+    deps.router === undefined ? [describeAgent(config, deps.adapter)] : deps.router.list();
+  /**
+   * 跑一次探测并写入 30s 缓存。同步抛错也转成 rejected Promise，
+   * 让 fire-and-forget 的 /health 预热可以安全 swallow。
+   */
+  const probeAgents = (): Promise<AgentStatus[]> => {
+    if (agentProbe !== null) {
+      return agentProbe;
+    }
+    const at = now();
+    let probe: Promise<AgentStatus[]>;
+    probe = Promise.resolve()
+      .then(() => deps.agentStatuses!())
+      .then((statuses) => {
+        agentCache = { at, statuses };
+        return statuses;
+      })
+      .finally(() => {
+        if (agentProbe === probe) {
+          agentProbe = null;
+        }
+      });
+    agentProbe = probe;
+    return probe;
+  };
   const currentAgents = async (): Promise<AgentStatus[] | AgentDescriptor[]> => {
     if (deps.agentStatuses === undefined) {
-      return deps.router === undefined ? [describeAgent(config, deps.adapter)] : deps.router.list();
+      return snapshotAgents();
     }
     const at = now();
     if (agentCache !== null && at - agentCache.at < AGENT_STATUS_CACHE_MS) {
       return agentCache.statuses;
     }
     try {
-      const statuses = await deps.agentStatuses();
-      agentCache = { at, statuses };
-      return statuses;
+      return await probeAgents();
     } catch {
       // 探测层异常不能把 /agents 拖成 500：回退到注册表最后一次快照
-      return deps.router?.list() ?? [describeAgent(config, deps.adapter)];
+      return snapshotAgents();
     }
+  };
+  /**
+   * C04 收尾：/health 只读快照，绝不 await 探测。
+   * 冷缓存时立即返回 router.list()/describeAgent，并把 3s 探测丢到后台预热；
+   * 否则 /health 会被探测拖慢数秒，还会在每个健康检查上拉起探测子进程。
+   */
+  const healthAgents = (): AgentStatus[] | AgentDescriptor[] => {
+    if (agentCache !== null && now() - agentCache.at < AGENT_STATUS_CACHE_MS) {
+      return agentCache.statuses;
+    }
+    if (deps.agentStatuses !== undefined) {
+      void probeAgents().catch(() => undefined);
+    }
+    return snapshotAgents();
   };
 
   /** 任意已登记会话接入事件流（B08 M2/P2-3）：dispatch、发现、登记、handback 共用。 */
@@ -296,20 +373,42 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
   };
   await app.register(fastifyWebsocket);
 
-  const health = async (): Promise<HealthBody> => ({
-    ok: true,
-    name: "pi-workbenchd",
-    version: WORKBENCH_VERSION,
-    pid: process.pid,
-    uptimeMs: Date.now() - startedAt,
-    schemaVersion: SCHEMA_VERSION,
-  });
+  const health = async (_request: FastifyRequest, reply: FastifyReply): Promise<HealthBody> => {
+    const db = healthDbState(deps.db);
+    if (!db.ok) {
+      void reply.code(503);
+    }
+    // 只读缓存/注册表快照；冷缓存探测在后台跑，health 本身不等它。
+    const agents = healthAgents();
+    return {
+      ok: db.ok,
+      name: "pi-workbenchd",
+      version: WORKBENCH_VERSION,
+      pid: process.pid,
+      uptimeMs: Date.now() - startedAt,
+      schemaVersion: SCHEMA_VERSION,
+      instanceId: deps.instanceId ?? "",
+      db,
+      adapters: agents.map((status) => ({
+        agent: status.agent,
+        available: status.available,
+      })),
+    };
+  };
 
   // T1 兼容：裸 /health（CLI probeHealth 依赖 {ok,pid,version}）
   app.get(HEALTH_PATH, health);
 
   app.setErrorHandler((error: FastifyError, _request, reply) => {
     if (isWorkbenchError(error)) {
+      // E_INTERNAL 是合法码（errors.ts）但语义等同「未知异常」：对外固定文案 + 真实原因只进日志。
+      // 否则 `new WorkbenchError("E_INTERNAL", <SQL 片段 / 绝对路径>)` 会原样回给客户端，
+      // 把下面「不回传内部 message」的那条规则打穿（review r3 P3）。
+      if (error.code === "E_INTERNAL") {
+        logError(error);
+        void reply.status(500).send(errorBody(INTERNAL_ERROR_CODE, INTERNAL_ERROR_MESSAGE));
+        return;
+      }
       const status = STATUS_BY_CODE[error.code];
       void reply.status(status).send(errorBody(error.code, error.message, error.details));
       return;
@@ -355,8 +454,58 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
 
       api.get(HEALTH_PATH, health);
 
+      /**
+       * spec §6.2：API v1 版本端点。api / schemaVersion 必须与 @pi-workbench/shared
+       * 的契约常量一致（contract test 覆盖）；instanceId 由 index.ts 从 InstanceStore.begin() 传入。
+       */
+      api.get("/version", async (): Promise<VersionResponse> => ({
+        api: API_VERSION,
+        schemaVersion: SCHEMA_VERSION,
+        daemon: WORKBENCH_VERSION,
+        instanceId: deps.instanceId ?? "",
+      }));
+
       // 0.5-B B01-b：有注册表时由 router.list() 动态生成；缺省保留 0.5-A 的 claude-only 描述
       api.get("/agents", async () => await currentAgents());
+
+      /**
+       * C03 审计查询：GET /audit?sessionKey=&since=&limit=&afterId=
+       * 按 id 升序返回 { items }；limit 默认 100、上限 1000（截断由 AuditStore 负责）。
+       * afterId 是增量游标：只返回 id 更大的行，避免同 ts 多条时重复回放。
+       */
+      api.get("/audit", async (request) => {
+        const query = queryOf(request);
+        const sessionKey = optionalString(query, "sessionKey", ROUTE_AUDIT);
+        const since = optionalString(query, "since", ROUTE_AUDIT);
+        let afterId: number | undefined;
+        const rawAfterId = query["afterId"];
+        if (rawAfterId !== undefined) {
+          if (typeof rawAfterId !== "string" || !/^\d+$/.test(rawAfterId.trim())) {
+            throw new WorkbenchError("E_BAD_REQUEST", ROUTE_AUDIT + " 的 afterId 必须是非负整数", { afterId: rawAfterId });
+          }
+          afterId = Number(rawAfterId);
+        }
+        let limit: number | undefined;
+        const rawLimit = query["limit"];
+        if (rawLimit !== undefined) {
+          if (typeof rawLimit !== "string" || !/^\d+$/.test(rawLimit.trim()) || Number(rawLimit) <= 0) {
+            throw new WorkbenchError("E_BAD_REQUEST", ROUTE_AUDIT + " 的 limit 必须是正整数", { limit: rawLimit });
+          }
+          limit = Number(rawLimit);
+        }
+        return {
+          items:
+            deps.audit?.list({
+              ...(sessionKey === undefined ? {} : { sessionKey }),
+              ...(since === undefined ? {} : { since }),
+              ...(afterId === undefined ? {} : { afterId }),
+              ...(limit === undefined ? {} : { limit }),
+            }) ?? [],
+        };
+      });
+
+      // C05 资产只读清单（spec §7.5）：不写回、不做双向同步、不启动 MCP server。
+      api.get("/assets", async () => loadAssets(deps.assetsPath ?? join(config.home, "assets.json")));
 
       // 0.5-B B08（评审 M4）：发现层必须有产品出口，否则用户无法让 daemon 认识既有原生会话。
       // GET /sessions/discover?agent=codex&cwd=...&limit=... → 发现并登记（幂等 upsert），返回登记后的 SessionRef。
@@ -468,10 +617,10 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
             const page = await driver.see(resolved, after, limit);
             return { messages: page.messages, nextCursor: page.nextCursor, pending: page.pending };
           }
-          return { messages: [] as UnifiedMessage[], nextCursor: after };
+          return { messages: [] as UnifiedMessage[], nextCursor: after, pending: true };
         }
         const page = readPage(resolved.agent, path, after, limit);
-        return { messages: page.messages, nextCursor: page.nextCursor };
+        return { messages: page.messages, nextCursor: page.nextCursor, pending: page.pending };
       });
 
       // spec §6.5：只返回该读者没读过的消息。ack=1 才推进游标，ack=0 是 peek（默认不推进）。
@@ -576,6 +725,17 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
             cap: "attach",
           });
         }
+        // 可用性与 /agents 同源（探测缓存 / 注册表快照）：不可用必须在能力闸门之前
+        // 报 422 E_AGENT_UNAVAILABLE，而不是调用 driver 后变成 503 E_ADAPTER_DOWN。
+        const status = (await currentAgents()).find((item) => item.agent === session.agent);
+        if (status !== undefined && !status.available) {
+          const reason = "reason" in status && typeof status.reason === "string" ? status.reason : undefined;
+          throw new WorkbenchError(
+            "E_AGENT_UNAVAILABLE",
+            "Agent 不可用：" + session.agent + (reason === undefined ? "" : "（" + reason + "）"),
+            { agent: session.agent, cap: "attach", reason: reason ?? null },
+          );
+        }
         const declared = session.capabilities;
         if (declared.attach !== true) {
           throw new WorkbenchError("E_CAP_UNSUPPORTED", "Agent " + session.agent + " 不支持能力 attach", {
@@ -584,7 +744,62 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
           });
         }
         await driver.attach(session);
+        // spec §7.1：重启后对账把 driver 会话置为 driver=none/status=unknown；attach 成功即恢复
+        // 控制面驱动并进入 idle，避免会话永远停在 unknown。
+        deps.registry.upsert({ ...session, driver: "pi", status: "idle" });
         return { attached: true, sessionKey: key, agent: session.agent };
+      });
+
+      /**
+       * 接管已存在的原生会话（v1 additive：重启后 Claude 交互式会话的恢复入口）。
+       *
+       * 与 attach 同一套双判定：可用性（422 E_AGENT_UNAVAILABLE）在能力闸门之前，
+       * 能力用会话声明的 caps.resume（不是 driver.caps 快照）；缺能力时不触碰 driver。
+       * 租约门禁 / 状态限制 / driver.resume / 注册表 / 事件全部下沉到 TakeoverEngine.resume
+       * （review r2 P1：与 handback 同形状），本层只保留存在性 + 可用性 + caps 三道闸。
+       * 引擎调用整体进 per-session 写队列，与 inject / interrupt / handoff 互斥
+       * （attach 是 0.5-B 既有实现，未入队，语义不动）。
+       */
+      api.post("/sessions/:key/resume", async (request) => {
+        const key = paramOf(request, "key");
+        const session = requireSession(deps.registry, key);
+        const body = bodyOf(request.body, ROUTE_RESUME);
+        const clientId = requireString(body, "clientId", ROUTE_RESUME);
+        if (deps.router === undefined) {
+          throw new WorkbenchError("E_AGENT_UNAVAILABLE", "Agent 注册表未启用，无法 resume：" + session.agent, {
+            agent: session.agent,
+            cap: "resume",
+          });
+        }
+        const driver = deps.router.get(session.agent);
+        if (driver === null) {
+          throw new WorkbenchError("E_AGENT_UNAVAILABLE", "Agent 未注册或不可用：" + session.agent, {
+            agent: session.agent,
+            cap: "resume",
+          });
+        }
+        // 可用性与 /agents 同源（探测缓存 / 注册表快照）：不可用必须在能力闸门之前报 422，
+        // 而不是调用 driver 后变成 503 E_ADAPTER_DOWN。
+        const status = (await currentAgents()).find((item) => item.agent === session.agent);
+        if (status !== undefined && !status.available) {
+          const reason = "reason" in status && typeof status.reason === "string" ? status.reason : undefined;
+          throw new WorkbenchError(
+            "E_AGENT_UNAVAILABLE",
+            "Agent 不可用：" + session.agent + (reason === undefined ? "" : "（" + reason + "）"),
+            { agent: session.agent, cap: "resume", reason: reason ?? null },
+          );
+        }
+        const declared = session.capabilities;
+        if (declared.resume !== true) {
+          throw new WorkbenchError("E_CAP_UNSUPPORTED", "Agent " + session.agent + " 不支持能力 resume", {
+            agent: session.agent,
+            cap: "resume",
+          });
+        }
+        await runWrite(key, () => deps.engine.resume(key, clientId));
+        const resumed = deps.registry.get(key) ?? { ...session, driver: "pi" as const, status: "idle" as const };
+        attachPipeline(resumed);
+        return { resumed: true, sessionKey: key, agent: session.agent };
       });
 
       api.post("/sessions/:key/inject", async (request) => {
@@ -593,7 +808,7 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         const body = bodyOf(request.body, ROUTE_INJECT);
         const clientId = requireString(body, "clientId", ROUTE_INJECT);
         const text = requireString(body, "text", ROUTE_INJECT);
-        return await deps.engine.inject(key, text, clientId);
+        return await runWrite(key, () => deps.engine.inject(key, text, clientId));
       });
 
       api.post("/sessions/:key/interrupt", async (request) => {
@@ -601,7 +816,7 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         requireSession(deps.registry, key);
         const body = bodyOf(request.body, ROUTE_INTERRUPT);
         const clientId = requireString(body, "clientId", ROUTE_INTERRUPT);
-        return await deps.engine.interrupt(key, clientId);
+        return await runWrite(key, () => deps.engine.interrupt(key, clientId));
       });
 
       api.post("/sessions/:key/checkpoint", async (request) => {
@@ -613,7 +828,7 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         const summary = requireString(body, "summary", ROUTE_CHECKPOINT);
         const nextStep = optionalString(body, "nextStep", ROUTE_CHECKPOINT) ?? "";
         const touchedFiles = optionalStringArray(body, "touchedFiles", ROUTE_CHECKPOINT) ?? [];
-        return deps.engine.checkpoint(key, { summary, touchedFiles, nextStep }, clientId);
+        return await runWrite(key, async () => deps.engine.checkpoint(key, { summary, touchedFiles, nextStep }, clientId));
       });
 
       api.get("/sessions/:key/checkpoint", async (request) => {
@@ -640,7 +855,7 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
           summary === undefined && nextStep === undefined && touchedFiles === undefined
             ? undefined
             : { summary: summary ?? "", touchedFiles: touchedFiles ?? [], nextStep: nextStep ?? "" };
-        return await deps.engine.handoff(key, to, clientId, input);
+        return await runWrite(key, () => deps.engine.handoff(key, to, clientId, input));
       });
 
       api.post("/sessions/:key/handback", async (request) => {
@@ -648,7 +863,7 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         requireSession(deps.registry, key);
         const body = bodyOf(request.body, ROUTE_HANDBACK);
         const clientId = requireString(body, "clientId", ROUTE_HANDBACK);
-        const result = await deps.engine.handback(key, clientId);
+        const result = await runWrite(key, () => deps.engine.handback(key, clientId));
         const session = deps.registry.get(key);
         if (session !== null) {
           attachPipeline(session);
@@ -750,6 +965,19 @@ export async function startServer(deps: ServerDeps): Promise<ServerHandle> {
       await app.close();
     },
   };
+}
+
+/** /health 的 db 探活：关闭 / 损坏的数据库返回 ok:false；未注入 db 的单测视为可用。 */
+function healthDbState(db: DatabaseSync | undefined): { schemaVersion: number; ok: boolean } {
+  if (db === undefined) {
+    return { schemaVersion: SCHEMA_VERSION, ok: true };
+  }
+  try {
+    const row = db.prepare("PRAGMA user_version").get() as { user_version?: number } | undefined;
+    return { schemaVersion: Number(row?.user_version ?? SCHEMA_VERSION), ok: true };
+  } catch {
+    return { schemaVersion: 0, ok: false };
+  }
 }
 
 /** 回环判定：127.0.0.0/8、::1、localhost（R32 的口径，含常见 IPv6 展开写法） */
@@ -939,15 +1167,16 @@ function parseAfterSeq(value: unknown): number {
   return 0;
 }
 
-/** WS 线格式（R33）：不含 idempotencyKey 等内部字段 */
+/** WS 线格式（R33 / spec §6.3）：保留 idempotencyKey（缺失时显式 null），客户端可据此幂等去重 */
 function wireOf(event: SessionEvent): string {
   return JSON.stringify({
     seq: event.seq,
     sessionKey: event.sessionKey,
     type: event.type,
-    payload: event.payload,
     source: event.source,
     ts: event.ts,
+    payload: event.payload,
+    idempotencyKey: event.idempotencyKey ?? null,
   });
 }
 

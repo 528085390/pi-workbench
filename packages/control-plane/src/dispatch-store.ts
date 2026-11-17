@@ -4,6 +4,7 @@
  * 语义：`reserve` 用 INSERT OR IGNORE 做**原子占位**，同 key 并发只有一个赢家；
  * 赢家继续 newSession，输家读到已有记录按 payload hash 判定冲突或复用。
  */
+import { randomUUID } from "node:crypto";
 import type { DatabaseSync, StatementSync } from "node:sqlite";
 
 export type DispatchStatus = "reserved" | "done" | "failed";
@@ -50,6 +51,13 @@ export class DispatchStore {
   #insertStmt: StatementSync | null = null;
   #getStmt: StatementSync | null = null;
   #completesStmt: StatementSync | null = null;
+  #reclaimStmt: StatementSync | null = null;
+  #touchStmt: StatementSync | null = null;
+  #pruneStmt: StatementSync | null = null;
+  #retryStmt: StatementSync | null = null;
+  #pruneStaleStmt: StatementSync | null = null;
+  #clearRetainedKeysStmt: StatementSync | null = null;
+  #clearStaleKeysStmt: StatementSync | null = null;
 
   constructor(db: DatabaseSync) {
     this.#db = db;
@@ -74,12 +82,88 @@ export class DispatchStore {
     return row === undefined ? null : toRecord(row);
   }
 
-  complete(idempotencyKey: string, sessionKey: string, now = new Date()): void {
-    this.#completes().run("done", sessionKey, null, now.toISOString(), idempotencyKey);
+  /**
+   * 只有仍持有 reserved 预留的调用者才能落 done（fencing，防止覆盖已被回收/完成的记录）。
+   * 普通预留的 session_key 为 NULL；被回收过的预留会换发 claim token，旧 owner 不复权。
+   */
+  complete(
+    idempotencyKey: string,
+    sessionKey: string,
+    now = new Date(),
+    claimToken?: string,
+  ): boolean {
+    const result = this.#completes().run(
+      "done",
+      sessionKey,
+      null,
+      now.toISOString(),
+      idempotencyKey,
+      claimToken ?? null,
+      claimToken ?? null,
+    );
+    return Number(result.changes) === 1;
   }
 
-  fail(idempotencyKey: string, reason: string, now = new Date()): void {
-    this.#completes().run("failed", null, reason, now.toISOString(), idempotencyKey);
+  /** 只有仍持有 reserved 预留的调用者才能落 failed（fencing，防止覆盖 done）。 */
+  fail(idempotencyKey: string, reason: string, now = new Date(), claimToken?: string): boolean {
+    const result = this.#completes().run(
+      "failed",
+      null,
+      reason,
+      now.toISOString(),
+      idempotencyKey,
+      claimToken ?? null,
+      claimToken ?? null,
+    );
+    return Number(result.changes) === 1;
+  }
+
+  /** 原子把 failed 重置为 reserved，供同 payload 重试；session_key/error 清空，时间戳重置。 */
+  retryFailed(idempotencyKey: string, now = new Date()): boolean {
+    const ts = now.toISOString();
+    const result = this.#retry().run(ts, ts, idempotencyKey);
+    return Number(result.changes) === 1;
+  }
+
+  /**
+   * 回收超 TTL 的 reserved：只有一条原子 UPDATE 抢到才算赢家（changes === 1）。
+   * 同时换发 claim token 写回 session_key —— 旧 owner 的 complete/fail/touch 会因此 no-op。
+   * 赢家负责重新 newSession；输家继续轮询。
+   */
+  reclaim(idempotencyKey: string, ttlMs: number, now = new Date()): boolean {
+    const cutoff = new Date(now.getTime() - ttlMs).toISOString();
+    const ts = now.toISOString();
+    const result = this.#reclaim().run(randomUUID(), ts, ts, idempotencyKey, cutoff);
+    return Number(result.changes) === 1;
+  }
+
+  /** 续约 reserved 预留窗口；被回收后旧 owner 没有 claim token，不能续约。返回是否续约成功。 */
+  touch(idempotencyKey: string, now = new Date(), claimToken?: string): boolean {
+    const result = this.#touch().run(
+      now.toISOString(),
+      idempotencyKey,
+      claimToken ?? null,
+      claimToken ?? null,
+    );
+    return Number(result.changes) === 1;
+  }
+
+  /** 删除超过保留期的 done/failed 记录，返回删除行数；同一事务清掉对应 sessions.dispatch_key。 */
+  pruneRetained(retentionMs: number, now = new Date()): number {
+    const cutoff = new Date(now.getTime() - retentionMs).toISOString();
+    return this.#inTransaction(() => {
+      this.#clearRetainedKeys().run(cutoff);
+      return Number(this.#prune().run(cutoff).changes);
+    });
+  }
+
+  /** 删除超过保留期仍停在 reserved 的记录（进程崩溃残留），同一事务清 dispatch_key。 */
+  pruneStaleReserved(retentionMs: number, now = new Date()): number {
+    const cutoff = new Date(now.getTime() - retentionMs).toISOString();
+    return this.#inTransaction(() => {
+      this.#clearStaleKeys().run(cutoff);
+      return Number(this.#pruneStale().run(cutoff).changes);
+    });
   }
 
   #insert(): StatementSync {
@@ -97,8 +181,73 @@ export class DispatchStore {
 
   #completes(): StatementSync {
     this.#completesStmt ??= this.#db.prepare(
-      "UPDATE dispatches SET status = ?, session_key = ?, error = ?, updated_at = ? WHERE idempotency_key = ?",
+      "UPDATE dispatches SET status = ?, session_key = ?, error = ?, updated_at = ? WHERE idempotency_key = ? AND status = 'reserved' AND ((session_key IS NULL AND ? IS NULL) OR session_key = ?)",
     );
     return this.#completesStmt;
+  }
+
+  #retry(): StatementSync {
+    this.#retryStmt ??= this.#db.prepare(
+      "UPDATE dispatches SET status = 'reserved', session_key = NULL, error = NULL, created_at = ?, updated_at = ? WHERE idempotency_key = ? AND status = 'failed'",
+    );
+    return this.#retryStmt;
+  }
+
+  #reclaim(): StatementSync {
+    this.#reclaimStmt ??= this.#db.prepare(
+      "UPDATE dispatches SET status = 'reserved', session_key = ?, created_at = ?, updated_at = ? WHERE idempotency_key = ? AND status = 'reserved' AND updated_at <= ?",
+    );
+    return this.#reclaimStmt;
+  }
+
+  #touch(): StatementSync {
+    this.#touchStmt ??= this.#db.prepare(
+      "UPDATE dispatches SET updated_at = ? WHERE idempotency_key = ? AND status = 'reserved' AND ((session_key IS NULL AND ? IS NULL) OR session_key = ?)",
+    );
+    return this.#touchStmt;
+  }
+
+  #prune(): StatementSync {
+    this.#pruneStmt ??= this.#db.prepare(
+      "DELETE FROM dispatches WHERE status IN ('done','failed') AND updated_at < ?",
+    );
+    return this.#pruneStmt;
+  }
+
+  #pruneStale(): StatementSync {
+    this.#pruneStaleStmt ??= this.#db.prepare(
+      "DELETE FROM dispatches WHERE status = 'reserved' AND updated_at < ?",
+    );
+    return this.#pruneStaleStmt;
+  }
+
+  #clearRetainedKeys(): StatementSync {
+    this.#clearRetainedKeysStmt ??= this.#db.prepare(
+      "UPDATE sessions SET dispatch_key = NULL WHERE dispatch_key IN (SELECT idempotency_key FROM dispatches WHERE status IN ('done','failed') AND updated_at < ?)",
+    );
+    return this.#clearRetainedKeysStmt;
+  }
+
+  #clearStaleKeys(): StatementSync {
+    this.#clearStaleKeysStmt ??= this.#db.prepare(
+      "UPDATE sessions SET dispatch_key = NULL WHERE dispatch_key IN (SELECT idempotency_key FROM dispatches WHERE status = 'reserved' AND updated_at < ?)",
+    );
+    return this.#clearStaleKeysStmt;
+  }
+
+  #inTransaction<T>(fn: () => T): T {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = fn();
+      this.#db.exec("COMMIT");
+      return result;
+    } catch (err) {
+      try {
+        this.#db.exec("ROLLBACK");
+      } catch {
+        // 回滚失败不覆盖原始错误
+      }
+      throw err;
+    }
   }
 }

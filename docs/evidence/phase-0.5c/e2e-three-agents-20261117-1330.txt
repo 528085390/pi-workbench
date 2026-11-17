@@ -1,0 +1,67 @@
+✔ [setup] start：{"nonce":"942e0b68","repoRoot":"E:\\pi-workbench","home":"E:\\pi-workbench\\tmp\\t9-e2e","workspace":"E:\\pi-workbench\\tmp\\t9-workspace","evidencePath":"E:\\pi-workbench\\docs\\evidence\\phase-0.5b\\e2e-three-agents.jsonl","node":"v24.16.0","platform":"win32","startedIso":"2026-11-17T05:29:17.536Z"}
+✔ [setup] clean-home：{"removed":"E:\\pi-workbench\\tmp\\t9-e2e"}
+✔ [setup] codex-exec-seed：{"label":"codex-exec-seed","status":0,"signal":null,"error":null,"ms":8208,"stdout":"T9_CODEX_SEED_942e0b68\n","stderr":"Reading additional input from stdin...\nOpenAI Codex v0.167.0\n--------\nworkdir: E:\\pi-workbench\\tmp\\t9-workspace\nmodel: deepseek-v4.1-flash\nprovider: openai\napproval: never\nsandbox: danger-full-access\nreasoning effort: high\nreasoning summaries: none\nsession id: 01a1e7fb-2564-7cc2-bb7b-bec0ddebb617\n--------\nuser\nReply with exactly T9_CODEX_SEED_942e0b68 and do not modify any files.\nwarning: Configured service tier `priority` is not advertised as supported for model `deepseek-v4.1-flash` and will be omitted from requests.\n2026-11-17T05:29:18.782589Z ERROR codex_api::endpoint::responses_websocket: failed to connect to Responses WebSocket stage=Unknown\ncodex\nT9_CODEX_SEED_942e0b68\ntokens used\n1,843\n"}
+✔ [setup] pi-print-seed：{"label":"pi-print-seed","status":0,"signal":null,"error":null,"ms":2097,"stdout":"T9_PI_SEED_942e0b68\n","stderr":""}
+✔ [setup] phase-summary：done
+✔ [setup] daemon-ready：{"url":"http://127.0.0.1:52991","pid":40268,"health":{"ok":true,"name":"pi-workbenchd","version":"0.0.1","pid":40268,"uptimeMs":1151,"schemaVersion":4,"instanceId":"396290b8-a71a-4128-8d43-13837f8adbbb","db":{"schemaVersion":4,"ok":true},"adapters":[{"agent":"claude","available":true},{"agent":"codex","available":false},{"agent":"pi","available":false}]}}
+✔ [setup] phase-summary：done
+✔ [codex] discover：{"count":41,"key":"codex:01a1e7fb-2564-7cc2-bb7b-bec0ddebb617","nativeId":"01a1e7fb-2564-7cc2-bb7b-bec0ddebb617","transcriptPath":"C:\\Users\\huang\\.codex\\sessions\\2026\\11\\17\\rollout-2026-11-17T13-29-18-01a1e7fb-2564-7cc2-bb7b-bec0ddebb617.jsonl","seedEchoed":true}
+✔ [pi] discover：{"count":20,"key":"pi:01a1e7fb-4322-74b8-934d-2596c8963962","nativeId":"01a1e7fb-4322-74b8-934d-2596c8963962","transcriptPath":"C:\\Users\\huang\\.pi\\agent\\sessions\\--E--pi-workbench-tmp-t9-workspace--\\2026-11-17T05-29-26-051Z_01a1e7fb-4322-74b8-934d-2596c8963962.jsonl","seedEchoed":true}
+✔ [setup] register-sessions：{"codex":"codex:01a1e7fb-2564-7cc2-bb7b-bec0ddebb617","pi":"pi:01a1e7fb-4322-74b8-934d-2596c8963962","unknown":"pi:t9-unknown"}
+✔ [setup] phase-summary：done
+✔ [gate4] agents：[{"agent":"claude","available":true,"version":"0.107.0","caps":{"stream":true,"inject":true,"interrupt":true,"attach":false,"resume":true,"transcript":true,"permissions":true,"background":false}},{"agent":"codex","available":true,"version":"0.167.0","caps":{"stream":true,"inject":true,"interrupt":true,"attach":false,"resume":true,"transcript":true,"permissions":false,"background":false}},{"agent":"pi","available":true,"version":"1.5.2","caps":{"stream":true,"inject":true,"interrupt":true,"attach":false,"resume":true,"transcript":true,"permissions":false,"background":false}}]
+✔ [gate4] attach-422-codex：{"status":422,"body":{"error":{"code":"E_CAP_UNSUPPORTED","message":"Agent codex 不支持能力 attach","details":{"agent":"codex","cap":"attach"}}},"ms":4}
+✔ [gate4] attach-422-pi：{"status":422,"body":{"error":{"code":"E_CAP_UNSUPPORTED","message":"Agent pi 不支持能力 attach","details":{"agent":"pi","cap":"attach"}}},"ms":3}
+✔ [gate6] unified-codex：{"messages":4,"shapes":["id,kind,role,text,ts"],"nextCursor":"60830"}
+✔ [gate6] unified-pi：{"messages":3,"shapes":["id,kind,role,text,ts"],"nextCursor":"11932"}
+✔ [gate6] unknown-events：{"messages":2,"body":{"messages":[{"id":"line-2:0","role":"user","kind":"text","text":"UNKNOWN_EVENT_USER","ts":"2026-11-17T05:29:30.319Z"},{"id":"line-5:0","role":"assistant","kind":"text","text":"UNKNOWN_EVENT_OK","ts":"2026-11-17T05:29:30.319Z"}],"nextCursor":"633","pending":false}}
+✔ [gate6] daemon-health：{"ok":true,"name":"pi-workbenchd","version":"0.0.1","pid":40268,"uptimeMs":1469,"schemaVersion":4,"instanceId":"396290b8-a71a-4128-8d43-13837f8adbbb","db":{"schemaVersion":4,"ok":true},"adapters":[{"agent":"claude","available":true},{"agent":"codex","available":true},{"agent":"pi","available":true}]}
+✔ [gate4+6] phase-summary：done
+✔ [claude] ws-open：{"url":"ws://127.0.0.1:52991/api/cp/ws?after=0"}
+✔ [claude] dispatch：{"status":200,"key":"claude:39ea4c35-eaa9-47a0-960a-84bc0d46fe07","nativeId":"39ea4c35-eaa9-47a0-960a-84bc0d46fe07","ms":1997}
+✔ [claude] lease：{"status":200,"expiresAt":"2026-11-17T05:59:32.377Z"}
+✔ [claude] see-ready：{"waitedMs":2040,"messages":2,"last":["The user says: \"T9 基线任务（nonce 942e0b68）：请用一句话答复 T9_CLAUDE_READY_942e0b68\" — respond with one sentence containing the token.\n\nJust answer one sentence."]}
+✔ [claude] inject：{"status":200,"body":{"messageId":"cd35733c-61e5-4c4b-b7eb-c631b79c00e8","effective":"next_turn"}}
+✔ [claude] see-inject：{"waitedMs":2565,"messages":3}
+✔ [claude] interrupt：{"status":200,"body":{"stopReason":"cancelled"}}
+✔ [claude] checkpoint：{"status":200,"body":{"sessionKey":"claude:39ea4c35-eaa9-47a0-960a-84bc0d46fe07","summary":"T9 Claude e2e 942e0b68：dispatch/see/inject/interrupt 已跑通","touchedFiles":[],"nextStep":"handoff 到原生 claude，再 handback","transcriptCursor":"213298","createdAt":"2026-11-17T05:29:42.112Z","version":1,"path":"E:\\pi-workbench\\tmp\\t9-e2e\\handoffs\\claude-39ea4c35-eaa9-47a0-960a-84bc0d46fe07-2026-11-17T05-29-42.112Z-c8fd059b-1.md"}}
+✔ [claude] handoff：{"status":200,"mode":"resume-tui","command":["claude","--resume","39ea4c35-eaa9-47a0-960a-84bc0d46fe07"]}
+✔ [claude] human-turn：{"label":"claude-human-turn","status":0,"signal":null,"error":null,"ms":4656,"stdout":"T9_CLAUDE_HUMAN_942e0b68\n","stderr":""}
+✔ [claude] handback：{"status":200,"resumed":true,"deltaSummary":"user: 请只回答这一行：T9_CLAUDE_HUMAN_942e0b68\nassistant: T9_CLAUDE_HUMAN_942e0b68"}
+✔ [claude] events：{"count":12,"types":{"notice":1,"state_update":9,"thought":1,"token":1},"firstSeq":1,"lastSeq":105}
+✔ [gate6] unified-claude：{"messages":7,"shapes":["id,kind,role,text,ts"],"nextCursor":"222356"}
+✔ [gate4] attach-422-claude-interactive：{"status":422,"body":{"error":{"code":"E_CAP_UNSUPPORTED","message":"Agent claude 不支持能力 attach","details":{"agent":"claude","cap":"attach"}}}}
+✔ [claude] phase-summary：done
+✔ [codex] http-dispatch：{"status":200,"key":"codex:01a1e7fb-9f3e-7561-9f03-45d39b138f74","nativeId":"01a1e7fb-9f3e-7561-9f03-45d39b138f74","ms":2546}
+✔ [codex] http-see：{"waitedMs":1554,"messages":4,"last":["The user asks to reply with exactly a token and not modify files. Simple.\n\nBut there are AGENTS.md instructions. The user instruction is direct. Just reply with the token.\n\nShould I verify anything? No. Just reply exactly."]}
+✔ [gate6] events-codex：{"count":2,"types":{"thought":1,"token":1},"firstSeq":108,"lastSeq":156}
+✔ [gate4] handoff-codex：{"status":200,"command":["codex","resume","01a1e7fb-9f3e-7561-9f03-45d39b138f74","--no-alt-screen"],"mode":"resume-tui"}
+✔ [gate5] handoff-codex：{"command":["codex","resume","01a1e7fb-9f3e-7561-9f03-45d39b138f74","--no-alt-screen"],"mode":"resume-tui"}
+✔ [codex-http] phase-summary：done
+✔ [pi] http-lease：{"status":200}
+✔ [gate7] lease-conflict-http：{"status":409,"body":{"error":{"code":"E_LEASE_CONFLICT","message":"租约被其他客户端持有：pi:01a1e7fb-4322-74b8-934d-2596c8963962","details":{"sessionKey":"pi:01a1e7fb-4322-74b8-934d-2596c8963962","clientId":"t9-intruder","heldBy":"t9-942e0b68","expiresAt":"2026-11-17T05:59:54.068Z"}}}}
+✔ [gate4] handoff-pi：{"status":200,"command":["pi","--session","C:\\Users\\huang\\.pi\\agent\\sessions\\--E--pi-workbench-tmp-t9-workspace--\\2026-11-17T05-29-26-051Z_01a1e7fb-4322-74b8-934d-2596c8963962.jsonl"],"mode":"resume-tui"}
+✔ [gate5] handoff-pi：{"command":["pi","--session","C:\\Users\\huang\\.pi\\agent\\sessions\\--E--pi-workbench-tmp-t9-workspace--\\2026-11-17T05-29-26-051Z_01a1e7fb-4322-74b8-934d-2596c8963962.jsonl"],"mode":"resume-tui"}
+✔ [pi-http] phase-summary：done
+✔ [gate3] pi-dispatch：{"key":"pi:01a1e7fb-b56b-707d-8743-1ef291c1d059","messages":3}
+✔ [gate6] events-pi：{"count":20,"types":{"thought":7,"token":13},"firstSeq":175,"lastSeq":194}
+✔ [pi-dispatch] phase-summary：done
+✔ [codex] resume-by-native-id：{"nativeId":"01a1e7fb-2564-7cc2-bb7b-bec0ddebb617","ms":1937}
+✔ [codex] inject：{"messageId":"09489314-a70f-4351-a08d-7e7b692376ae","effective":"now"}
+✔ [codex] wait-turn：{"stopReason":"end_turn"}
+✔ [codex] see：{"messages":7,"pending":false,"last":["T9_CODEX_RESUME_942e0b68"]}
+✔ [gate5] handoff-codex-driver：{"command":["codex","resume","01a1e7fb-2564-7cc2-bb7b-bec0ddebb617","--no-alt-screen"],"mode":"resume-tui"}
+✔ [codex-driver] phase-summary：done
+✔ [pi] rpc-attach：{"ms":3038,"session":"C:\\Users\\huang\\.pi\\agent\\sessions\\--E--pi-workbench-tmp-t9-workspace--\\2026-11-17T05-29-26-051Z_01a1e7fb-4322-74b8-934d-2596c8963962.jsonl"}
+✔ [pi] inject：{"messageId":"pi:01a1e7fb-4322-74b8-934d-2596c8963962:msg-1","effective":"now"}
+✔ [pi] see：{"messages":5,"last":["T9_PI_ATTACH_942e0b68"]}
+✔ [gate3] pi-lease-conflict：{"conflict":{"code":"E_LEASE_CONFLICT","message":"租约被其他客户端持有：pi:01a1e7fb-4322-74b8-934d-2596c8963962"},"before":2,"after":2,"newProcesses":0}
+✔ [gate5] handoff-pi-driver：{"command":["pi","--session","C:\\Users\\huang\\.pi\\agent\\sessions\\--E--pi-workbench-tmp-t9-workspace--\\2026-11-17T05-29-26-051Z_01a1e7fb-4322-74b8-934d-2596c8963962.jsonl"],"mode":"resume-tui","rpcProcessesBefore":2,"rpcProcessesAfter":1}
+✔ [pi-driver] phase-summary：done
+✔ [gate7] agent-unavailable：{"status":422,"body":{"error":{"code":"E_AGENT_UNAVAILABLE","message":"Agent 未注册或不可用：t9-no-such-agent","details":{"agent":"t9-no-such-agent"}}}}
+✔ [gate7] session-not-found：{"status":404,"body":{"error":{"code":"E_SESSION_NOT_FOUND","message":"会话不存在：claude:t9-missing-942e0b68","details":{"sessionKey":"claude:t9-missing-942e0b68"}}}}
+✔ [gate7] resume-rejected：{"ms":1497,"rejected":{"code":"E_RESUME_REJECTED","message":"恢复会话被 agent 拒绝：00000000-0000-0000-0000-000000000000","details":{"sessionId":"00000000-0000-0000-0000-000000000000","cause":"resume 被 agent 拒绝：Internal error"}}}
+✔ [gate7] phase-summary：done
+✔ [summary] result：{"result":"PASS","failures":[],"claudeKey":"claude:39ea4c35-eaa9-47a0-960a-84bc0d46fe07","codexKey":"codex:01a1e7fb-2564-7cc2-bb7b-bec0ddebb617","piKey":"pi:01a1e7fb-4322-74b8-934d-2596c8963962","evidencePath":"E:\\pi-workbench\\docs\\evidence\\phase-0.5b\\e2e-three-agents.jsonl"}
+
+PASS —— 证据：E:\pi-workbench\docs\evidence\phase-0.5b\e2e-three-agents.jsonl

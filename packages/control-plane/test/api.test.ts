@@ -5,7 +5,7 @@
  */
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { connect } from "node:net";
 import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
@@ -16,13 +16,15 @@ import type { SessionCaps, SessionEvent, SessionRef } from "@pi-workbench/shared
 import type { FastifyInstance } from "fastify";
 
 import type { AgentAdapter } from "../src/adapters/types.ts";
-import { CLAUDE_CAPABILITIES } from "../src/capabilities.ts";
+import type { AgentDriver } from "../src/agents/types.ts";
+import { AgentRouter } from "../src/agents/router.ts";
+import { CLAUDE_BACKGROUND_CAPABILITIES, CLAUDE_CAPABILITIES } from "../src/capabilities.ts";
 import { CheckpointStore } from "../src/checkpoints.ts";
 import { ReadCursorStore } from "../src/cursors.ts";
 import type { Config } from "../src/config.ts";
 import { migrate, openDb } from "../src/db.ts";
 import { DispatchStore } from "../src/dispatch-store.ts";
-import { isWorkbenchError } from "../src/errors.ts";
+import { isWorkbenchError, WorkbenchError } from "../src/errors.ts";
 import { EventStore } from "../src/events.ts";
 import type { NewEvent } from "../src/events.ts";
 import { LeaseManager } from "../src/lease.ts";
@@ -95,6 +97,27 @@ function sessionRef(overrides: Partial<SessionRef> = {}): SessionRef {
   };
 }
 
+/** 假 driver：记录 attach / resume 调用，其余方法空实现（resume 路由用例共用） */
+function makeDriver(calls: string[], overrides: Partial<AgentDriver> = {}): AgentDriver {
+  return {
+    agent: "claude",
+    caps: CLAUDE_CAPABILITIES,
+    discover: async () => [],
+    attach: async () => {
+      calls.push("attach");
+    },
+    inject: async () => ({ messageId: "m-1", effective: "now" }),
+    interrupt: async () => ({ stopReason: "cancelled" }),
+    resume: async () => {
+      calls.push("resume");
+    },
+    handoff: async () => ({ command: ["claude", "attach", "sess-1"], mode: "attach" }),
+    onUpdate: () => () => {},
+    dispose: async () => {},
+    ...overrides,
+  };
+}
+
 function makeConfig(home: string, overrides: Partial<Config> = {}): Config {
   return {
     host: "127.0.0.1",
@@ -102,6 +125,7 @@ function makeConfig(home: string, overrides: Partial<Config> = {}): Config {
     home,
     authToken: null,
     leaseTtlMs: 30_000,
+    dispatchReservedTtlMs: 120_000,
     claude: { adapterCmd: [process.execPath], permissionMode: "auto_allow", initialPermissionMode: "auto" },
     ...overrides,
     codex: overrides.codex ?? { adapterCmd: [process.execPath], permissionMode: "auto_allow", initialAgentMode: "workspace-write" },
@@ -130,6 +154,10 @@ type BundleOptions = {
   storeFactory?: (db: DatabaseSync) => EventStore;
   /** 500 路径的内部错误收集器（Fastify logger:false 时 app.log.error 是 no-op） */
   logError?: (error: unknown) => void;
+  /** 需要走 /agents 或 attach 的用例注入注册表 */
+  router?: AgentRouter;
+  /** 需要观察写队列入队行为的用例注入假队列 */
+  writeQueue?: NonNullable<ServerDeps["writeQueue"]>;
 };
 
 function makeBundle(opts: BundleOptions = {}): Bundle {
@@ -151,6 +179,7 @@ function makeBundle(opts: BundleOptions = {}): Bundle {
     leases,
     registry,
     adapter: fake.adapter,
+    ...(opts.router === undefined ? {} : { router: opts.router }),
     checkpoints,
     dispatches,
     handoffDir: join(dir, "handoffs"),
@@ -162,12 +191,16 @@ function makeBundle(opts: BundleOptions = {}): Bundle {
     store,
     leases,
     registry,
+    instanceId: "test-instance",
+    db,
     engine,
     adapter: fake.adapter,
     checkpoints,
     cursors,
     readTranscript: opts.readTranscript,
     logError: opts.logError,
+    ...(opts.router === undefined ? {} : { router: opts.router }),
+    ...(opts.writeQueue === undefined ? {} : { writeQueue: opts.writeQueue }),
   };
 
   return {
@@ -238,21 +271,51 @@ type ErrorEnvelope = { error: { code: string; message: string; details?: unknown
 
 // ---------------------------------------------------------------- 健康检查
 
-test("GET /health 与 /api/cp/health 都是 T1 健康形状（R31）", async () => {
+test("GET /health 与 /api/cp/health 都是 T1 健康形状 + C04 运行态摘要（R31 / §6.2）", async () => {
   const h = await makeHarness();
   try {
     for (const path of ["/health", API + "/health"]) {
       const res = await h.app.inject({ method: "GET", url: path });
       assert.equal(res.statusCode, 200, path + " 应 200");
-      const body = res.json<{ ok: boolean; name: string; version: string; pid: number; uptimeMs: number }>();
+      const body = res.json<{
+        ok: boolean;
+        name: string;
+        version: string;
+        pid: number;
+        uptimeMs: number;
+        instanceId: string;
+        db: { schemaVersion: number; ok: boolean };
+        adapters: { agent: string; available: boolean }[];
+      }>();
       assert.equal(body.ok, true);
       assert.equal(body.name, "pi-workbenchd");
       assert.equal(typeof body.version, "string");
       assert.equal(body.pid, process.pid);
       assert.ok(body.uptimeMs >= 0);
+      assert.equal(body.instanceId, "test-instance");
+      assert.deepEqual(body.db, { schemaVersion: 4, ok: true });
+      assert.ok(Array.isArray(body.adapters));
     }
   } finally {
     await h.close();
+  }
+});
+
+test("GET /health: db 关闭时 ok:false 且 503（spec §6.2 / §7.4）", async () => {
+  const h = await makeHarness({ seed: null });
+  try {
+    h.db.close();
+    for (const path of ["/health", API + "/health"]) {
+      const res = await h.app.inject({ method: "GET", url: path });
+      assert.equal(res.statusCode, 503, path + " 应 503");
+      const body = res.json<{ ok: boolean; db: { schemaVersion: number; ok: boolean } }>();
+      assert.equal(body.ok, false);
+      assert.equal(body.db.ok, false);
+      assert.equal(body.db.schemaVersion, 0);
+    }
+  } finally {
+    await h.app.close();
+    rmSync(h.dir, { recursive: true, force: true });
   }
 });
 
@@ -527,6 +590,35 @@ test("checkpoint：POST 缺 clientId → 400；GET 先 null 再返回保存的�
   }
 });
 
+test("checkpoint：落库失败 → 500 E_CHECKPOINT_FAILED，不留文件 / 行（C03 fix）", async () => {
+  const h = await makeHarness();
+  try {
+    await acquire(h.app, "pi:1");
+    // 让 checkpoints.save 在 INSERT 时失败，模拟落库异常
+    h.db.exec(
+      "CREATE TRIGGER fail_checkpoint_save BEFORE INSERT ON checkpoints " +
+        "BEGIN SELECT RAISE(ABORT, 'checkpoint save boom'); END;",
+    );
+
+    const res = await h.app.inject({
+      method: "POST",
+      url: SESSIONS + "/checkpoint",
+      payload: { summary: "s", touchedFiles: [], nextStep: "n", clientId: "pi:1" },
+    });
+    assert.equal(res.statusCode, 500);
+    assert.equal(res.json<ErrorEnvelope>().error.code, "E_CHECKPOINT_FAILED");
+
+    const row = h.db.prepare("SELECT count(*) AS n FROM checkpoints").get() as { n?: number } | undefined;
+    assert.equal(Number(row?.n ?? 0), 0, "落库失败不得留行");
+    assert.deepEqual(readdirSync(join(h.dir, "handoffs")), [], "落库失败必须清掉正式文件和 tmp");
+
+    const latest = await h.app.inject({ method: "GET", url: SESSIONS + "/checkpoint" });
+    assert.equal(latest.json<unknown>(), null);
+  } finally {
+    await h.close();
+  }
+});
+
 test("POST handoff → checkpoint + command + mode；handback 接回（R36）", async () => {
   const h = await makeHarness();
   try {
@@ -629,17 +721,18 @@ test("GET transcript 用注入的 readTranscript（R46）", async () => {
       },
     ],
     nextCursor: "42",
-    pending: false,
+    pending: true,
   });
   const h = await makeHarness({ readTranscript: reader });
   try {
     const res = await h.app.inject({ method: "GET", url: SESSIONS + "/transcript?after=0&limit=5" });
     assert.equal(res.statusCode, 200);
-    const body = res.json<{ messages: { id: string; text: string }[]; nextCursor: string }>();
+    const body = res.json<{ messages: { id: string; text: string }[]; nextCursor: string; pending: boolean }>();
     assert.equal(body.messages.length, 1);
     assert.equal(body.messages[0]?.id, "m1");
     assert.ok(body.messages[0]?.text.includes("limit=5"));
     assert.equal(body.nextCursor, "42");
+    assert.equal(body.pending, true, "文件分支也必须透传 pending");
 
     const missing = await h.app.inject({ method: "GET", url: API + "/sessions/claude:nope/transcript" });
     assert.equal(missing.statusCode, 404);
@@ -737,10 +830,17 @@ test("错误码 → 状态码映射覆盖 R35 全表", () => {
     E_LEASE_CONFLICT: 409,
     E_NO_LEASE: 409,
     E_IDEMPOTENCY_CONFLICT: 409,
+    E_DISPATCH_IN_PROGRESS: 409,
+    E_SESSION_BUSY: 429,
+    E_ASSET_CONFIG_INVALID: 400,
     E_CAP_UNSUPPORTED: 422,
     E_AGENT_UNAVAILABLE: 422,
     E_ADAPTER_DOWN: 503,
-    E_RESUME_REJECTED: 503,
+    E_ADAPTER_CRASHED: 503,
+    E_HANDOFF_FAILED: 503,
+    E_CHECKPOINT_FAILED: 500,
+    E_RESUME_REJECTED: 409,
+    E_INTERNAL: 500,
   });
 });
 
@@ -762,7 +862,7 @@ test("错误体形状与状态码（E_BAD_REQUEST / E_NO_LEASE / E_IDEMPOTENCY_C
     assert.equal(noLease.statusCode, 409);
     assert.equal(noLease.json<ErrorEnvelope>().error.code, "E_NO_LEASE");
 
-    // E_RESUME_REJECTED：handback 的 resume 失败 → 503
+    // E_RESUME_REJECTED：handback 的 resume 失败 → 409（spec §7.3 / §8）
     await acquire(h.app, "pi:1");
     const handoff = await h.app.inject({
       method: "POST",
@@ -775,7 +875,7 @@ test("错误体形状与状态码（E_BAD_REQUEST / E_NO_LEASE / E_IDEMPOTENCY_C
       url: SESSIONS + "/handback",
       payload: { clientId: "handoff-pi:1" },
     });
-    assert.equal(handback.statusCode, 503);
+    assert.equal(handback.statusCode, 409);
     assert.equal(handback.json<ErrorEnvelope>().error.code, "E_RESUME_REJECTED");
 
     // E_IDEMPOTENCY_CONFLICT：同 key 换 payload
@@ -833,6 +933,31 @@ test("未知异常 → 500 E_INTERNAL（R35 兜底码）", async () => {
     // 评审 N1：logger:false 让 app.log.error 变 no-op，真实原因必须仍能落到注入的 logError
     assert.equal(logged.length, 1, "内部异常必须交给 logError 一次");
     assert.match(String((logged[0] as Error).message), /boom/);
+  } finally {
+    await h.close();
+  }
+});
+
+test("WorkbenchError(E_INTERNAL) 与未知异常同待遇：500 + 固定文案 + 原因只进日志（review r3）", async () => {
+  const logged: unknown[] = [];
+  const h = await makeHarness({
+    readTranscript: () => {
+      throw new WorkbenchError("E_INTERNAL", "SQL 片段 SELECT * FROM sessions WHERE key = 'secret'");
+    },
+    logError: (error) => {
+      logged.push(error);
+    },
+  });
+  try {
+    const res = await h.app.inject({ method: "GET", url: SESSIONS + "/transcript" });
+    assert.equal(res.statusCode, 500);
+    const body = res.json<ErrorEnvelope>();
+    assert.equal(body.error.code, "E_INTERNAL");
+    assert.equal(body.error.message, "internal error", "E_INTERNAL 不得回传内部 message");
+    assert.equal(body.error.details, undefined, "E_INTERNAL 不得回传 details");
+    assert.ok(!res.body.includes("SELECT"), "内部 SQL 片段不得回给客户端：" + res.body);
+    assert.equal(logged.length, 1, "E_INTERNAL 必须交给 logError 一次");
+    assert.match(String((logged[0] as Error).message), /SELECT/);
   } finally {
     await h.close();
   }
@@ -1193,7 +1318,7 @@ class RaceReplayStore extends EventStore {
   }
 }
 
-test("WS：连接后 append 的事件以 {seq,sessionKey,type,payload,source,ts} 下发（R33）", async () => {
+test("WS：连接后 append 的事件以 {seq,sessionKey,type,source,ts,payload,idempotencyKey} 下发（R33 / §6.3）", async () => {
   const h = await makeHarness({ listen: true, seed: null });
   const received: string[] = [];
   let socket: MinimalSocket | null = null;
@@ -1214,7 +1339,7 @@ test("WS：连接后 append 的事件以 {seq,sessionKey,type,payload,source,ts}
     assert.deepEqual(wire["payload"], { text: "hello" });
     assert.equal(wire["source"], "claude");
     assert.equal(typeof wire["ts"], "string");
-    assert.equal(wire["idempotencyKey"], undefined, "线格式不暴露 idempotencyKey");
+    assert.equal(wire["idempotencyKey"], "ws-1", "线格式保留 idempotencyKey（spec §6.3）");
   } finally {
     socket?.close();
     await h.close();
@@ -1432,6 +1557,302 @@ test("读语义：GET /unread 默认只读不推进（peek），ack=1 才推进�
     const after = await h.app.inject({ method: "GET", url: API + "/sessions?clientId=pi:1" });
     assert.equal(after.json<{ unread: number }[]>()[0]?.unread, 3, "已读 2 条 → 剩 3 条");
     assert.equal(after.json<{ lastReadCursor: string }[]>()[0]?.lastReadCursor, "2");
+  } finally {
+    await h.close();
+  }
+});
+
+test("attach 成功后恢复 driver=pi 且 status=idle（spec §7.1）", async () => {
+  const calls: string[] = [];
+  const router = new AgentRouter();
+  const driver: AgentDriver = {
+    agent: "claude",
+    caps: CLAUDE_BACKGROUND_CAPABILITIES,
+    discover: async () => [],
+    attach: async () => {
+      calls.push("attach");
+    },
+    inject: async () => ({ messageId: "m-1", effective: "now" }),
+    interrupt: async () => ({ stopReason: "cancelled" }),
+    resume: async () => {},
+    handoff: async () => ({ command: ["claude", "attach", "sess-1"], mode: "attach" }),
+    onUpdate: () => () => {},
+    dispose: async () => {},
+  };
+  router.register(driver);
+
+  const h = await makeHarness({
+    router,
+    seed: [
+      sessionRef({
+        status: "unknown",
+        driver: "none",
+        capabilities: CLAUDE_BACKGROUND_CAPABILITIES,
+        kind: "background",
+      }),
+    ],
+  });
+  try {
+    const res = await h.app.inject({ method: "POST", url: SESSIONS + "/attach" });
+    assert.equal(res.statusCode, 200, res.body);
+    assert.deepEqual(res.json(), { attached: true, sessionKey: SESSION_KEY, agent: "claude" });
+    assert.deepEqual(calls, ["attach"]);
+    assert.equal(h.registry.get(SESSION_KEY)?.driver, "pi");
+    assert.equal(h.registry.get(SESSION_KEY)?.status, "idle");
+  } finally {
+    await h.close();
+  }
+});
+
+test("resume 成功后接管会话：driver=pi / status=idle 且追加 state_update（v1 additive）", async () => {
+  const calls: string[] = [];
+  const router = new AgentRouter();
+  router.register(makeDriver(calls));
+
+  const h = await makeHarness({
+    router,
+    seed: [
+      sessionRef({
+        status: "unknown",
+        driver: "none",
+        capabilities: CLAUDE_CAPABILITIES,
+        kind: "interactive",
+      }),
+    ],
+  });
+  try {
+    // review r2 P1：resume 现在是写操作，先取租约
+    await acquire(h.app, "pi:1");
+    const res = await h.app.inject({
+      method: "POST",
+      url: SESSIONS + "/resume",
+      payload: { clientId: "pi:1" },
+    });
+    assert.equal(res.statusCode, 200, res.body);
+    assert.deepEqual(res.json(), { resumed: true, sessionKey: SESSION_KEY, agent: "claude" });
+    assert.deepEqual(calls, ["resume"]);
+    assert.equal(h.registry.get(SESSION_KEY)?.driver, "pi");
+    assert.equal(h.registry.get(SESSION_KEY)?.status, "idle");
+
+    const events = h.store.list(SESSION_KEY);
+    const last = events[events.length - 1];
+    assert.equal(last?.type, "state_update");
+    // source 用会话 agent 名（与 takeover / boot-recovery 的 state_update 口径一致）
+    assert.equal(last?.source, "claude");
+    assert.deepEqual(last?.payload, { state: "idle", driver: "pi", clientId: "pi:1" });
+  } finally {
+    await h.close();
+  }
+});
+
+test("resume 走 per-session 写队列：driver.resume 在队列任务内执行", async () => {
+  const calls: string[] = [];
+  const router = new AgentRouter();
+  router.register(makeDriver(calls));
+  const queued: string[] = [];
+  const writeQueue = {
+    run: async <T>(sessionKey: string, task: () => Promise<T>): Promise<T> => {
+      queued.push(sessionKey);
+      return await task();
+    },
+    pending: (): number => 0,
+  };
+
+  const h = await makeHarness({
+    router,
+    writeQueue: writeQueue as unknown as NonNullable<ServerDeps["writeQueue"]>,
+    seed: [sessionRef({ status: "unknown", driver: "none" })],
+  });
+  try {
+    await acquire(h.app, "pi:1");
+    const res = await h.app.inject({
+      method: "POST",
+      url: SESSIONS + "/resume",
+      payload: { clientId: "pi:1" },
+    });
+    assert.equal(res.statusCode, 200, res.body);
+    assert.deepEqual(queued, [SESSION_KEY], "resume 必须按路径 sessionKey 入队");
+    assert.deepEqual(calls, ["resume"]);
+    assert.equal(h.registry.get(SESSION_KEY)?.driver, "pi");
+  } finally {
+    await h.close();
+  }
+});
+
+test("resume：会话不存在 → 404 E_SESSION_NOT_FOUND", async () => {
+  const h = await makeHarness({ seed: null });
+  try {
+    const res = await h.app.inject({ method: "POST", url: API + "/sessions/claude:nope/resume" });
+    assert.equal(res.statusCode, 404, res.body);
+    assert.equal(res.json<ErrorEnvelope>().error.code, "E_SESSION_NOT_FOUND");
+  } finally {
+    await h.close();
+  }
+});
+
+test("resume：Agent 不可用 → 422 E_AGENT_UNAVAILABLE 且不调 driver", async () => {
+  const calls: string[] = [];
+  const router = new AgentRouter();
+  router.register(makeDriver(calls), {
+    available: false,
+    reason: "E_AGENT_UNAVAILABLE: claude 未登录",
+  });
+
+  const h = await makeHarness({
+    router,
+    seed: [sessionRef({ status: "unknown", driver: "none" })],
+  });
+  try {
+    await acquire(h.app, "pi:1");
+    const res = await h.app.inject({
+      method: "POST",
+      url: SESSIONS + "/resume",
+      payload: { clientId: "pi:1" },
+    });
+    assert.equal(res.statusCode, 422, res.body);
+    const body = res.json<ErrorEnvelope>();
+    assert.equal(body.error.code, "E_AGENT_UNAVAILABLE");
+    assert.deepEqual(body.error.details, {
+      agent: "claude",
+      cap: "resume",
+      reason: "E_AGENT_UNAVAILABLE: claude 未登录",
+    });
+    assert.deepEqual(calls, []);
+    assert.equal(h.registry.get(SESSION_KEY)?.driver, "none", "失败不改状态");
+  } finally {
+    await h.close();
+  }
+});
+
+test("resume：会话未声明 caps.resume → 422 E_CAP_UNSUPPORTED 且不调 driver", async () => {
+  const calls: string[] = [];
+  const router = new AgentRouter();
+  router.register(makeDriver(calls));
+
+  const h = await makeHarness({
+    router,
+    seed: [
+      sessionRef({
+        status: "unknown",
+        driver: "none",
+        capabilities: { ...CLAUDE_CAPABILITIES, resume: false },
+      }),
+    ],
+  });
+  try {
+    await acquire(h.app, "pi:1");
+    const res = await h.app.inject({
+      method: "POST",
+      url: SESSIONS + "/resume",
+      payload: { clientId: "pi:1" },
+    });
+    assert.equal(res.statusCode, 422, res.body);
+    const body = res.json<ErrorEnvelope>();
+    assert.equal(body.error.code, "E_CAP_UNSUPPORTED");
+    assert.deepEqual(body.error.details, { agent: "claude", cap: "resume" });
+    assert.deepEqual(calls, []);
+  } finally {
+    await h.close();
+  }
+});
+
+test("resume：调用方未持有租约 → 409 E_NO_LEASE 且不调 driver（review r2 P1）", async () => {
+  const calls: string[] = [];
+  const router = new AgentRouter();
+  router.register(makeDriver(calls));
+
+  const h = await makeHarness({
+    router,
+    seed: [sessionRef({ status: "unknown", driver: "none" })],
+  });
+  try {
+    const res = await h.app.inject({
+      method: "POST",
+      url: SESSIONS + "/resume",
+      payload: { clientId: "pi:1" },
+    });
+    assert.equal(res.statusCode, 409, res.body);
+    assert.equal(res.json<ErrorEnvelope>().error.code, "E_NO_LEASE");
+    assert.deepEqual(calls, [], "无租约时不得触碰 driver");
+    assert.equal(h.registry.get(SESSION_KEY)?.driver, "none");
+    assert.equal(h.registry.get(SESSION_KEY)?.status, "unknown");
+  } finally {
+    await h.close();
+  }
+});
+
+test("resume：human handoff 会话 → 409 E_RESUME_REJECTED，不改状态/租约（review r2 P1）", async () => {
+  const calls: string[] = [];
+  const router = new AgentRouter();
+  router.register(makeDriver(calls));
+
+  const h = await makeHarness({
+    router,
+    seed: [sessionRef({ status: "handoff", driver: "human" })],
+  });
+  try {
+    // 即使调用方持有租约，human handoff 也不允许 resume：必须走 handback
+    await acquire(h.app, "human-1");
+    const res = await h.app.inject({
+      method: "POST",
+      url: SESSIONS + "/resume",
+      payload: { clientId: "human-1" },
+    });
+    assert.equal(res.statusCode, 409, res.body);
+    const body = res.json<ErrorEnvelope>();
+    assert.equal(body.error.code, "E_RESUME_REJECTED");
+    assert.deepEqual(body.error.details, { sessionKey: SESSION_KEY, reason: "handoff" });
+    assert.deepEqual(calls, []);
+    assert.equal(h.registry.get(SESSION_KEY)?.driver, "human");
+    assert.equal(h.registry.get(SESSION_KEY)?.status, "handoff");
+  } finally {
+    await h.close();
+  }
+});
+
+test("resume：running / starting 会话 → 429 E_SESSION_BUSY（review r2 P1）", async () => {
+  for (const status of ["running", "starting"] as const) {
+    const calls: string[] = [];
+    const router = new AgentRouter();
+    router.register(makeDriver(calls));
+
+    const h = await makeHarness({
+      router,
+      seed: [sessionRef({ status, driver: "pi" })],
+    });
+    try {
+      await acquire(h.app, "pi:1");
+      const res = await h.app.inject({
+        method: "POST",
+        url: SESSIONS + "/resume",
+        payload: { clientId: "pi:1" },
+      });
+      assert.equal(res.statusCode, 429, status + " 应 429：" + res.body);
+      const body = res.json<ErrorEnvelope>();
+      assert.equal(body.error.code, "E_SESSION_BUSY");
+      assert.deepEqual(body.error.details, { sessionKey: SESSION_KEY, status });
+      assert.deepEqual(calls, []);
+      assert.equal(h.registry.get(SESSION_KEY)?.status, status);
+    } finally {
+      await h.close();
+    }
+  }
+});
+
+test("resume：缺 clientId → 400 E_BAD_REQUEST（review r2 P1）", async () => {
+  const calls: string[] = [];
+  const router = new AgentRouter();
+  router.register(makeDriver(calls));
+
+  const h = await makeHarness({
+    router,
+    seed: [sessionRef({ status: "unknown", driver: "none" })],
+  });
+  try {
+    const res = await h.app.inject({ method: "POST", url: SESSIONS + "/resume", payload: {} });
+    assert.equal(res.statusCode, 400, res.body);
+    assert.equal(res.json<ErrorEnvelope>().error.code, "E_BAD_REQUEST");
+    assert.deepEqual(calls, []);
   } finally {
     await h.close();
   }

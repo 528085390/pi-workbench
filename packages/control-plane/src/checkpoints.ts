@@ -8,6 +8,9 @@ import type { DatabaseSync, StatementSync } from "node:sqlite";
 
 import type { Checkpoint } from "@pi-workbench/shared";
 
+/** 当前检查点格式版本（spec §7.3：数据库 `checkpoints.version` 固定写 1）。 */
+export const CHECKPOINT_VERSION = 1;
+
 /** 带落盘路径的检查点（数据库行里 path 列的值）。 */
 export type StoredCheckpoint = Checkpoint & { path: string };
 
@@ -19,9 +22,10 @@ type CheckpointRow = {
   next_step: string;
   cursor: string;
   created_at: string;
+  version: number | null;
 };
 
-const COLUMNS = "session_key, path, summary, touched_files_json, next_step, cursor, created_at";
+const COLUMNS = "session_key, path, summary, touched_files_json, next_step, cursor, created_at, version";
 
 function toStored(row: CheckpointRow): StoredCheckpoint {
   let touched: string[] = [];
@@ -39,6 +43,8 @@ function toStored(row: CheckpointRow): StoredCheckpoint {
     nextStep: row.next_step,
     transcriptCursor: row.cursor,
     createdAt: row.created_at,
+    // 半迁移 / 历史行没有 version 值时按 1 读（spec §7.3）
+    version: Number(row.version ?? 1),
   };
 }
 
@@ -63,6 +69,7 @@ export class CheckpointStore {
       checkpoint.nextStep,
       checkpoint.transcriptCursor,
       checkpoint.createdAt,
+      checkpoint.version ?? CHECKPOINT_VERSION,
     );
   }
 
@@ -81,8 +88,8 @@ export class CheckpointStore {
 
   #insert(): StatementSync {
     this.#insertStmt ??= this.#db.prepare(
-      `INSERT INTO checkpoints (session_key, path, summary, touched_files_json, next_step, cursor, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO checkpoints (session_key, path, summary, touched_files_json, next_step, cursor, created_at, version)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     return this.#insertStmt;
   }

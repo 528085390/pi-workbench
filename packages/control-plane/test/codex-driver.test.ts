@@ -29,6 +29,7 @@ function makeConfig(adapterCmd: string[]): Config {
     home: WORKSPACE,
     authToken: null,
     leaseTtlMs: 30_000,
+    dispatchReservedTtlMs: 120_000,
     claude: { adapterCmd: [process.execPath, FIXTURE], permissionMode: "auto_allow", initialPermissionMode: "auto" },
     codex: { adapterCmd, permissionMode: "auto_allow", initialAgentMode: "workspace-write" },
     pi: { rpcCmd: ["pi", "--mode", "rpc"] },

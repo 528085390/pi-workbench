@@ -31,17 +31,23 @@ export type LeaseManagerOptions = {
   ttlMs?: number;
   /** 时间源，默认 `Date.now`；测试注入以便快进。 */
   now?: () => number;
+  /**
+   * 本进程的实例 id（`instances.instance_id`，schema v4）。
+   * 空串 = 未归属：测试 / CLI 等单次用法不写归属；启动清扫会把它当历史租约清理。
+   */
+  instanceId?: string;
 };
 
 type LeaseRow = {
   session_key: string;
   driver: string;
   client_id: string;
+  instance_id: string;
   expires_at: string;
   heartbeat_at: string;
 };
 
-const LEASE_COLUMNS = "session_key, driver, client_id, expires_at, heartbeat_at";
+const LEASE_COLUMNS = "session_key, driver, client_id, instance_id, expires_at, heartbeat_at";
 
 /**
  * 单 driver 租约：同一 sessionKey 同时最多一个 writer。
@@ -53,12 +59,14 @@ export class LeaseManager {
   readonly #db: DatabaseSync;
   readonly #ttlMs: number;
   readonly #now: () => number;
+  readonly #instanceId: string;
 
   constructor(db: DatabaseSync, opts: LeaseManagerOptions = {}) {
     this.#db = db;
     // 与 acquire / heartbeat 用同一套校验：非法 TTL 在这里就炸，避免写出「出生即过期」的租约。
     this.#ttlMs = opts.ttlMs === undefined ? DEFAULT_LEASE_TTL_MS : positiveTtl(opts.ttlMs);
     this.#now = opts.now ?? Date.now;
+    this.#instanceId = opts.instanceId ?? "";
   }
 
   /**
@@ -73,15 +81,17 @@ export class LeaseManager {
 
     const result = this.#db
       .prepare(
-        `INSERT INTO leases (${LEASE_COLUMNS}) VALUES (?, ?, ?, ?, ?)
+        `INSERT INTO leases (session_key, driver, client_id, instance_id, expires_at, heartbeat_at)
+         VALUES (?, ?, ?, ?, ?, ?)
          ON CONFLICT(session_key) DO UPDATE SET
            driver = excluded.driver,
            client_id = excluded.client_id,
            expires_at = excluded.expires_at,
-           heartbeat_at = excluded.heartbeat_at
+           heartbeat_at = excluded.heartbeat_at,
+           instance_id = excluded.instance_id
          WHERE leases.expires_at <= ? OR leases.client_id = ?`,
       )
-      .run(sessionKey, driver, clientId, expiresAt, heartbeatAt, heartbeatAt, clientId);
+      .run(sessionKey, driver, clientId, this.#instanceId, expiresAt, heartbeatAt, heartbeatAt, clientId);
 
     if (Number(result.changes) === 0) {
       const held = this.#read(sessionKey);
@@ -110,10 +120,10 @@ export class LeaseManager {
 
     const result = this.#db
       .prepare(
-        `UPDATE leases SET expires_at = ?, heartbeat_at = ?
+        `UPDATE leases SET expires_at = ?, heartbeat_at = ?, instance_id = ?
          WHERE session_key = ? AND client_id = ? AND expires_at > ?`,
       )
-      .run(expiresAt, heartbeatAt, sessionKey, clientId, heartbeatAt);
+      .run(expiresAt, heartbeatAt, this.#instanceId, sessionKey, clientId, heartbeatAt);
 
     if (Number(result.changes) === 0) {
       throw this.#conflict(sessionKey, clientId, "heartbeat");
@@ -148,6 +158,37 @@ export class LeaseManager {
       return null;
     }
     return Date.parse(lease.expiresAt) <= this.#now() ? null : lease;
+  }
+
+  /**
+   * 周期清扫：删除全部已过期租约（`expires_at <= now`），返回删除行数。
+   * 与 `current()` 共用注入时钟；不碰未过期租约（归属清理由启动清扫负责）。
+   */
+  sweepExpired(): number {
+    const result = this.#db
+      .prepare("DELETE FROM leases WHERE expires_at <= ?")
+      .run(toIso(this.#now()));
+    return Number(result.changes);
+  }
+
+  /**
+   * 启动清扫（spec §7.1 第 4 步）：单实例锁保证其他实例已死。
+   * 1. 未过期的 human handoff 租约跨重启保留（spec §7.1 对账表），先改归属到当前实例；
+   * 2. 删除其余 `instance_id != 当前` 的租约（含 v4 之前的空串历史行，spec §5 约束 2）。
+   * 返回删除行数；被接管的 human 租约不计入（它们没有被删除）。
+   */
+  sweepForBoot(): number {
+    const now = toIso(this.#now());
+    this.#db
+      .prepare(
+        `UPDATE leases SET instance_id = ?
+         WHERE instance_id != ? AND driver = 'human' AND expires_at > ?`,
+      )
+      .run(this.#instanceId, this.#instanceId, now);
+    const deleted = this.#db
+      .prepare("DELETE FROM leases WHERE instance_id != ?")
+      .run(this.#instanceId);
+    return Number(deleted.changes);
   }
 
   /** 写保护断言：无有效租约或租约属于他人 → `E_NO_LEASE`。 */
@@ -213,6 +254,7 @@ function toLease(row: LeaseRow): Lease {
     sessionKey: row.session_key,
     driver: asDriver(row.driver),
     clientId: row.client_id,
+    instanceId: row.instance_id,
     expiresAt: row.expires_at,
     heartbeatAt: row.heartbeat_at,
   };

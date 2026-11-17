@@ -212,12 +212,17 @@ export class PiDriver implements AgentDriver {
     return { stopReason: "aborted" };
   }
 
+  /** 接管模式（纯函数，不执行命令）：能力门禁在 close 之前使用 */
+  handoffMode(): "resume-tui" {
+    return "resume-tui";
+  }
+
   /** handoff 出口：原生终端打开同一 session 文件（A12 实测能看到历史）。 */
   async handoff(ref: SessionRef): Promise<HandoffCommand> {
     this.#claim(ref);
     // 先断开 RPC 子进程：否则人类终端与 daemon 会同时写同一个 session jsonl（A11：Pi 无文件锁）。
     await this.#dropClient(ref.key);
-    return { command: ["pi", "--session", transcriptPathOf(ref)], mode: "resume-tui" };
+    return { command: ["pi", "--session", transcriptPathOf(ref)], mode: this.handoffMode() };
   }
 
   onUpdate(cb: (update: AdapterUpdate) => void): () => void {

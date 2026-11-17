@@ -1,0 +1,17 @@
+✔ daemon-1-health：{"url":"http://127.0.0.1:6983","pid":44136,"instanceId":"2304d48e-d318-48c4-8e9e-936af7fbeb9b"}
+✔ dispatch-accepted：{"status":200,"body":{"key":"claude:sess_1","agent":"claude","nativeId":"sess_1","acpSessionId":"sess_1","cwd":"E:\\pi-workbench\\tmp\\e2e-faults\\workspace","transcriptPath":"C:\\Users\\huang\\.claude\\projects\\E--pi-workbench-tmp-e2e-faults-workspace\\sess_1.jsonl","status":"running","driver":"pi","capabilities":{"stream":true,"inject":true,"interrupt":true,"attach":false,"resume":true,"transcript":true,"permissions":true,"background":false},"kind":"interactive"}}
+✔ session-running：{"status":"running","driver":"pi"}
+✔ lease-acquired：{"status":200,"body":{"sessionKey":"claude:sess_1","driver":"pi","clientId":"e2e-faults","instanceId":"2304d48e-d318-48c4-8e9e-936af7fbeb9b","expiresAt":"2026-11-16T19:54:27.676Z","heartbeatAt":"2026-11-16T19:52:27.676Z"}}
+✔ adapter-child-found：{"daemonPid":44136,"found":[{"pid":29776,"name":"node.exe","cmd":"E:\\nodejs\\node.exe E:\\pi-workbench\\packages\\control-plane\\test\\fixtures\\fake-acp-agent.mjs claude-agent-acp-fixture"}]}
+✔ descendants-before-adapter-kill：{"count":3,"pids":[12528,29776,54776]}
+✔ adapter-killed：{"adapterPid":29776}
+✔ lease-released-within-30s：{"released":true,"sessionStatus":"exited","lease":null}
+✔ error-event-E_ADAPTER_CRASHED：{"seq":4,"payload":{"code":"E_ADAPTER_CRASHED","message":"adapter 子进程异常退出（pid 29776，E:\\nodejs\\node.exe）","pid":29776,"label":"E:\\nodejs\\node.exe"}}
+✔ session-status-exited：{"status":"exited"}
+✔ daemon-still-healthy：{"status":200,"adapters":[{"agent":"claude","available":true},{"agent":"codex","available":true},{"agent":"pi","available":true}]}
+✔ daemon-stop-exit：{"daemonPid":44136}
+✔ no-residual-children：{"beforeStop":[12528,29776,54776],"survivors":[]}
+✔ daemon-2-health：{"url":"http://127.0.0.1:7003","pid":48712,"instanceId":"a76c9add-5c84-46d4-af2f-e5d02c7eb261"}
+✔ instances-ended-at-reconciled：{"instanceId1":"2304d48e-d318-48c4-8e9e-936af7fbeb9b","instanceId2":"a76c9add-5c84-46d4-af2f-e5d02c7eb261","row":{"instance_id":"2304d48e-d318-48c4-8e9e-936af7fbeb9b","ended_at":"2026-11-16T19:52:33.974Z"}}
+↷ SKIP graceful-shutdown-ended-at：SKIP: 未设置 PI_WORKBENCH_E2E_SHUTDOWN=1；Windows SIGTERM=TerminateProcess，优雅关闭分支不可达
+PASS 15 checks (1 skipped)

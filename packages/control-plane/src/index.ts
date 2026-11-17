@@ -14,15 +14,22 @@ import type { CodexWriteAction } from "./agents/codex-driver.ts";
 import { PiDriver, resolvePiPackageDir } from "./agents/pi-driver.ts";
 import { AgentRouter } from "./agents/router.ts";
 import type { AgentDriver } from "./agents/types.ts";
-import { hideWindowsChildProcesses } from "./child-process.ts";
+import { AUDIT_RETENTION_DAYS, AuditStore } from "./audit.ts";
+import { reconcileSessions } from "./boot-recovery.ts";
+import type { RecoveryReport } from "./boot-recovery.ts";
+import { hideWindowsChildProcesses, setProcessRegistry } from "./child-process.ts";
+import { createLogger, resolveLogDir } from "./logger.ts";
+import type { Logger } from "./logger.ts";
+import { ProcessRegistry, createDriverExitHandler } from "./process-registry.ts";
 import { CheckpointStore } from "./checkpoints.ts";
 import type { Config } from "./config.ts";
 import { loadConfig } from "./config.ts";
 import { ReadCursorStore } from "./cursors.ts";
-import { migrate, openDb } from "./db.ts";
+import { SCHEMA_VERSION, backupDbFile, migrate, openDb, schemaVersion } from "./db.ts";
 import { DispatchStore } from "./dispatch-store.ts";
 import { isWorkbenchError, WorkbenchError } from "./errors.ts";
 import { EventStore } from "./events.ts";
+import { InstanceStore } from "./instances.ts";
 import { LeaseManager } from "./lease.ts";
 import { InstanceLockError, acquireInstanceLock, ensureDirs, resolvePaths } from "./paths.ts";
 import type { InstanceLock, WorkbenchPaths } from "./paths.ts";
@@ -34,6 +41,25 @@ import { TakeoverEngine } from "./takeover.ts";
 
 /** 与 index 装配的 PiDriver 保持一致的写者身份（takeover.ts 的 piClientId 必须同值） */
 export const PI_AGENT_CLIENT_ID = "pi";
+
+/** daemon 日志器：main() 装配后写入轮转日志；启动早期仍回落 console。 */
+let log: Logger | null = null;
+
+function logInfo(message: string): void {
+  if (log === null) {
+    console.log(message);
+    return;
+  }
+  log.info(message);
+}
+
+function logError(message: string): void {
+  if (log === null) {
+    console.error(message);
+    return;
+  }
+  log.error(message);
+}
 
 /**
  * Codex 写守卫（B08 S6/P0-1）：TakeoverEngine 在 driver 写操作期间把租约临时换到
@@ -59,6 +85,16 @@ export function makeCodexWriteGuard(
 
 /** spec §11.1：单个探测子进程 / 动态 import 的硬超时 */
 export const PROBE_TIMEOUT_MS = 3000;
+
+/** spec §7.1：`instances.heartbeat_at` 刷新间隔（15s）。`unref()` 后不拖住进程退出。 */
+const INSTANCE_HEARTBEAT_MS = 15_000;
+
+/** spec §7.1 / 0.5-A D6：租约后台清扫间隔（30s）。`unref()` 后不拖住进程退出。 */
+const LEASE_SWEEP_MS = 30_000;
+
+/** C02：dispatch 幂等记录保留 24h，后台每小时清扫一次（含超期 reserved）。 */
+const DISPATCH_RETENTION_MS = 24 * 3600_000;
+const DISPATCH_SWEEP_MS = 3600_000;
 
 export type AgentProbe = {
   agent: AgentName;
@@ -271,21 +307,24 @@ function withProbeTimeout<T>(promise: Promise<T>, timeoutMs: number, label: stri
  */
 export async function main(): Promise<void> {
   hideWindowsChildProcesses();
+  const processRegistry = new ProcessRegistry();
+  setProcessRegistry(processRegistry);
   const config = loadConfig();
   const paths = resolvePaths(config.home);
   ensureDirs(paths);
+  log = createLogger({ dir: resolveLogDir(process.env, config.home) });
 
   let lock: InstanceLock;
   try {
     lock = acquireInstanceLock(paths.pid);
   } catch (err) {
     if (err instanceof InstanceLockError) {
-      console.error("[pi-workbenchd] " + err.message);
+      logError("[pi-workbenchd] " + err.message);
       process.exitCode = 1;
       return;
     }
     if ((err as NodeJS.ErrnoException).code === "EEXIST") {
-      console.error(
+      logError(
         "[pi-workbenchd] E_ALREADY_RUNNING：pid 文件 " + paths.pid + " 已被占用（另一进程正在启动，或空锁迟迟未写完）",
       );
       process.exitCode = 1;
@@ -301,7 +340,79 @@ export async function main(): Promise<void> {
     process.exitCode = 1;
     return;
   }
-  const { db, store, leases, registry, restored, checkpoints, dispatches, cursors } = boot;
+  const { db, store, leases, registry, restored, recovery, checkpoints, dispatches, cursors, instances } = boot;
+
+  // C04 / spec §7.4：adapter/RPC 子进程异常退出时，对该 agent 的 running 会话发 error、释放租约、置 exited。
+  processRegistry.setOnExit((info) => {
+    if (info.agent === undefined) {
+      return;
+    }
+    createDriverExitHandler({ agent: info.agent, sessions: registry, events: store, leases })(info);
+  });
+
+  // C03 / spec §7.4：审计只追加；启动按配置的保留期清一次，失败只告警不阻断启动。
+  const audit = new AuditStore(db, { instanceId: instances.id ?? "unknown" });
+  const auditRetentionDays = config.auditRetentionDays ?? AUDIT_RETENTION_DAYS;
+  try {
+    const pruned = audit.prune(auditRetentionDays);
+    logInfo(
+      "[pi-workbenchd] 审计日志清理完成：删除 " +
+        String(pruned) +
+        " 条（保留 " +
+        String(auditRetentionDays) +
+        " 天）",
+    );
+  } catch (err) {
+    logError("[pi-workbenchd] 审计日志清理失败（启动继续）：" + errorMessage(err));
+  }
+
+  // C02：dispatch 幂等记录保留 24h；启动先扫一次，之后每小时扫一次（含超期 reserved）。
+  const sweepDispatches = (): number => {
+    const retained = dispatches.pruneRetained(DISPATCH_RETENTION_MS);
+    const stale = dispatches.pruneStaleReserved(DISPATCH_RETENTION_MS);
+    return retained + stale;
+  };
+  try {
+    const swept = sweepDispatches();
+    logInfo("[pi-workbenchd] dispatch 幂等记录清理完成：删除 " + String(swept) + " 条（保留 24h）");
+  } catch (err) {
+    logError("[pi-workbenchd] dispatch 幂等记录清理失败（启动继续）：" + errorMessage(err));
+  }
+
+  // spec §7.1：15s 心跳刷新 instances.heartbeat_at，让「这个 daemon 还活着」可被外部观测。
+  // 心跳失败只告警：DB 偶发错误不该打崩 daemon，下个周期重试。
+  const heartbeat = setInterval(() => {
+    try {
+      instances.touch();
+    } catch (err) {
+      logError("[pi-workbenchd] 实例心跳写入失败（下个周期重试）：" + errorMessage(err));
+    }
+  }, INSTANCE_HEARTBEAT_MS);
+  heartbeat.unref();
+
+  // 0.5-A D6：惰性过期之外再做周期清扫，避免过期行长期堆在库里。
+  // 清扫失败只告警：单个周期出错不该打崩 daemon，下个周期重试。
+  const leaseSweep = setInterval(() => {
+    try {
+      leases.sweepExpired();
+    } catch (err) {
+      logError("[pi-workbenchd] 租约清扫失败（下个周期重试）：" + errorMessage(err));
+    }
+  }, LEASE_SWEEP_MS);
+  leaseSweep.unref();
+
+  // C02：保留期清扫不能只在启动时跑；每小时清一次，失败只告警。
+  const dispatchSweep = setInterval(() => {
+    try {
+      const swept = sweepDispatches();
+      if (swept > 0) {
+        logInfo("[pi-workbenchd] dispatch 幂等记录清理完成：删除 " + String(swept) + " 条（保留 24h）");
+      }
+    } catch (err) {
+      logError("[pi-workbenchd] dispatch 幂等记录清理失败（下个周期重试）：" + errorMessage(err));
+    }
+  }, DISPATCH_SWEEP_MS);
+  dispatchSweep.unref();
 
   let adapter: ClaudeAdapter;
   try {
@@ -310,7 +421,10 @@ export async function main(): Promise<void> {
     });
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
-    console.error("[pi-workbenchd] E_ADAPTER_DOWN：Claude ACP adapter 启动失败（" + reason + "）");
+    logError("[pi-workbenchd] E_ADAPTER_DOWN：Claude ACP adapter 启动失败（" + reason + "）");
+    clearInterval(heartbeat);
+    clearInterval(leaseSweep);
+    clearInterval(dispatchSweep);
     await closeQuietly(db);
     lock.release();
     process.exitCode = 1;
@@ -390,6 +504,8 @@ export async function main(): Promise<void> {
     router,
     checkpoints,
     dispatches,
+    audit,
+    dispatchReservedTtlMs: config.dispatchReservedTtlMs,
     handoffDir: paths.handoffs,
     piClientId: PI_AGENT_CLIENT_ID,
   });
@@ -401,16 +517,26 @@ export async function main(): Promise<void> {
       store,
       leases,
       registry,
+      instanceId: instances.id ?? "",
+      db,
       engine,
       adapter,
       router,
       agentStatuses: refreshAgentStatuses,
       checkpoints,
       cursors,
+      audit,
+      assetsPath: join(config.home, "assets.json"),
       pipeline,
     });
   } catch (err) {
     reportStartupFailure(err, config);
+    clearInterval(heartbeat);
+    clearInterval(leaseSweep);
+    clearInterval(dispatchSweep);
+    pipeline.dispose();
+    processRegistry.beginShutdown();
+    await processRegistry.killAll(3000);
     await disposeDriversQuietly([claudeDriver, codexDriver, piDriver]);
     await closeQuietly(db);
     lock.release();
@@ -418,12 +544,31 @@ export async function main(): Promise<void> {
     return;
   }
 
-  console.log("pi-workbenchd listening on " + handle.url);
+  logInfo("pi-workbenchd listening on " + handle.url);
+  // spec §7.1 第 8 步：HTTP/WS 起来后再补上一个实例的 ended_at；失败只告警，不影响本次启动。
+  try {
+    const closedStale = instances.closeStale();
+    if (closedStale > 0) {
+      logInfo("[pi-workbenchd] 已补齐 " + String(closedStale) + " 个历史实例的 ended_at");
+    }
+  } catch (err) {
+    logError("[pi-workbenchd] 补齐历史实例 ended_at 失败（启动继续）：" + errorMessage(err));
+  }
   // 探测最长 3s，绝不把监听卡在子进程上；首个 GET /agents 会 await 同一个 in-flight Promise。
   void refreshAgentStatuses().catch(() => {});
   if (restored > 0) {
-    console.log("[pi-workbenchd] 已从库里恢复 " + String(restored) + " 个会话");
+    logInfo("[pi-workbenchd] 已从库里恢复 " + String(restored) + " 个会话");
   }
+  // spec §7.1：启动对账结果写进启动日志，便于重启验收与故障排查。
+  logInfo(
+    "[pi-workbenchd] 重启对账：共 " +
+      String(recovery.total) +
+      " 个会话，" +
+      String(recovery.markedUnknown) +
+      " 个置为 unknown，" +
+      String(recovery.keptHandoff) +
+      " 个保持 handoff",
+  );
 
   let closing = false;
   async function shutdown(signal: NodeJS.Signals): Promise<void> {
@@ -431,13 +576,26 @@ export async function main(): Promise<void> {
       return;
     }
     closing = true;
-    console.log("[pi-workbenchd] " + signal + " received, shutting down");
+    logInfo("[pi-workbenchd] " + signal + " received, shutting down");
     const force = setTimeout(() => {
       lock.release();
       process.exit(1);
     }, 5000);
     force.unref();
     await handle.close();
+    // C04 / spec §7.4：先退订管线，再给子进程 3s 优雅退出；killAll 对存活者补 SIGKILL。
+    pipeline.dispose();
+    processRegistry.beginShutdown();
+    await processRegistry.killAll(3000);
+    clearInterval(heartbeat);
+    clearInterval(leaseSweep);
+    clearInterval(dispatchSweep);
+    // spec §7.1：关库前给本实例写 ended_at；写失败也不阻断后面的释放锁（force 计时器兜底）。
+    try {
+      instances.finish();
+    } catch (err) {
+      logError("[pi-workbenchd] 写 instances.ended_at 失败：" + errorMessage(err));
+    }
     await disposeDriversQuietly([claudeDriver, codexDriver, piDriver]);
     await closeQuietly(db);
     lock.release();
@@ -450,6 +608,9 @@ export async function main(): Promise<void> {
   process.on("SIGTERM", () => {
     void shutdown("SIGTERM");
   });
+  process.on("SIGBREAK", () => {
+    void shutdown("SIGBREAK");
+  });
 }
 
 /** 抢到实例锁之后装配出来的运行期对象（R39） */
@@ -460,9 +621,13 @@ type Boot = {
   registry: SessionRegistry;
   /** R34：loadFromDb 恢复出来的会话条数 */
   restored: number;
+  /** Task 4：启动对账结果（main 写启动日志） */
+  recovery: RecoveryReport;
   checkpoints: CheckpointStore;
   dispatches: DispatchStore;
   cursors: ReadCursorStore;
+  /** 本次 daemon 的实例记录（心跳 / 收尾在 main 里装配） */
+  instances: InstanceStore;
 };
 
 /**
@@ -474,16 +639,37 @@ function bootStores(config: Config, paths: WorkbenchPaths, lock: InstanceLock): 
   let db: DatabaseSync | null = null;
   try {
     db = openDb(paths.db);
+    const currentVersion = schemaVersion(db);
+    // 只有真正要升级旧库时才备份：否则每次启动都会新增备份，两次重启就把升级前的备份轮换掉。
+    if (currentVersion > 0 && currentVersion < SCHEMA_VERSION) {
+      try {
+        backupDbFile(paths.db, join(dirname(paths.db), "db-backup"), currentVersion);
+      } catch (err) {
+        // 备份失败只告警不阻断：升级仍可继续，不能让备份故障挡住 daemon 启动（spec §5 约束 6）。
+        logError(
+          "[pi-workbenchd] 迁移前备份数据库失败（继续启动）：" +
+            (err instanceof Error ? err.message : String(err)),
+        );
+      }
+    }
     migrate(db);
+    // spec §7.1 第 3 步：迁移成功后立刻登记本次实例，心跳与收尾由 main 装配。
+    const instances = new InstanceStore(db);
+    const instance = instances.begin();
     const store = new EventStore(db);
-    const leases = new LeaseManager(db, { ttlMs: config.leaseTtlMs });
+    // spec §7.1 第 4 步：租约按实例归属；启动清扫必须早于 loadFromDb，避免恢复出别家实例的租约。
+    const leases = new LeaseManager(db, { ttlMs: config.leaseTtlMs, instanceId: instance.id });
+    leases.sweepForBoot();
     const registry = new SessionRegistry(db);
     // R34：冷启动恢复 —— 否则重启后 /sessions 与 dispatch 幂等复用都看不到历史会话
     const restored = registry.loadFromDb();
+    // spec §7.1 第 6 步：恢复后立即对账，driver 会话不按 transcript 猜状态（决策 2），
+    // 一律置 unknown 等显式 attach；必须早于 startServer，避免对外短暂暴露 running。
+    const recovery = reconcileSessions({ registry, store, instanceId: instance.id });
     const checkpoints = new CheckpointStore(db);
     const dispatches = new DispatchStore(db);
     const cursors = new ReadCursorStore(db);
-    return { db, store, leases, registry, restored, checkpoints, dispatches, cursors };
+    return { db, store, leases, registry, restored, recovery, checkpoints, dispatches, cursors, instances };
   } catch (err) {
     if (db !== null) {
       try {
@@ -494,7 +680,7 @@ function bootStores(config: Config, paths: WorkbenchPaths, lock: InstanceLock): 
     }
     lock.release();
     const reason = err instanceof Error ? err.message : String(err);
-    console.error("[pi-workbenchd] E_DB_INIT：打开数据库 / 迁移失败（" + reason + "），已释放实例锁");
+    logError("[pi-workbenchd] E_DB_INIT：打开数据库 / 迁移失败（" + reason + "），已释放实例锁");
     return null;
   }
 }
@@ -502,15 +688,15 @@ function bootStores(config: Config, paths: WorkbenchPaths, lock: InstanceLock): 
 /** 启动失败给一句人话：鉴权拒绝（R32）直接报错误码，端口占用保留 T1 的口径 */
 function reportStartupFailure(err: unknown, config: Config): void {
   if (isWorkbenchError(err)) {
-    console.error("[pi-workbenchd] " + err.code + "：" + err.message);
+    logError("[pi-workbenchd] " + err.code + "：" + err.message);
     return;
   }
   if ((err as NodeJS.ErrnoException).code === "EADDRINUSE") {
-    console.error("[pi-workbenchd] 端口已被占用：" + config.host + ":" + String(config.port));
+    logError("[pi-workbenchd] 端口已被占用：" + config.host + ":" + String(config.port));
     return;
   }
   const reason = err instanceof Error ? err.message : String(err);
-  console.error("[pi-workbenchd] 监听失败：" + reason);
+  logError("[pi-workbenchd] 监听失败：" + reason);
 }
 
 /** 关闭全部 driver（ClaudeDriver 内部即 adapter.dispose）；退出流程里失败不再上报 */
@@ -551,7 +737,7 @@ if (isEntrypoint()) {
   // 只会打原始栈；这里统一收口成人话 + 非零 exitCode。
   main().catch((err: unknown) => {
     const reason = err instanceof Error ? err.stack ?? err.message : String(err);
-    console.error("[pi-workbenchd] 启动失败：" + reason);
+    logError("[pi-workbenchd] 启动失败：" + reason);
     process.exitCode = 1;
   });
 }

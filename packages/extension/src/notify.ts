@@ -68,9 +68,9 @@ export type TurnNotifierOptions = {
   mode?: NotifyMode;
   /** 合并窗口：窗口内多个会话的结束信号合成一条 */
   debounceMs?: number;
-  /** 连续自动唤醒上限（期间没有推进型工具调用则累加） */
+  /** 每个会话的连续自动唤醒上限（期间没有推进型工具调用则累加；会话间不共享预算） */
   maxConsecutiveWakes?: number;
-  /** 唤醒计数的滑动窗口：窗口内没有新唤醒就清零（缺省 60s） */
+  /** 每个会话的唤醒计数滑动窗口：窗口内没有新唤醒就清零（缺省 60s） */
   wakeWindowMs?: number;
   /** 只对 driver=pi 的会话唤醒（人接管中不吵） */
   wakeDrivers?: readonly string[];
@@ -125,8 +125,8 @@ export class TurnNotifier {
   readonly #lastEventSeq = new Map<string, number>();
   readonly #lastNotifiedSeq = new Map<string, number>();
   #timer: ReturnType<typeof setTimeout> | null = null;
-  #wakes = 0;
-  #wakeWindowStartedAt = 0;
+  /** sessionKey → 连续唤醒预算：每个会话独立计数、独立窗口，a 触顶不挡 b */
+  readonly #wakes = new Map<string, { count: number; windowStart: number }>();
   #flushing: Promise<void> | null = null;
   #badge: string | undefined;
   #disposed = false;
@@ -142,10 +142,16 @@ export class TurnNotifier {
     this.#startedAt = this.#now();
   }
 
-  /** 连击计数（测试/诊断用；读取会触发过期窗口归零，符合时间窗语义） */
+  /** 连击计数（测试/诊断用；读取会触发过期窗口归零，返回各会话中的最大值） */
   get consecutiveWakes(): number {
     this.#resetWakeBudgetIfStale();
-    return this.#wakes;
+    let max = 0;
+    for (const budget of this.#wakes.values()) {
+      if (budget.count > max) {
+        max = budget.count;
+      }
+    }
+    return max;
   }
 
   /** 待发通知的会话 key（测试用） */
@@ -191,8 +197,7 @@ export class TurnNotifier {
     if (toolName === "cp_sessions" || toolName === "cp_see") {
       return;
     }
-    this.#wakes = 0;
-    this.#wakeWindowStartedAt = 0;
+    this.#wakes.clear();
   }
 
   /** cp_see / cp_read 读完某会话：把它的待发通知删掉 */
@@ -236,6 +241,7 @@ export class TurnNotifier {
     this.#pending.clear();
     this.#lastEventSeq.clear();
     this.#lastNotifiedSeq.clear();
+    this.#wakes.clear();
   }
 
   async #flushOnce(): Promise<void> {
@@ -280,20 +286,28 @@ export class TurnNotifier {
 
     if (actionable.length > 0) {
       this.#resetWakeBudgetIfStale();
-      if (this.#wakes >= this.#options.maxConsecutiveWakes) {
-        this.#log("[notify] 连续唤醒达上限（" + String(this.#wakes) + "），只更新徽标");
-      } else {
+      // 预算按会话独立：只投递还有额度的会话；触顶会话的待发已在上面清掉，等下一次事件或工具调用。
+      const allowed = actionable.filter(
+        (item) => (this.#wakes.get(item.session.key)?.count ?? 0) < this.#options.maxConsecutiveWakes,
+      );
+      const blocked = actionable.length - allowed.length;
+      if (blocked > 0) {
+        this.#log("[notify] " + String(blocked) + " 个会话的连续唤醒达上限，只更新徽标");
+      }
+      if (allowed.length > 0) {
         const mode = this.#options.mode ?? "followUp";
         try {
           await this.#options.sink.send(
-            { customType: CUSTOM_TYPE, content: renderMessage(actionable), display: true },
+            { customType: CUSTOM_TYPE, content: renderMessage(allowed), display: true },
             { deliverAs: mode, triggerTurn: mode !== "nextTurn" },
           );
-          this.#wakes += 1;
-          if (this.#wakeWindowStartedAt === 0) {
-            this.#wakeWindowStartedAt = this.#now();
-          }
-          for (const item of actionable) {
+          const now = this.#now();
+          for (const item of allowed) {
+            const budget = this.#wakes.get(item.session.key);
+            this.#wakes.set(item.session.key, {
+              count: (budget?.count ?? 0) + 1,
+              windowStart: budget?.windowStart ?? now,
+            });
             this.#lastNotifiedSeq.set(item.session.key, item.seq);
           }
         } catch (err) {
@@ -306,12 +320,14 @@ export class TurnNotifier {
   }
 
   #resetWakeBudgetIfStale(): void {
-    if (this.#wakes === 0) {
+    if (this.#wakes.size === 0) {
       return;
     }
-    if (this.#now() - this.#wakeWindowStartedAt >= this.#options.wakeWindowMs) {
-      this.#wakes = 0;
-      this.#wakeWindowStartedAt = 0;
+    const now = this.#now();
+    for (const [key, budget] of this.#wakes) {
+      if (now - budget.windowStart >= this.#options.wakeWindowMs) {
+        this.#wakes.delete(key);
+      }
     }
   }
 

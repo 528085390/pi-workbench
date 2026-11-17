@@ -3,6 +3,8 @@
  * 字段口径见 docs/PRD.md §3.0 与 docs/agent-control-plane-v0.3.md §5.2。
  */
 
+export * from "./api.ts";
+
 export const WORKBENCH_VERSION = "0.0.1";
 
 /** 控制面默认端口（PRD FR-5.3） */
@@ -93,6 +95,8 @@ export interface Lease {
   sessionKey: string;
   driver: Driver;
   clientId: string;
+  /** 租约归属的 daemon 实例 id（schema v4 `leases.instance_id`；空串 = 历史 / 未归属）。 */
+  instanceId: string;
   expiresAt: string;
   heartbeatAt: string;
 }
@@ -104,4 +108,9 @@ export interface Checkpoint {
   nextStep: string;
   transcriptCursor: string;
   createdAt: string;
+  /**
+   * 检查点格式版本（C03 / spec §7.3）：当前固定为 1。additive 字段 ——
+   * 历史库行没有该列值时，读取侧按 1 处理。
+   */
+  version: number;
 }

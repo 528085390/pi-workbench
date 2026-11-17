@@ -66,3 +66,130 @@ test("跨连接可见（另一个 db 句柄读到同一行，模拟重启）", (
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("reclaim 只回收超 TTL 的 reserved", () => {
+  const { db, dir } = fresh();
+  try {
+    const store = new DispatchStore(db);
+    store.reserve("k1", "h", new Date("2026-11-17T00:00:00.000Z"));
+    assert.equal(store.reclaim("k1", 120_000, new Date("2026-11-17T00:01:00.000Z")), false);
+    assert.equal(store.reclaim("k1", 120_000, new Date("2026-11-17T00:02:01.000Z")), true);
+    assert.equal(store.get("k1")?.status, "reserved");
+    assert.equal(store.get("k1")?.createdAt, "2026-11-17T00:02:01.000Z", "回收必须重置 created_at");
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("touch 只续约 reserved，不碰 done", () => {
+  const { db, dir } = fresh();
+  try {
+    const store = new DispatchStore(db);
+    store.reserve("k-touch", "h", new Date("2026-11-17T00:00:00.000Z"));
+    store.touch("k-touch", new Date("2026-11-17T00:01:00.000Z"));
+    assert.equal(store.get("k-touch")?.updatedAt, "2026-11-17T00:01:00.000Z");
+
+    store.complete("k-touch", "claude:s1", new Date("2026-11-17T00:02:00.000Z"));
+    store.touch("k-touch", new Date("2026-11-17T00:03:00.000Z"));
+    assert.equal(store.get("k-touch")?.updatedAt, "2026-11-17T00:02:00.000Z");
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("pruneRetained 只删过期 done/failed", () => {
+  const { db, dir } = fresh();
+  try {
+    const store = new DispatchStore(db);
+    store.reserve("old", "h", new Date("2026-11-15T00:00:00.000Z"));
+    store.complete("old", "claude:a", new Date("2026-11-15T00:00:01.000Z"));
+    store.reserve("new", "h", new Date("2026-11-17T00:00:00.000Z"));
+    store.complete("new", "claude:b", new Date("2026-11-17T00:00:01.000Z"));
+    assert.equal(store.pruneRetained(24 * 3600_000, new Date("2026-11-17T01:00:00.000Z")), 1);
+    assert.equal(store.get("old"), null);
+    assert.equal(store.get("new")?.status, "done");
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+test("complete/fail 只对 reserved 生效（fencing）", () => {
+  const { db, dir } = fresh();
+  try {
+    const store = new DispatchStore(db);
+    store.reserve("k-fence", "h");
+    assert.equal(store.complete("k-fence", "claude:s1"), true);
+    assert.equal(store.complete("k-fence", "claude:s2"), false, "done 不能被二次 complete 覆盖");
+    assert.equal(store.fail("k-fence", "late failure"), false, "done 不能被 fail 覆盖");
+    assert.deepEqual(
+      { s: store.get("k-fence")?.status, k: store.get("k-fence")?.sessionKey, e: store.get("k-fence")?.error },
+      { s: "done", k: "claude:s1", e: null },
+    );
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("retryFailed 原子把 failed 重置为 reserved 并清空 session_key/error", () => {
+  const { db, dir } = fresh();
+  try {
+    const store = new DispatchStore(db);
+    store.reserve("k-retry", "h", new Date("2026-11-17T00:00:00.000Z"));
+    store.fail("k-retry", "boom", new Date("2026-11-17T00:01:00.000Z"));
+    assert.equal(store.retryFailed("k-retry", new Date("2026-11-17T00:02:00.000Z")), true);
+    const record = store.get("k-retry");
+    assert.equal(record?.status, "reserved");
+    assert.equal(record?.sessionKey, null);
+    assert.equal(record?.error, null);
+    assert.equal(record?.createdAt, "2026-11-17T00:02:00.000Z");
+    assert.equal(store.retryFailed("k-retry"), false, "已 reserved 不能再次 retry");
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("pruneStaleReserved 只删过期 reserved", () => {
+  const { db, dir } = fresh();
+  try {
+    const store = new DispatchStore(db);
+    store.reserve("old", "h", new Date("2026-11-15T00:00:00.000Z"));
+    store.reserve("new", "h", new Date("2026-11-17T00:00:00.000Z"));
+    assert.equal(store.pruneStaleReserved(24 * 3600_000, new Date("2026-11-17T01:00:00.000Z")), 1);
+    assert.equal(store.get("old"), null);
+    assert.equal(store.get("new")?.status, "reserved");
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("reclaim 换发 claim token：旧 owner 的 complete/fail/touch 全部失效（fencing）", () => {
+  const { db, dir } = fresh();
+  try {
+    const store = new DispatchStore(db);
+    store.reserve("k-reclaim-fence", "h", new Date("2026-11-17T00:00:00.000Z"));
+    assert.equal(store.reclaim("k-reclaim-fence", 120_000, new Date("2026-11-17T00:02:01.000Z")), true);
+
+    const claim = store.get("k-reclaim-fence")?.sessionKey;
+    assert.ok(claim != null && claim.length > 0, "reclaim 必须换发 claim token");
+
+    assert.equal(store.complete("k-reclaim-fence", "claude:stale"), false, "旧 owner 不能落 done");
+    assert.equal(store.fail("k-reclaim-fence", "late failure"), false, "旧 owner 不能落 failed");
+    store.touch("k-reclaim-fence", new Date("2026-11-17T00:02:30.000Z"));
+    assert.equal(store.get("k-reclaim-fence")?.updatedAt, "2026-11-17T00:02:01.000Z", "旧 owner 不能续约");
+
+    assert.equal(
+      store.complete("k-reclaim-fence", "claude:fresh", new Date("2026-11-17T00:03:00.000Z"), claim ?? undefined),
+      true,
+      "回收赢家凭 claim token 才能落 done",
+    );
+    assert.equal(store.get("k-reclaim-fence")?.sessionKey, "claude:fresh");
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

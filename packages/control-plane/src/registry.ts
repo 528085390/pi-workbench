@@ -158,6 +158,31 @@ export class SessionRegistry {
   }
 
   /**
+   * C02：dispatch 赢家建会话后写 sessions.dispatch_key。
+   * 唯一索引 idx_sessions_dispatch 兜底，防止回收窗口内重复建会话。
+   */
+  setDispatchKey(sessionKey: string, dispatchKey: string, now = new Date()): void {
+    this.#db
+      .prepare("UPDATE sessions SET dispatch_key = ?, updated_at = ? WHERE key = ?")
+      .run(dispatchKey, now.toISOString(), sessionKey);
+  }
+
+  /** C02：dispatch 失败回收时清掉会话的 dispatch_key，避免唯一索引挡住同 key 重试。 */
+  clearDispatchKey(sessionKey: string, now = new Date()): void {
+    this.#db
+      .prepare("UPDATE sessions SET dispatch_key = NULL, updated_at = ? WHERE key = ?")
+      .run(now.toISOString(), sessionKey);
+  }
+
+  /** C02 回收前必查：按 dispatch_key 找上次已经建好的会话（不依赖内存）。 */
+  findByDispatchKey(dispatchKey: string): SessionRef | null {
+    const row = this.#db
+      .prepare(`SELECT ${SESSION_COLUMNS} FROM sessions WHERE dispatch_key = ?`)
+      .get(dispatchKey) as SessionRow | undefined;
+    return row === undefined ? null : toSessionRef(row);
+  }
+
+  /**
    * 冷启动恢复（R34）：把 `sessions` 表读回内存，返回载入条数。
    * 语义是「以库为准」：先清空内存 map 再填，重复调用幂等。
    */
