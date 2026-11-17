@@ -45,7 +45,7 @@
    - `errors.ts` 的 `WorkbenchErrorCode` 增加 `E_ADAPTER_CRASHED`；`STATUS_BY_CODE` 映射 503。
    - `api.test.ts` 的状态码全表断言、`docs/api/cp-v1.md` 错误表均补充 503 行。
 
-6. **/health.adapters 状态源（MINOR）**
+6. **/health.adapters 状态源（MINOR）**（历史记录：本条描述 d023f07 当时实现；`4b42e4e` 已改为只读快照 + 后台探测，当前实现见 `restart-20261117-0352.md`）
    - `server.ts` 的 health 改用 `currentAgents()`，与 `/agents` 共用 30s 探测缓存快照（探测未完成时回退注册表快照）。
    - 新增测试 `GET /health.adapters 与 /agents 共用同一探测缓存（快照语义一致）`，断言两者一致且只探测一次。
 

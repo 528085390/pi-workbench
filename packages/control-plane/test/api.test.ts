@@ -840,6 +840,7 @@ test("错误码 → 状态码映射覆盖 R35 全表", () => {
     E_HANDOFF_FAILED: 503,
     E_CHECKPOINT_FAILED: 500,
     E_RESUME_REJECTED: 409,
+    E_INTERNAL: 500,
   });
 });
 

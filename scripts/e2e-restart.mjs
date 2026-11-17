@@ -12,7 +12,8 @@
  *   → taskkill /F /PID <daemon>（POSIX 用 SIGKILL）→ 用同一个 home 重启 daemon #2
  *   → 断言 GET /sessions 仍含该 key、GET transcript 可读、POST attach 被能力闸门
  *     挡成 422 E_CAP_UNSUPPORTED（Claude 交互式 attach=false，预期分支）
- *   → 断言 POST resume 返回 200 且注册表回到 driver=pi/status=idle（v1 additive 恢复入口）
+ *   → 断言 resume 无租约 409；取租约后 POST resume 200、注册表回到 driver=pi/status=idle，
+ *     同一 clientId inject 成功且消息回显 transcript（v1 additive 恢复入口，红线 3）
  *   → 断言 workbench.db 有 2 个 instances 行、1 条 daemon_restart 事件。
  *
  * 证据：<home>/e2e-restart.jsonl，每步一行 {ts, step, ok, detail}；默认 PASS 后随 home 删除，
@@ -368,9 +369,24 @@ async function main() {
     body: attach.body,
   });
 
+  // review r2 P1：resume 是写操作，必须先持租约（红线 3）。先做负向断言，证明闸门真的在。
+  const e2eClientId = "e2e-restart-" + nonce;
+  const noLease = await http("POST", "/api/cp/sessions/" + encodeURIComponent(key) + "/resume", { clientId: e2eClientId }, 15_000);
+  const noLeaseCode = errorCodeOf(noLease);
+  const noLeaseOk = noLease.status === 409 && (noLeaseCode === "E_NO_LEASE" || noLeaseCode === "E_LEASE_CONFLICT");
+  record("resume-without-lease-409", noLeaseOk, { status: noLease.status, code: noLeaseCode, body: noLease.body });
+
+  const lease = await http("POST", "/api/cp/sessions/" + encodeURIComponent(key) + "/lease", {
+    clientId: e2eClientId,
+    action: "acquire",
+  }, 30_000);
+  const leaseOk = lease.status === 200;
+  record("lease-acquired-before-resume", leaseOk, { status: lease.status, body: lease.body });
+  must(leaseOk, "重启后取租约失败：" + JSON.stringify(lease.body));
+
   // P1-1（review）：attach 能力不足的 Claude 交互式会话，重启后由 resume 接管（v1 additive）。
   // resume 成功 = 注册表回到 driver=pi/status=idle，之后 inject/handoff 才有入口。
-  const resumed = await http("POST", "/api/cp/sessions/" + encodeURIComponent(key) + "/resume", {}, 120_000);
+  const resumed = await http("POST", "/api/cp/sessions/" + encodeURIComponent(key) + "/resume", { clientId: e2eClientId }, 120_000);
   const resumedOk = resumed.status === 200 && resumed.body?.resumed === true;
   record("resume-after-restart", resumedOk, { status: resumed.status, ms: resumed.ms, body: resumed.body });
   must(resumedOk, "重启后 resume 接管失败：" + JSON.stringify(resumed.body));
@@ -378,6 +394,17 @@ async function main() {
   const rehydrated = (Array.isArray(afterResume.body) ? afterResume.body : []).find((session) => session.key === key);
   const rehydratedOk = rehydrated?.driver === "pi" && rehydrated?.status === "idle";
   record("resume-restores-driver-idle", rehydratedOk, { driver: rehydrated?.driver ?? null, status: rehydrated?.status ?? null });
+
+  // P2-8：接管后必须真的还能用 —— 同一租约身份 inject，消息要回显到 transcript。
+  const injected = "E2E_RESUME_INJECT_" + nonce;
+  const inject = await http("POST", "/api/cp/sessions/" + encodeURIComponent(key) + "/inject", {
+    clientId: e2eClientId,
+    text: "请只回答这一行：" + injected,
+  }, 60_000);
+  record("inject-after-resume", inject.status === 200, { status: inject.status, body: inject.body });
+  must(inject.status === 200, "resume 后 inject 失败（租约没还回来？）：" + JSON.stringify(inject.body));
+  const echoed = await pollTranscript(key, (messages) => messages.some((message) => textOf(message).includes(injected)), 60_000);
+  record("transcript-after-resume-inject", echoed.hit, { messages: echoed.messages.length, waited: echoed.hit });
 
   const dbPath = join(home, "workbench.db");
   must(existsSync(dbPath), "workbench.db 不存在：" + dbPath);

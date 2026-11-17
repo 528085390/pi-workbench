@@ -179,10 +179,11 @@ export const STATUS_BY_CODE: Readonly<Record<WorkbenchErrorCode, number>> = {
   E_HANDOFF_FAILED: 503,
   E_CHECKPOINT_FAILED: 500,
   E_RESUME_REJECTED: 409,
+  E_INTERNAL: 500,
 };
 
 /** 兜底错误码（spec §6 之外，仅「未知异常 → 500」使用） */
-export const INTERNAL_ERROR_CODE = "E_INTERNAL";
+export const INTERNAL_ERROR_CODE: WorkbenchErrorCode = "E_INTERNAL";
 /**
  * 500 的对外固定文案（评审 Minor 2）：真实 message 可能带 SQL 片段 / 绝对路径 / 内部标识，
  * 只写进日志，绝不回传给客户端。

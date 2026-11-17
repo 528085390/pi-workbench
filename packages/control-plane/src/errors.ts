@@ -20,7 +20,8 @@ export type WorkbenchErrorCode =
   | "E_SESSION_BUSY"
   | "E_ASSET_CONFIG_INVALID"
   | "E_HANDOFF_FAILED"
-  | "E_CHECKPOINT_FAILED";
+  | "E_CHECKPOINT_FAILED"
+  | "E_INTERNAL";
 
 /**
  * 带错误码的控制面异常。

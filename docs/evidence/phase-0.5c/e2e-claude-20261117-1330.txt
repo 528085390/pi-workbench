@@ -1,0 +1,19 @@
+✔ start：{"baseUrl":"http://127.0.0.1:17499","clientId":"e2e-f012daf8","nonce":"f012daf8","logPath":"E:\\pi-workbench\\tmp\\e2e-2026-11-17T05-30-33-615Z.jsonl"}
+✔ health：{"ok":true,"name":"pi-workbenchd","version":"0.0.1","pid":57508,"uptimeMs":1363,"schemaVersion":4,"instanceId":"2b17141e-00d6-438f-8a0e-57d4008cd8bd","db":{"schemaVersion":4,"ok":true},"adapters":[{"agent":"claude","available":true},{"agent":"codex","available":false},{"agent":"pi","available":false}]}
+✔ dispatch：{"key":"claude:f073cd28-42e6-408e-bfe0-8cdf48a3ebb6","status":"running","nativeId":"f073cd28-42e6-408e-bfe0-8cdf48a3ebb6"}
+✔ lease：{"clientId":"e2e-f012daf8","expiresAt":"2026-11-17T06:00:35.690Z"}
+✔ see-ready：{"waitedMs":2570,"status":"running","messages":2,"preview":["E2E 基线任务（nonce f012daf8）：请用一句话答复 E2E_READY_f012daf8","E2E_READY_f012daf8 — E2E 基线任务已确认收到，nonce 匹配。"]}
+✔ inject：{"messageId":"ae4570d7-42ce-46a9-9714-a2183477a8d6","effective":"now"}
+✔ see-inject：{"waitedMs":517,"messages":1}
+✔ interrupt：{"stopReason":"cancelled"}
+✔ checkpoint：{"sessionKey":"claude:f073cd28-42e6-408e-bfe0-8cdf48a3ebb6","summary":"E2E f012daf8：已跑通 dispatch / see / inject / interrupt","touchedFiles":[],"nextStep":"人工接管确认一轮，再 handback 回 Pi","transcriptCursor":"211599","createdAt":"2026-11-17T05:30:38.828Z","version":1,"path":"E:\\e\\pi-workbench\\tmp\\e2e-claude-home\\handoffs\\claude-f073cd28-42e6-408e-bfe0-8cdf48a3ebb6-2026-11-17T05-30-38.828Z-b643bed9-1.md"}
+✔ handoff：{"mode":"resume-tui","command":"claude --resume f073cd28-42e6-408e-bfe0-8cdf48a3ebb6"}
+
+>>> 接管命令：claude --resume f073cd28-42e6-408e-bfe0-8cdf48a3ebb6
+
+✔ human-turn：{"status":0,"sample":"E2E_HUMAN_f012daf8 — 人工注入消息已收到，nonce 匹配。"}
+✔ lease-handback：{"clientId":"handoff-e2e-f012daf8"}
+✔ handback：{"resumed":true,"deltaSummary":"assistant: No response requested.\nuser: 回答E2E_HUMAN_f012daf8\nassistant: The user asks me to answer E2E_HUMAN_f012daf8. Simple one-line answer.\nassistant: E2E_HUMAN_f012daf8 — 人工注入消息已收到，nonce 匹配。"}
+✔ summary：{"result":"PASS","sessionKey":"claude:f073cd28-42e6-408e-bfe0-8cdf48a3ebb6","nonce":"f012daf8","logPath":"E:\\pi-workbench\\tmp\\e2e-2026-11-17T05-30-33-615Z.jsonl","error":null}
+
+PASS —— 证据：E:\pi-workbench\tmp\e2e-2026-11-17T05-30-33-615Z.jsonl
