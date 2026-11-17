@@ -33,6 +33,9 @@ export type NotifySession = {
   unread?: number;
   lastReadCursor?: string;
   awaiting?: boolean;
+  agent?: string;
+  nativeId?: string;
+  cwd?: string;
 };
 
 export type NotifyMessage = {
@@ -110,6 +113,71 @@ export function reasonOf(event: NotifyEvent): NotifyReason | null {
   return null;
 }
 
+/** 底栏只列“Pi 正在管”或“处于活动状态”的会话；历史 unknown 会话不占位置。 */
+const ACTIVE_STATUSES = new Set(["starting", "running", "needs-input", "handoff"]);
+
+/** 状态排序：需要用户回话的最靠前，其次运行中，Pi 驱动中的待命会话排在交接/历史之前。 */
+const STATUS_RANK: Record<string, number> = {
+  "needs-input": 0,
+  running: 1,
+  starting: 2,
+  idle: 3,
+  handoff: 4,
+  exited: 5,
+  unknown: 6,
+};
+
+const MAX_STATUS_SESSIONS = 3;
+const MAX_LABEL_CHARS = 20;
+
+function statusLabel(status: string | undefined): string {
+  return status !== undefined && status.length > 0 ? status : "unknown";
+}
+
+/** 会话短标识：agent:目录名（拿不到目录时用 nativeId / key 尾段）。 */
+function sessionLabel(session: NotifySession): string {
+  const [keyAgent, keyId] = session.key.split(":");
+  const agent = session.agent ?? keyAgent ?? "?";
+  const cwd = session.cwd?.replace(/[\\/]+$/, "");
+  const base = cwd !== undefined && cwd.length > 0 ? cwd.split(/[\\/]/).pop() : undefined;
+  const raw = base !== undefined && base.length > 0 ? base : (session.nativeId ?? keyId ?? session.key);
+  const short = raw.length > MAX_LABEL_CHARS ? raw.slice(0, MAX_LABEL_CHARS - 1) + "…" : raw;
+  return agent + ":" + short;
+}
+
+/**
+ * 底栏文案（替代早期“N 未读”）：显示有多少活跃会话、每个会话的状态与会话短名。
+ * 只列 Pi 驱动的、或正在运行/等回话/交接的会话；历史 unknown 会话不占位置。
+ */
+export function renderStatus(sessions: readonly NotifySession[]): string {
+  const visible = sessions.filter((s) => s.driver === "pi" || ACTIVE_STATUSES.has(statusLabel(s.status)))
+    .sort((a, b) => {
+      const rank = (STATUS_RANK[statusLabel(a.status)] ?? 99) - (STATUS_RANK[statusLabel(b.status)] ?? 99);
+      if (rank !== 0) return rank;
+      const unread = (b.unread ?? 0) - (a.unread ?? 0);
+      if (unread !== 0) return unread;
+      return a.key.localeCompare(b.key);
+    });
+  if (visible.length === 0) {
+    return "pi-workbench: 无活跃会话";
+  }
+  const labels = visible.map(sessionLabel);
+  const dupes = new Map<string, number>();
+  for (const label of labels) {
+    dupes.set(label, (dupes.get(label) ?? 0) + 1);
+  }
+  const shown = visible.slice(0, MAX_STATUS_SESSIONS).map((session, index) => {
+    let label = labels[index]!;
+    if ((dupes.get(label) ?? 0) > 1) {
+      const id = session.nativeId ?? session.key.split(":")[1] ?? session.key;
+      label += "#" + id.slice(0, 4);
+    }
+    return "[" + statusLabel(session.status) + "] " + label;
+  });
+  const more = visible.length - shown.length;
+  return "pi-workbench: " + String(visible.length) + " 会话 · " + shown.join(" · ") + (more > 0 ? " · +" + String(more) : "");
+}
+
 type Pending = { reason: NotifyReason; seq: number };
 
 /** 回合结束通知器：纯内存 + 注入时钟，不碰 IO（除了注入的 listSessions / sink） */
@@ -182,11 +250,13 @@ export class TurnNotifier {
       this.#lastEventSeq.set(event.sessionKey, event.seq);
     }
     const reason = reasonOf(event);
-    if (reason === null) {
-      return;
+    if (reason !== null) {
+      this.#pending.set(event.sessionKey, { reason, seq: event.seq });
     }
-    this.#pending.set(event.sessionKey, { reason, seq: event.seq });
-    this.#scheduleFlush();
+    // 状态类事件即使不唤醒，也要刷新底栏（running → idle 这类变化不该等到下一轮）。
+    if (reason !== null || event.type === "state_update" || event.type === "session_status" || event.type === "error") {
+      this.#scheduleFlush();
+    }
   }
 
   /**
@@ -205,14 +275,13 @@ export class TurnNotifier {
     this.#pending.delete(sessionKey);
   }
 
-  /** 只是刷新底栏徽标（与唤醒解耦，nextTurn / 静音时也用） */
+  /** 只是刷新底栏状态（与唤醒解耦，nextTurn / 静音 / 状态变化时也用） */
   async refreshBadge(): Promise<void> {
     const sessions = await this.#list();
     if (sessions === null) {
       return;
     }
-    const total = sessions.reduce((sum, s) => sum + (typeof s.unread === "number" ? s.unread : 0), 0);
-    this.#setBadge(total > 0 ? "pi-workbench: " + String(total) + " 未读" : undefined);
+    this.#setBadge(renderStatus(sessions));
   }
 
   /** 立即投递（测试直接调；生产由 debounce 定时器调） */
@@ -246,6 +315,7 @@ export class TurnNotifier {
 
   async #flushOnce(): Promise<void> {
     if (this.#pending.size === 0) {
+      await this.refreshBadge();
       return;
     }
     const entries = [...this.#pending.entries()];

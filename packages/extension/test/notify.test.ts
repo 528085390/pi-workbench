@@ -7,6 +7,7 @@ import {
   normalizeNotifyMode,
   reasonOf,
   renderMessage,
+  renderStatus,
   type NotifySession,
   type NotifySink,
 } from "../src/notify.ts";
@@ -38,6 +39,47 @@ test("reasonOf：只认回合结束 / 等输入 / 出错", () => {
   assert.equal(reasonOf({ seq: 1, sessionKey: "k", type: "error", payload: {} }), "error");
   assert.equal(reasonOf({ seq: 1, sessionKey: "k", type: "state_update", payload: { status: "running" } }), null);
   assert.equal(reasonOf({ seq: 1, sessionKey: "k", type: "token", payload: {} }), null);
+});
+
+test("renderStatus：只列活跃会话，状态优先、带目录短名", () => {
+  const line = renderStatus([
+    session({ key: "claude:old", driver: "none", status: "unknown", unread: 10, cwd: "E:\\pi-workbench" }),
+    session({ key: "claude:a", status: "idle", unread: 0, cwd: "C:\\Users\\huang\\homework\\dl-ch7" }),
+    session({ key: "codex:b", status: "running", unread: 2, cwd: "C:\\Users\\huang\\homework\\java-oop" }),
+  ]);
+  assert.equal(line, "pi-workbench: 2 会话 · [running] codex:java-oop · [idle] claude:dl-ch7");
+});
+
+test("renderStatus：最多列 3 个会话，其余折叠成 +N", () => {
+  const line = renderStatus([
+    session({ key: "claude:a", cwd: "C:\\a" }),
+    session({ key: "claude:b", cwd: "C:\\b" }),
+    session({ key: "claude:c", cwd: "C:\\c" }),
+    session({ key: "claude:d", cwd: "C:\\d" }),
+  ]);
+  assert.match(line, /^pi-workbench: 4 会话 · /);
+  assert.match(line, / · \+1$/);
+});
+
+test("renderStatus：同目录会话用 nativeId 前缀区分；无会话时明说", () => {
+  const line = renderStatus([
+    session({ key: "claude:a", nativeId: "aaaa1111", cwd: "C:\\same" }),
+    session({ key: "claude:b", nativeId: "bbbb2222", cwd: "C:\\same" }),
+  ]);
+  assert.match(line, /claude:same#aaaa/);
+  assert.match(line, /claude:same#bbbb/);
+  assert.equal(renderStatus([]), "pi-workbench: 无活跃会话");
+});
+
+test("状态变化（running）即使不唤醒也刷新底栏", async () => {
+  const { statuses, sink } = recorder();
+  let sessions = [session({ key: "claude:a", status: "idle", unread: 0 })];
+  const notifier = new TurnNotifier({ sink, now: () => NOW, debounceMs: 5, listSessions: async () => sessions });
+  sessions = [session({ key: "claude:a", status: "running", unread: 0 })];
+  notifier.handleEvent({ seq: 3, sessionKey: "claude:a", type: "state_update", payload: { status: "running" }, ts: LATER });
+  assert.deepEqual(notifier.pendingKeys, [], "running 不该入队唤醒");
+  await notifier.flush();
+  assert.ok(statuses.includes("pi-workbench: 1 会话 · [running] claude:a"));
 });
 
 test("normalizeNotifyMode：未知值回落 followUp", () => {
@@ -92,7 +134,7 @@ test("I2：sendEnabled=false 只维护徽标、不发消息（PI_WORKBENCH_NOTIF
   await notifier.flush();
   assert.equal(sent.length, 0, "静音模式不发对话消息");
   assert.deepEqual(notifier.pendingKeys, [], "静音也不攒着");
-  assert.ok(statuses.includes("pi-workbench: 4 未读"), "徽标照常反映未读");
+  assert.ok(statuses.includes("pi-workbench: 1 会话 · [idle] claude:a"), "底栏照常反映会话状态");
 });
 
 test("投递前复核：未读已清零 → 静默丢弃", async () => {
@@ -158,7 +200,7 @@ test("连续唤醒上限 5：触顶后只更新徽标，工具调用后恢复", 
   }
   assert.equal(sent.length, 5);
   assert.equal(notifier.consecutiveWakes, 5);
-  assert.ok(statuses.includes("pi-workbench: 1 未读"));
+  assert.ok(statuses.includes("pi-workbench: 1 会话 · [idle] claude:a"));
   notifier.noteToolActivity();
   assert.equal(notifier.consecutiveWakes, 0);
   notifier.handleEvent({ seq: 200, sessionKey: "claude:a", type: "state_update", payload: { status: "idle" }, ts: LATER });
