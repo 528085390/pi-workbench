@@ -10,9 +10,9 @@
  * 流程（任一步失败 → 退出码 1，但后续清理照做）：
  *   启动 daemon #1 → dispatch 一个 claude 任务 → 等 session/assistant 出现
  *   → taskkill /F /PID <daemon>（POSIX 用 SIGKILL）→ 用同一个 home 重启 daemon #2
- *   → 断言 GET /sessions 仍含该 key、GET transcript 可读、POST attach 返回
- *     200 或结构化 E_RESUME_REJECTED（Claude 交互式会话先被能力闸门挡成
- *     E_CAP_UNSUPPORTED，属预期分支）
+ *   → 断言 GET /sessions 仍含该 key、GET transcript 可读、POST attach 被能力闸门
+ *     挡成 422 E_CAP_UNSUPPORTED（Claude 交互式 attach=false，预期分支）
+ *   → 断言 POST resume 返回 200 且注册表回到 driver=pi/status=idle（v1 additive 恢复入口）
  *   → 断言 workbench.db 有 2 个 instances 行、1 条 daemon_restart 事件。
  *
  * 证据：<home>/e2e-restart.jsonl，每步一行 {ts, step, ok, detail}；默认 PASS 后随 home 删除，
@@ -20,9 +20,9 @@
  * 只用 Node 内置能力 + HTTP：不 import packages 下的任何模块（避免把控制面代码
  * import 进脚本，让「跑不通」只剩一种解释：daemon / adapter 真的不行）。
  *
- * 已知偏差（C07 裁定）：Claude 交互式会话 attach=false，POST attach 会在能力闸门
- * 返回 422 E_CAP_UNSUPPORTED（契约已记录）；因此「attach 200 后 restart 再 inject」的
- * 正向链路无法用 Claude interactive 演练。本脚本把 422 作为负向断言保留，不伪造 200。
+ * 已知偏差（C07 裁定 + review P1-1 修复）：Claude 交互式会话 attach=false，POST attach
+ * 会在能力闸门返回 422 E_CAP_UNSUPPORTED（契约已记录），本脚本把它作为负向断言保留、
+ * 不伪造 200；重启后的接管改由 POST /sessions/:key/resume 演练（正向断言）。
  */
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -367,6 +367,17 @@ async function main() {
     knownDeviation: "Claude interactive attach=false; attach 200 + inject-after-restart is not exercised",
     body: attach.body,
   });
+
+  // P1-1（review）：attach 能力不足的 Claude 交互式会话，重启后由 resume 接管（v1 additive）。
+  // resume 成功 = 注册表回到 driver=pi/status=idle，之后 inject/handoff 才有入口。
+  const resumed = await http("POST", "/api/cp/sessions/" + encodeURIComponent(key) + "/resume", {}, 120_000);
+  const resumedOk = resumed.status === 200 && resumed.body?.resumed === true;
+  record("resume-after-restart", resumedOk, { status: resumed.status, ms: resumed.ms, body: resumed.body });
+  must(resumedOk, "重启后 resume 接管失败：" + JSON.stringify(resumed.body));
+  const afterResume = await http("GET", "/api/cp/sessions", undefined, 10_000);
+  const rehydrated = (Array.isArray(afterResume.body) ? afterResume.body : []).find((session) => session.key === key);
+  const rehydratedOk = rehydrated?.driver === "pi" && rehydrated?.status === "idle";
+  record("resume-restores-driver-idle", rehydratedOk, { driver: rehydrated?.driver ?? null, status: rehydrated?.status ?? null });
 
   const dbPath = join(home, "workbench.db");
   must(existsSync(dbPath), "workbench.db 不存在：" + dbPath);

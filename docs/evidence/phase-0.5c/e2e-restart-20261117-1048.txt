@@ -1,0 +1,21 @@
+✔ daemon-1-health：{"url":"http://127.0.0.1:41881","pid":51136,"health":{"ok":true,"name":"pi-workbenchd","version":"0.0.1","pid":51136,"uptimeMs":814,"schemaVersion":4,"instanceId":"d0225c9d-f61f-4c58-b9b7-bb7c35a3f56b","db":{"schemaVersion":4,"ok":true},"adapters":[{"agent":"claude","available":true},{"agent":"codex","available":false},{"agent":"pi","available":false}]}}
+✔ dispatch-accepted：{"status":200,"body":{"key":"claude:fe65b1bc-86b5-4d5b-936c-c95314a77fe9","agent":"claude","nativeId":"fe65b1bc-86b5-4d5b-936c-c95314a77fe9","acpSessionId":"fe65b1bc-86b5-4d5b-936c-c95314a77fe9","cwd":"E:\\pi-workbench\\tmp\\e2e-restart\\workspace","transcriptPath":"C:\\Users\\huang\\.claude\\projects\\E--pi-workbench-tmp-e2e-restart-workspace\\fe65b1bc-86b5-4d5b-936c-c95314a77fe9.jsonl","status":"running","driver":"pi","capabilities":{"stream":true,"inject":true,"interrupt":true,"attach":false,"resume":true,"transcript":true,"permissions":true,"background":false},"kind":"interactive"},"ms":3637}
+✔ session-listed-before-restart：{"key":"claude:fe65b1bc-86b5-4d5b-936c-c95314a77fe9","status":"running","driver":"pi"}
+✔ sessions-count-before-restart：{"count":1}
+✔ transcript-before-restart：{"messages":2,"waited":true}
+✔ daemon-pid-is-control-plane：{"pid":51136,"cmd":"E:\\nodejs\\node.exe --experimental-strip-types E:\\pi-workbench\\packages\\control-plane\\src\\index.ts"}
+✔ daemon-1-killed：{"pid":51136}
+✔ daemon-2-health：{"url":"http://127.0.0.1:22051","pid":47916,"health":{"ok":true,"name":"pi-workbenchd","version":"0.0.1","pid":47916,"uptimeMs":811,"schemaVersion":4,"instanceId":"00f8d317-b8de-4e65-8317-f704f2e0d1ee","db":{"schemaVersion":4,"ok":true},"adapters":[{"agent":"claude","available":true},{"agent":"codex","available":false},{"agent":"pi","available":false}]}}
+✔ daemon-2-new-instance：{"instanceId1":"d0225c9d-f61f-4c58-b9b7-bb7c35a3f56b","instanceId2":"00f8d317-b8de-4e65-8317-f704f2e0d1ee"}
+✔ sessions-count-unchanged：{"before":1,"after":1}
+✔ sessions-after-restart：{"total":1,"found":{"key":"claude:fe65b1bc-86b5-4d5b-936c-c95314a77fe9","agent":"claude","status":"unknown","driver":"none"}}
+✔ session-reconciled-unknown：{"driver":"none","status":"unknown"}
+✔ transcript-after-restart：{"status":200,"messages":2,"beforeMessages":2}
+✔ attach-after-restart-capability-gate-422：{"status":422,"code":"E_CAP_UNSUPPORTED","knownDeviation":"Claude interactive attach=false; attach 200 + inject-after-restart is not exercised","body":{"error":{"code":"E_CAP_UNSUPPORTED","message":"Agent claude 不支持能力 attach","details":{"agent":"claude","cap":"attach"}}}}
+✔ resume-after-restart：{"status":200,"ms":669,"body":{"resumed":true,"sessionKey":"claude:fe65b1bc-86b5-4d5b-936c-c95314a77fe9","agent":"claude"}}
+✔ resume-restores-driver-idle：{"driver":"pi","status":"idle"}
+✔ db-instances-2：{"dbPath":"E:\\pi-workbench\\tmp\\e2e-restart\\workbench.db","instances":2}
+✔ db-daemon-restart-event：{"events":1}
+✔ daemon-log-recovery：{"path":"E:\\pi-workbench\\tmp\\e2e-restart\\logs\\daemon.log","tail":" 30 天）\n[2026-11-17T02:48:00.975Z] [INFO] [pi-workbenchd] dispatch 幂等记录清理完成：删除 0 条（保留 24h）\n[2026-11-17T02:48:01.471Z] [INFO] pi-workbenchd listening on http://127.0.0.1:22051\n[2026-11-17T02:48:01.474Z] [INFO] [pi-workbenchd] 已补齐 1 个历史实例的 ended_at\n[2026-11-17T02:48:02.033Z] [INFO] [pi-workbenchd] 已从库里恢复 1 个会话\n[2026-11-17T02:48:02.033Z] [INFO] [pi-workbenchd] 重启对账：共 1 个会话，1 个置为 unknown，0 个保持 handoff\n"}
+✔ daemon-2-stopped：{"pid":47916}
+PASS 20 checks
