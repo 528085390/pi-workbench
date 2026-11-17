@@ -24,7 +24,7 @@ import { ReadCursorStore } from "../src/cursors.ts";
 import type { Config } from "../src/config.ts";
 import { migrate, openDb } from "../src/db.ts";
 import { DispatchStore } from "../src/dispatch-store.ts";
-import { isWorkbenchError } from "../src/errors.ts";
+import { isWorkbenchError, WorkbenchError } from "../src/errors.ts";
 import { EventStore } from "../src/events.ts";
 import type { NewEvent } from "../src/events.ts";
 import { LeaseManager } from "../src/lease.ts";
@@ -933,6 +933,31 @@ test("未知异常 → 500 E_INTERNAL（R35 兜底码）", async () => {
     // 评审 N1：logger:false 让 app.log.error 变 no-op，真实原因必须仍能落到注入的 logError
     assert.equal(logged.length, 1, "内部异常必须交给 logError 一次");
     assert.match(String((logged[0] as Error).message), /boom/);
+  } finally {
+    await h.close();
+  }
+});
+
+test("WorkbenchError(E_INTERNAL) 与未知异常同待遇：500 + 固定文案 + 原因只进日志（review r3）", async () => {
+  const logged: unknown[] = [];
+  const h = await makeHarness({
+    readTranscript: () => {
+      throw new WorkbenchError("E_INTERNAL", "SQL 片段 SELECT * FROM sessions WHERE key = 'secret'");
+    },
+    logError: (error) => {
+      logged.push(error);
+    },
+  });
+  try {
+    const res = await h.app.inject({ method: "GET", url: SESSIONS + "/transcript" });
+    assert.equal(res.statusCode, 500);
+    const body = res.json<ErrorEnvelope>();
+    assert.equal(body.error.code, "E_INTERNAL");
+    assert.equal(body.error.message, "internal error", "E_INTERNAL 不得回传内部 message");
+    assert.equal(body.error.details, undefined, "E_INTERNAL 不得回传 details");
+    assert.ok(!res.body.includes("SELECT"), "内部 SQL 片段不得回给客户端：" + res.body);
+    assert.equal(logged.length, 1, "E_INTERNAL 必须交给 logError 一次");
+    assert.match(String((logged[0] as Error).message), /SELECT/);
   } finally {
     await h.close();
   }

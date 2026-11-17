@@ -401,6 +401,14 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
 
   app.setErrorHandler((error: FastifyError, _request, reply) => {
     if (isWorkbenchError(error)) {
+      // E_INTERNAL 是合法码（errors.ts）但语义等同「未知异常」：对外固定文案 + 真实原因只进日志。
+      // 否则 `new WorkbenchError("E_INTERNAL", <SQL 片段 / 绝对路径>)` 会原样回给客户端，
+      // 把下面「不回传内部 message」的那条规则打穿（review r3 P3）。
+      if (error.code === "E_INTERNAL") {
+        logError(error);
+        void reply.status(500).send(errorBody(INTERNAL_ERROR_CODE, INTERNAL_ERROR_MESSAGE));
+        return;
+      }
       const status = STATUS_BY_CODE[error.code];
       void reply.status(status).send(errorBody(error.code, error.message, error.details));
       return;
