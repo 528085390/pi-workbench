@@ -206,12 +206,17 @@ export class CodexDriver implements AgentDriver {
     await this.resolveTranscriptPath(ref);
   }
 
+  /** 接管模式（纯函数，不执行命令）：能力门禁在 close 之前使用 */
+  handoffMode(): "resume-tui" {
+    return "resume-tui";
+  }
+
   /** 原生 TUI 出口：只拼命令，不执行；adapter 起不来也照样能交给人 */
   async handoff(ref: SessionRef): Promise<HandoffCommand> {
     this.#authorize(ref, "handoff");
     return {
       command: ["codex", "resume", ref.nativeId, "--no-alt-screen"],
-      mode: "resume-tui",
+      mode: this.handoffMode(),
     };
   }
 

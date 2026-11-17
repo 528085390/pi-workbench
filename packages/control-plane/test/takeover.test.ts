@@ -19,7 +19,7 @@ import { LeaseManager } from "../src/lease.ts";
 import { SessionRegistry } from "../src/registry.ts";
 import { claudeProjectDir } from "../src/transcript/claude.ts";
 import type { UnifiedMessage } from "../src/transcript/claude.ts";
-import { CLAUDE_CAPABILITIES } from "../src/capabilities.ts";
+import { CLAUDE_CAPABILITIES, CODEX_CAPABILITIES } from "../src/capabilities.ts";
 import { AgentRouter } from "../src/agents/router.ts";
 import type { AgentDriver } from "../src/agents/types.ts";
 import { STATUS_BY_CODE } from "../src/server.ts";
@@ -1765,6 +1765,82 @@ test("handoff: 命令拼接失败 → exited + 租约释放 + E_HANDOFF_FAILED�
     assert.equal(registry.get(key)?.status, "exited", "命令拼接失败后会话置 exited");
     assert.equal(leases.current(key), null, "失败后租约必须释放");
     assert.equal(countRows(db, "checkpoints"), 1, "checkpoint 在命令失败前已落库");
+  } finally {
+    db.close();
+    rmSync(handoffDir, { recursive: true, force: true });
+  }
+});
+
+test("handoff: driver 不支持 attach 语义 → 在 close 之前 E_CAP_UNSUPPORTED，会话/租约/控制通道不变（P2-5）", async () => {
+  const db = openDb(":memory:");
+  migrate(db);
+  const clock = makeClock();
+  const registry = new SessionRegistry(db);
+  const leases = new LeaseManager(db, { now: clock.now });
+  const store = new EventStore(db);
+  const handoffDir = mkdtempSync(join(tmpdir(), "pi-handoff-cap-"));
+  let closeCalls = 0;
+  const driver: AgentDriver & {
+    close: (ref: SessionRef) => Promise<void>;
+    handoffMode: (ref: SessionRef) => "resume-tui" | "attach";
+  } = {
+    agent: "codex",
+    caps: { ...CODEX_CAPABILITIES },
+    discover: async () => [],
+    attach: async () => {},
+    inject: async () => ({ messageId: "m", effective: "now" }),
+    interrupt: async () => ({ stopReason: "cancelled" }),
+    resume: async () => {},
+    // 声明 attach 出口、但 caps.attach=false：能力门禁必须在 close 之前拒绝
+    handoffMode: () => "attach",
+    handoff: async () => ({ command: ["codex", "attach", "sess-1"], mode: "attach" }),
+    close: async () => {
+      closeCalls += 1;
+    },
+    onUpdate: (_cb: (update: AdapterUpdate) => void) => () => {},
+    dispose: async () => {},
+  };
+  const router = new AgentRouter();
+  router.register(driver);
+  const engine = new TakeoverEngine({
+    store,
+    leases,
+    registry,
+    adapter: makeFake().adapter,
+    router,
+    checkpoints: new CheckpointStore(db),
+    dispatches: new DispatchStore(db),
+    handoffDir,
+    now: clock.now,
+    readTranscript: emptyReader,
+  });
+  const key = "codex:sess-1";
+  try {
+    registry.upsert({
+      key,
+      agent: "codex",
+      nativeId: "sess-1",
+      cwd: CWD,
+      status: "idle",
+      driver: "pi",
+      capabilities: driver.caps,
+      kind: "interactive",
+    });
+    leases.acquire(key, "pi", "pi-1");
+
+    try {
+      await engine.handoff(key, "human", "pi-1");
+      assert.fail("预期抛 E_CAP_UNSUPPORTED");
+    } catch (err) {
+      assert.ok(isWorkbenchError(err), "预期 WorkbenchError，实际：" + String(err));
+      assert.equal(err.code, "E_CAP_UNSUPPORTED");
+    }
+
+    assert.equal(closeCalls, 0, "能力不足的 driver 不得先 close 再报错");
+    assert.equal(registry.get(key)?.status, "idle", "拒绝后会话状态不变");
+    assert.equal(registry.get(key)?.driver, "pi", "拒绝后 driver 不变");
+    assert.equal(leases.current(key)?.clientId, "pi-1", "拒绝后租约仍归调用方");
+    assert.equal(countRows(db, "checkpoints"), 1, "checkpoint 在命令阶段之前已落库");
   } finally {
     db.close();
     rmSync(handoffDir, { recursive: true, force: true });

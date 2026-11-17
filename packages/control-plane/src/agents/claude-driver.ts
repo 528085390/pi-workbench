@@ -51,11 +51,16 @@ export class ClaudeDriver implements AgentDriver {
     await this.#adapter.resume(ref.nativeId, ref.cwd);
   }
 
+  /** 接管模式（纯函数，不执行命令）：能力门禁在 close 之前用它判断是否需要 attach */
+  handoffMode(ref: SessionRef): "resume-tui" | "attach" {
+    return ref.kind === "background" ? "attach" : "resume-tui";
+  }
+
   async handoff(ref: SessionRef): Promise<HandoffCommand> {
-    const background = ref.kind === "background";
+    const mode = this.handoffMode(ref);
     return {
-      command: background ? ["claude", "attach", ref.nativeId] : ["claude", "--resume", ref.nativeId],
-      mode: background ? "attach" : "resume-tui",
+      command: mode === "attach" ? ["claude", "attach", ref.nativeId] : ["claude", "--resume", ref.nativeId],
+      mode,
     };
   }
 

@@ -264,6 +264,12 @@ async function main() {
 
   await startDaemon();
 
+  // 评审 P2-7：先采会话列表基线，dispatch 后断言「只多出这一个会话」。
+  // 隔离 home 从空库起步，基线应为 0；写成 baseline + 1 也能兼容将来预置会话的用例。
+  const beforeList = await http("GET", "/api/cp/sessions", undefined, 10_000);
+  must(beforeList.status === 200, "GET /sessions 基线失败：" + JSON.stringify(beforeList.body));
+  const sessionsBefore = Array.isArray(beforeList.body) ? beforeList.body.length : 0;
+
   // ---- 1. 同一 idempotencyKey 并发 dispatch 3 次 ---------------------------------
   const idempotencyKey = "e2e-concurrency:" + nonce;
   const task = "E2E 并发任务（nonce " + nonce + "）：请只回答一行，不要使用任何工具：E2E_CONCURRENCY_" + nonce;
@@ -287,10 +293,12 @@ async function main() {
   must(typeof key === "string" && key.length > 0, "dispatch 没有返回 key");
 
   const listed = await waitForSession(key);
-  record("dispatch-single-session", listed.sessions.filter((session) => session.key === key).length === 1, {
-    totalSessions: listed.sessions.length,
-    key,
-  });
+  const sessionsAfter = listed.sessions.length;
+  record(
+    "dispatch-single-session",
+    sessionsAfter === sessionsBefore + 1 && listed.sessions.filter((session) => session.key === key).length === 1,
+    { baseline: sessionsBefore, totalSessions: sessionsAfter, expected: sessionsBefore + 1, key },
+  );
   const dispatchRows = dbQuery("SELECT idempotency_key, status, session_key FROM dispatches WHERE idempotency_key = ?", [idempotencyKey]);
   record("dispatch-single-row", dispatchRows.length === 1 && dispatchRows[0].status === "done" && dispatchRows[0].session_key === key, dispatchRows);
 

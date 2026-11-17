@@ -359,7 +359,14 @@ async function main() {
   record("session-status-exited", released.session?.session?.status === "exited", { status: released.session?.session?.status });
 
   const alive = await http("GET", "/health", undefined, 10_000);
-  record("daemon-still-healthy", alive.status === 200, { status: alive.status, adapters: alive.body?.adapters });
+  const healthAdapters = Array.isArray(alive.body?.adapters) ? alive.body.adapters : [];
+  // 评审 P3-11：三行 adapters 不能只写进 detail，必须参与断言（空数组也不能真空通过）
+  const adaptersAvailable = healthAdapters.length > 0 && healthAdapters.every((row) => row?.available === true);
+  record("daemon-still-healthy", alive.status === 200 && adaptersAvailable, {
+    status: alive.status,
+    adapters: healthAdapters,
+    adaptersAvailable,
+  });
 
   // ---- 停止 daemon：不留下任何子进程 -------------------------------------------
   state.daemon.kill("SIGTERM");

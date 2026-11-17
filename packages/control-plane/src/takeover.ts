@@ -92,6 +92,8 @@ type DriverRuntime = AgentDriver & {
   waitForTurn?: (ref: SessionRef, timeoutMs?: number) => Promise<{ stopReason: string }>;
   close?: (ref: SessionRef) => Promise<void>;
   resolveTranscriptPath?: (ref: SessionRef) => Promise<string | undefined>;
+  /** 接管出口模式（纯函数，不执行命令）：能力门禁要在 close 之前判断是否走 attach 语义 */
+  handoffMode?: (ref: SessionRef) => "resume-tui" | "attach";
 };
 
 export type TakeoverDeps = {
@@ -381,7 +383,12 @@ export class TakeoverEngine {
       cursor: checkpoint.transcriptCursor,
     });
 
-    // 4. 释放控制通道里的会话，交给原生终端（没有 close 的 driver，如 Pi，保持原生会话不动）
+    // 4. 接管模式的能力门禁（review P2-5）：必须在破坏性的 close 之前。
+    //    只看 driver 声明的模式（纯函数，不执行命令），能力不足的 driver 不得先关控制通道再回 422；
+    //    否则调用方拿到「422 但控制通道已关」的假失败，后续 inject 会打到已关闭的会话。
+    this.#assertHandoffMode(ref, driver);
+
+    // 5. 释放控制通道里的会话，交给原生终端（没有 close 的 driver，如 Pi，保持原生会话不动）
     const closeStartedAt = this.#now();
     try {
       if (driver !== null) {
@@ -396,7 +403,7 @@ export class TakeoverEngine {
     }
     this.#auditStep(clientId, "handoff", ref, "close", closeStartedAt, "ok", null);
 
-    // 5. 接管命令由 driver.handoff(ref) 决定（Claude：background attach / interactive --resume；
+    // 6. 接管命令由 driver.handoff(ref) 决定（Claude：background attach / interactive --resume；
     //    Codex：codex resume <id> --no-alt-screen；Pi：pi --session <file>）。
     //    放在 checkpoint / close 之后：handoff 只拼命令，不执行，也不依赖 adapter 仍存活。
     let exit: { command: string[]; mode: "resume-tui" | "attach" };
@@ -429,11 +436,11 @@ export class TakeoverEngine {
     }
     this.#auditStep(clientId, "handoff", ref, "handoff", commandStartedAt, "ok", null, { mode: exit.mode });
 
-    // 6. 租约转给接管的 driver，人类窗口固定 30 分钟
+    // 7. 租约转给接管的 driver，人类窗口固定 30 分钟
     this.#leases.release(key, clientId);
     this.#leases.acquire(key, to, HANDOFF_CLIENT_PREFIX + clientId, HUMAN_HANDOFF_TTL_MS);
 
-    // 7. 注册表 + 事件
+    // 8. 注册表 + 事件
     const next: SessionRef = { ...ref, driver: to, status: "handoff" };
     this.#registry.upsert(next);
     this.#appendState(next, { state: "handoff", driver: to, checkpointPath: path, to }, "handoff");
@@ -708,6 +715,26 @@ export class TakeoverEngine {
 
   #driverOf(ref: SessionRef): AgentDriver | null {
     return this.#router?.get(ref.agent) ?? null;
+  }
+
+  /**
+   * 接管模式的能力门禁（review P2-5）：在破坏性的 close 之前执行。
+   * 模式来自 driver.handoffMode（纯函数）；未实现的 driver 按会话 kind 推导
+   * （background → attach，其余 → resume-tui，与 0.5-A 的 fallback 口径一致）。
+   */
+  #assertHandoffMode(ref: SessionRef, driver: AgentDriver | null): void {
+    if (driver === null) {
+      return;
+    }
+    const runtime = driver as DriverRuntime;
+    const mode = runtime.handoffMode?.(ref) ?? (ref.kind === "background" ? "attach" : "resume-tui");
+    if (mode === "attach" && driver.agent !== "claude" && !driver.caps.attach) {
+      throw new WorkbenchError(
+        "E_CAP_UNSUPPORTED",
+        "Agent " + String(driver.agent) + " 不支持 attach 语义",
+        { agent: driver.agent, cap: "attach" },
+      );
+    }
   }
 
   /** 能力门禁：读 driver.caps 的实时值（router.list() 是注册时快照，不能用于运行时降级） */
