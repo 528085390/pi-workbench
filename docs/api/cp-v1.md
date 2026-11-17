@@ -28,7 +28,7 @@
 | 409 | `E_NO_LEASE` | 调用方未持有该会话租约 |
 | 409 | `E_IDEMPOTENCY_CONFLICT` | 同一 `idempotencyKey` 对应不同请求 |
 | 409 | `E_DISPATCH_IN_PROGRESS` | 同一幂等键的派发仍在进行 |
-| 409 | `E_RESUME_REJECTED` | attach / resume / handback 时原生会话已被丢弃或拒绝恢复 |
+| 409 | `E_RESUME_REJECTED` | attach / resume / handback 时原生会话已被丢弃或拒绝恢复；resume 在 human handoff 会话上直接拒绝（请用 handback） |
 | 422 | `E_CAP_UNSUPPORTED` | 会话能力未声明该操作 |
 | 422 | `E_AGENT_UNAVAILABLE` | 目标 Agent 未注册 / CLI 不可用 / 探测失败 |
 | 429 | `E_SESSION_BUSY` | 会话忙，稍后重试 |
@@ -314,7 +314,13 @@
 
 ### POST /api/cp/sessions/:key/resume
 
-请求体：无（`{}` 亦可）。
+请求体：
+
+```json
+{ "clientId": "pi:12345" }
+```
+
+`clientId` 必填（缺失 → `400 E_BAD_REQUEST`）。
 
 成功 `200`：`{ "resumed": true, "sessionKey": "claude:abc", "agent": "claude" }`。
 
@@ -325,9 +331,13 @@
 1. 会话必须存在 → 否则 `404 E_SESSION_NOT_FOUND`。
 2. 目标 Agent 必须已注册且可用 → 否则 `422 E_AGENT_UNAVAILABLE`（`details.cap="resume"`）。
 3. 会话自身声明的 `capabilities.resume` 必须为 `true` → 否则 `422 E_CAP_UNSUPPORTED`（`details.cap="resume"`）。
-4. 调 `driver.resume()` 接管；原生侧拒绝恢复 → `409 E_RESUME_REJECTED`，会话状态不变。
-5. 成功后注册表置 `driver="pi"`、`status="idle"`，并追加 `state_update` 事件：`payload.reason="manual_resume"`，`payload.previous={ driver, status }` 为改写前快照。
-6. 写操作走 per-session 写队列：同一会话的 resume / inject / interrupt / handoff 串行执行。
+4. 状态限制：`driver="human"` 或 `status="handoff"` → `409 E_RESUME_REJECTED`（`details.reason="handoff"`，请用 handback 接回）；`status` 为 `running` / `starting` → `429 E_SESSION_BUSY`（`details.status`）。
+5. **调用方必须持有该会话租约**（`clientId` 与租约持有人一致）→ 否则 `409 E_NO_LEASE`。这是 AGENTS.md 红线 3 的强制门禁。
+6. 进入 `TakeoverEngine.resume`：先状态门禁，再 `leases.assertWriter`，再 `driver.resume`；写操作经 `#driverWrite`（Pi / Codex 内部 `"pi"` 租约临时切换后原样还原），并写一条 `audit_log`：`action="resume"`、`detail.step="resume"`。
+7. 成功后注册表置 `driver="pi"`、`status="idle"`，并追加 `state_update` 事件：`payload={ state: "idle", driver: "pi", clientId }`。
+8. 引擎调用走 per-session 写队列：同一会话的 resume / inject / interrupt / handoff 串行执行。
+
+原生侧拒绝恢复 → `409 E_RESUME_REJECTED`（`details.step="resume"`），会话状态不变。
 
 其他错误：`401`、`500 E_INTERNAL`。
 

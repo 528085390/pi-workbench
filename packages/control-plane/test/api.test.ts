@@ -179,6 +179,7 @@ function makeBundle(opts: BundleOptions = {}): Bundle {
     leases,
     registry,
     adapter: fake.adapter,
+    ...(opts.router === undefined ? {} : { router: opts.router }),
     checkpoints,
     dispatches,
     handoffDir: join(dir, "handoffs"),
@@ -1594,7 +1595,13 @@ test("resume 成功后接管会话：driver=pi / status=idle 且追加 state_upd
     ],
   });
   try {
-    const res = await h.app.inject({ method: "POST", url: SESSIONS + "/resume" });
+    // review r2 P1：resume 现在是写操作，先取租约
+    await acquire(h.app, "pi:1");
+    const res = await h.app.inject({
+      method: "POST",
+      url: SESSIONS + "/resume",
+      payload: { clientId: "pi:1" },
+    });
     assert.equal(res.statusCode, 200, res.body);
     assert.deepEqual(res.json(), { resumed: true, sessionKey: SESSION_KEY, agent: "claude" });
     assert.deepEqual(calls, ["resume"]);
@@ -1606,10 +1613,7 @@ test("resume 成功后接管会话：driver=pi / status=idle 且追加 state_upd
     assert.equal(last?.type, "state_update");
     // source 用会话 agent 名（与 takeover / boot-recovery 的 state_update 口径一致）
     assert.equal(last?.source, "claude");
-    assert.deepEqual(last?.payload, {
-      reason: "manual_resume",
-      previous: { driver: "none", status: "unknown" },
-    });
+    assert.deepEqual(last?.payload, { state: "idle", driver: "pi", clientId: "pi:1" });
   } finally {
     await h.close();
   }
@@ -1634,7 +1638,12 @@ test("resume 走 per-session 写队列：driver.resume 在队列任务内执行"
     seed: [sessionRef({ status: "unknown", driver: "none" })],
   });
   try {
-    const res = await h.app.inject({ method: "POST", url: SESSIONS + "/resume" });
+    await acquire(h.app, "pi:1");
+    const res = await h.app.inject({
+      method: "POST",
+      url: SESSIONS + "/resume",
+      payload: { clientId: "pi:1" },
+    });
     assert.equal(res.statusCode, 200, res.body);
     assert.deepEqual(queued, [SESSION_KEY], "resume 必须按路径 sessionKey 入队");
     assert.deepEqual(calls, ["resume"]);
@@ -1668,7 +1677,12 @@ test("resume：Agent 不可用 → 422 E_AGENT_UNAVAILABLE 且不调 driver", as
     seed: [sessionRef({ status: "unknown", driver: "none" })],
   });
   try {
-    const res = await h.app.inject({ method: "POST", url: SESSIONS + "/resume" });
+    await acquire(h.app, "pi:1");
+    const res = await h.app.inject({
+      method: "POST",
+      url: SESSIONS + "/resume",
+      payload: { clientId: "pi:1" },
+    });
     assert.equal(res.statusCode, 422, res.body);
     const body = res.json<ErrorEnvelope>();
     assert.equal(body.error.code, "E_AGENT_UNAVAILABLE");
@@ -1700,11 +1714,118 @@ test("resume：会话未声明 caps.resume → 422 E_CAP_UNSUPPORTED 且不调 d
     ],
   });
   try {
-    const res = await h.app.inject({ method: "POST", url: SESSIONS + "/resume" });
+    await acquire(h.app, "pi:1");
+    const res = await h.app.inject({
+      method: "POST",
+      url: SESSIONS + "/resume",
+      payload: { clientId: "pi:1" },
+    });
     assert.equal(res.statusCode, 422, res.body);
     const body = res.json<ErrorEnvelope>();
     assert.equal(body.error.code, "E_CAP_UNSUPPORTED");
     assert.deepEqual(body.error.details, { agent: "claude", cap: "resume" });
+    assert.deepEqual(calls, []);
+  } finally {
+    await h.close();
+  }
+});
+
+test("resume：调用方未持有租约 → 409 E_NO_LEASE 且不调 driver（review r2 P1）", async () => {
+  const calls: string[] = [];
+  const router = new AgentRouter();
+  router.register(makeDriver(calls));
+
+  const h = await makeHarness({
+    router,
+    seed: [sessionRef({ status: "unknown", driver: "none" })],
+  });
+  try {
+    const res = await h.app.inject({
+      method: "POST",
+      url: SESSIONS + "/resume",
+      payload: { clientId: "pi:1" },
+    });
+    assert.equal(res.statusCode, 409, res.body);
+    assert.equal(res.json<ErrorEnvelope>().error.code, "E_NO_LEASE");
+    assert.deepEqual(calls, [], "无租约时不得触碰 driver");
+    assert.equal(h.registry.get(SESSION_KEY)?.driver, "none");
+    assert.equal(h.registry.get(SESSION_KEY)?.status, "unknown");
+  } finally {
+    await h.close();
+  }
+});
+
+test("resume：human handoff 会话 → 409 E_RESUME_REJECTED，不改状态/租约（review r2 P1）", async () => {
+  const calls: string[] = [];
+  const router = new AgentRouter();
+  router.register(makeDriver(calls));
+
+  const h = await makeHarness({
+    router,
+    seed: [sessionRef({ status: "handoff", driver: "human" })],
+  });
+  try {
+    // 即使调用方持有租约，human handoff 也不允许 resume：必须走 handback
+    await acquire(h.app, "human-1");
+    const res = await h.app.inject({
+      method: "POST",
+      url: SESSIONS + "/resume",
+      payload: { clientId: "human-1" },
+    });
+    assert.equal(res.statusCode, 409, res.body);
+    const body = res.json<ErrorEnvelope>();
+    assert.equal(body.error.code, "E_RESUME_REJECTED");
+    assert.deepEqual(body.error.details, { sessionKey: SESSION_KEY, reason: "handoff" });
+    assert.deepEqual(calls, []);
+    assert.equal(h.registry.get(SESSION_KEY)?.driver, "human");
+    assert.equal(h.registry.get(SESSION_KEY)?.status, "handoff");
+  } finally {
+    await h.close();
+  }
+});
+
+test("resume：running / starting 会话 → 429 E_SESSION_BUSY（review r2 P1）", async () => {
+  for (const status of ["running", "starting"] as const) {
+    const calls: string[] = [];
+    const router = new AgentRouter();
+    router.register(makeDriver(calls));
+
+    const h = await makeHarness({
+      router,
+      seed: [sessionRef({ status, driver: "pi" })],
+    });
+    try {
+      await acquire(h.app, "pi:1");
+      const res = await h.app.inject({
+        method: "POST",
+        url: SESSIONS + "/resume",
+        payload: { clientId: "pi:1" },
+      });
+      assert.equal(res.statusCode, 429, status + " 应 429：" + res.body);
+      const body = res.json<ErrorEnvelope>();
+      assert.equal(body.error.code, "E_SESSION_BUSY");
+      assert.deepEqual(body.error.details, { sessionKey: SESSION_KEY, status });
+      assert.deepEqual(calls, []);
+      assert.equal(h.registry.get(SESSION_KEY)?.status, status);
+    } finally {
+      await h.close();
+    }
+  }
+});
+
+test("resume：缺 clientId → 400 E_BAD_REQUEST（review r2 P1）", async () => {
+  const calls: string[] = [];
+  const router = new AgentRouter();
+  router.register(makeDriver(calls));
+
+  const h = await makeHarness({
+    router,
+    seed: [sessionRef({ status: "unknown", driver: "none" })],
+  });
+  try {
+    const res = await h.app.inject({ method: "POST", url: SESSIONS + "/resume", payload: {} });
+    assert.equal(res.statusCode, 400, res.body);
+    assert.equal(res.json<ErrorEnvelope>().error.code, "E_BAD_REQUEST");
     assert.deepEqual(calls, []);
   } finally {
     await h.close();

@@ -19,7 +19,7 @@ import { LeaseManager } from "../src/lease.ts";
 import { SessionRegistry } from "../src/registry.ts";
 import { claudeProjectDir } from "../src/transcript/claude.ts";
 import type { UnifiedMessage } from "../src/transcript/claude.ts";
-import { CLAUDE_CAPABILITIES, CODEX_CAPABILITIES } from "../src/capabilities.ts";
+import { CLAUDE_CAPABILITIES, CODEX_CAPABILITIES, PI_CAPABILITIES } from "../src/capabilities.ts";
 import { AgentRouter } from "../src/agents/router.ts";
 import type { AgentDriver } from "../src/agents/types.ts";
 import { STATUS_BY_CODE } from "../src/server.ts";
@@ -661,6 +661,95 @@ test("handback: 无租约 → E_NO_LEASE，resume 0 次", async () => {
     assert.equal(h.fake.count("resume"), 0);
   } finally {
     h.close();
+  }
+});
+
+test("resume: 状态门禁先于租约检查（无租约的 running / handoff 会话也按状态拒绝）", async () => {
+  const h = fresh();
+  try {
+    h.registry.upsert(makeRef({ status: "running" }));
+    await expectRejectCode(() => h.engine.resume(KEY, "pi-1"), "E_SESSION_BUSY");
+    h.registry.upsert(makeRef({ status: "handoff", driver: "human" }));
+    await expectRejectCode(() => h.engine.resume(KEY, "pi-1"), "E_RESUME_REJECTED");
+    assert.equal(h.fake.count("resume"), 0);
+  } finally {
+    h.close();
+  }
+});
+
+test("resume: Pi driver 内部抢 'pi' 租约后仍还原给调用方，后续 inject 不 E_NO_LEASE（P2-9）", async () => {
+  const db = openDb(":memory:");
+  migrate(db);
+  const clock = makeClock();
+  const store = new EventStore(db);
+  const leases = new LeaseManager(db, { now: clock.now });
+  const registry = new SessionRegistry(db);
+  const handoffDir = mkdtempSync(join(tmpdir(), "pi-resume-lease-"));
+  const calls: string[] = [];
+
+  // PiDriver 的真实行为：resume 内部 #claim 会把 "pi" 租约抢过去并留在名下。
+  const driver: AgentDriver = {
+    agent: "pi",
+    caps: PI_CAPABILITIES,
+    discover: async () => [],
+    attach: async () => {},
+    inject: async () => {
+      calls.push("inject");
+      return { messageId: "m-resume", effective: "now" };
+    },
+    interrupt: async () => ({ stopReason: "cancelled" }),
+    resume: async (ref) => {
+      calls.push("resume");
+      leases.acquire(ref.key, "pi", "pi");
+    },
+    handoff: async () => ({ command: ["pi"], mode: "resume-tui" }),
+    onUpdate: () => () => {},
+    dispose: async () => {},
+  };
+  const router = new AgentRouter();
+  router.register(driver);
+  const engine = new TakeoverEngine({
+    store,
+    leases,
+    registry,
+    adapter: makeFake().adapter,
+    router,
+    checkpoints: new CheckpointStore(db),
+    dispatches: new DispatchStore(db),
+    handoffDir,
+    now: clock.now,
+    readTranscript: emptyReader,
+  });
+  const key = "pi:sess-1";
+  try {
+    registry.upsert({
+      key,
+      agent: "pi",
+      nativeId: "sess-1",
+      cwd: CWD,
+      status: "unknown",
+      driver: "none",
+      capabilities: PI_CAPABILITIES,
+      kind: "interactive",
+    });
+    leases.acquire(key, "pi", "pi:4242");
+
+    const result = await engine.resume(key, "pi:4242");
+
+    assert.deepEqual(result, { resumed: true, sessionKey: key });
+    assert.deepEqual(calls, ["resume"]);
+    assert.equal(leases.current(key)?.clientId, "pi:4242", "#driverWrite 必须把调用方租约还回来");
+    assert.equal(registry.get(key)?.driver, "pi");
+    assert.equal(registry.get(key)?.status, "idle");
+
+    // 关键回归：接管后紧接着 inject 不能 E_NO_LEASE（P2-9）
+    const injected = await engine.inject(key, "继续", "pi:4242");
+    assert.equal(injected.messageId, "m-resume");
+    assert.deepEqual(calls, ["resume", "inject"]);
+    assert.equal(leases.current(key)?.clientId, "pi:4242", "inject 之后租约仍属于调用方");
+  } finally {
+    db.close();
+    rmSync(handoffDir, { recursive: true, force: true });
   }
 });
 

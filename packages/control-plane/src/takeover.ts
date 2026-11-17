@@ -3,7 +3,7 @@
  * 规格：docs/specs/2026-11-14-phase-0.5a-claude-slice.md §9；任务：task-7-brief 的 R21–R30。
  *
  * 硬约束（controller 裁定）：
- * - R25 所有写操作（inject / interrupt / checkpoint / handoff / handback）先 leases.assertWriter，
+ * - R25 所有写操作（inject / interrupt / checkpoint / handoff / handback / resume）先 leases.assertWriter，
  *   再碰 adapter 或落盘 —— 无租约时绝不产生任何 ACP 请求；
  * - R26 handoff 严格按序：cancel → (waitForTurn) → checkpoint → close → 租约转 human(30min) → 注册表 + 事件；
  * - R27 handback：resume（失败 → E_RESUME_REJECTED）→ 从 checkpoint 游标读 transcript 生成 deltaSummary
@@ -135,6 +135,8 @@ export type HandoffResult = {
   mode: "resume-tui" | "attach";
 };
 export type HandbackResult = { resumed: boolean; deltaSummary: string };
+/** resume：接管成功后统一回到 pi/idle（review r2 P1 把语义下沉到引擎） */
+export type ResumeResult = { resumed: true; sessionKey: string };
 
 /**
  * 接管原语集合。一个实例服务所有会话；业务状态（会话 / 游标 / 幂等预留）全部走
@@ -500,6 +502,63 @@ export class TakeoverEngine {
     this.#leases.release(key, writerId);
     this.#leases.acquire(key, "pi", piClientId, DEFAULT_LEASE_TTL_MS);
     return { resumed: true, deltaSummary };
+  }
+
+  /**
+   * 接管已存在的原生会话（review r2 P1）：形状与 handback 对齐 —— 租约门禁 → #driverWrite →
+   * driver.resume → 注册表/事件。三个 Agent 的行为因此一致，Pi 在 resume 内部 #claim 抢走的
+   * "pi" 租约也会被 #driverWrite 还原给调用方（否则紧接着 inject 会 E_NO_LEASE）。
+   *
+   * 判定顺序是「状态 → 租约 → driver」：human handoff / running 是「这个会话现在不该 resume」，
+   * 与调用方有没有租约无关；状态门禁必须在 assertWriter 之前。
+   * resume 被拒立即 E_RESUME_REJECTED，不改注册表、不动租约。
+   */
+  async resume(key: string, clientId: string): Promise<ResumeResult> {
+    const ref = this.#requireSession(key);
+    if (ref.driver === "human" || ref.status === "handoff") {
+      throw new WorkbenchError("E_RESUME_REJECTED", "会话处于 human handoff，请用 handback 接回", {
+        sessionKey: key,
+        reason: "handoff",
+      });
+    }
+    if (ref.status === "running" || ref.status === "starting") {
+      throw new WorkbenchError("E_SESSION_BUSY", "会话正在运行，暂不能 resume：" + key, {
+        sessionKey: key,
+        status: ref.status,
+      });
+    }
+    this.#leases.assertWriter(key, clientId);
+
+    const driver = this.#driverOf(ref);
+    if (driver === null) {
+      throw new WorkbenchError("E_AGENT_UNAVAILABLE", "Agent 未注册或不可用：" + ref.agent, {
+        agent: ref.agent,
+        cap: "resume",
+      });
+    }
+    this.#assertDriverCap(driver, "resume");
+
+    const startedAt = this.#now();
+    try {
+      await this.#driverWrite(ref, clientId, () => driver.resume(ref));
+    } catch (err) {
+      this.#auditStep(clientId, "resume", ref, "resume", startedAt, "error", this.#errorCodeOf(err));
+      if (isWorkbenchError(err)) {
+        throw err;
+      }
+      throw new WorkbenchError("E_RESUME_REJECTED", "恢复会话被拒绝：" + key, {
+        sessionKey: key,
+        nativeId: ref.nativeId,
+        step: "resume",
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+    this.#auditStep(clientId, "resume", ref, "resume", startedAt, "ok", null);
+
+    const next: SessionRef = { ...ref, driver: "pi", status: "idle" };
+    this.#registry.upsert(next);
+    this.#appendState(next, { state: "idle", driver: "pi", clientId }, "resume");
+    return { resumed: true, sessionKey: key };
   }
 
   /**
@@ -1172,7 +1231,7 @@ export class TakeoverEngine {
   /** C03：每一步审计（成功/失败都写；durationMs 由注入时钟测量）。审计失败绝不阻断主流程。 */
   #auditStep(
     actor: string,
-    action: "handoff" | "handback" | "checkpoint",
+    action: "handoff" | "handback" | "checkpoint" | "resume",
     ref: SessionRef,
     step: string,
     startedAt: number,
