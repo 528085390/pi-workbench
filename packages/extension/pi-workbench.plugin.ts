@@ -45,6 +45,7 @@ export default function piWorkbench(pi: ExtensionAPI): void {
   let notifier: TurnNotifier | undefined;
   let connection: NotifierConnection | undefined;
   let setStatus: ((text: string | undefined) => void) | undefined;
+  let setWidget: ((lines: string[] | undefined) => void) | undefined;
   let notifierStarting = false;
   let sessionActive = true;
   /** 当前 Pi 进程自己的会话 key；通知器与 cp_sessions 都要排除它。 */
@@ -97,7 +98,12 @@ export default function piWorkbench(pi: ExtensionAPI): void {
       currentSessionKey = undefined;
     }
     sessionActive = true;
-    const ui = (ctx as { ui?: { setStatus?: (key: string, text: string | undefined) => void } }).ui;
+    const ui = (ctx as {
+      ui?: {
+        setStatus?: (key: string, text: string | undefined) => void;
+        setWidget?: (key: string, content: string[] | undefined, options?: { placement?: "aboveEditor" | "belowEditor" }) => void;
+      };
+    }).ui;
     if (ui?.setStatus !== undefined) {
       setStatus = (text: string | undefined) => {
         try {
@@ -107,11 +113,23 @@ export default function piWorkbench(pi: ExtensionAPI): void {
         }
       };
     }
+    if (ui?.setWidget !== undefined) {
+      setWidget = (lines: string[] | undefined) => {
+        try {
+          ui.setWidget?.("pi-workbench", lines, { placement: "belowEditor" });
+        } catch {
+          // widget 画不出来也不影响工具调用
+        }
+      };
+    }
+    // session_start 可能晚于通知器首次刷新：UI 句柄就绪后再刷一次，避免 widget 空白。
+    void notifier?.refreshBadge();
   });
 
   pi.on("session_shutdown", async () => {
     sessionActive = false;
     currentSessionKey = undefined;
+    setWidget?.(undefined);
     connection?.close();
     connection = undefined;
     notifier?.dispose();
@@ -140,6 +158,9 @@ export default function piWorkbench(pi: ExtensionAPI): void {
           },
           setStatus: (text: string | undefined) => {
             setStatus?.(text);
+          },
+          setWidget: (lines: string[] | undefined) => {
+            setWidget?.(lines);
           },
         },
         log: (line: string) => { console.error(line); },

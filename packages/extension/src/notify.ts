@@ -53,6 +53,8 @@ export type NotifySendOptions = {
 export type NotifySink = {
   send(message: NotifyMessage, options: NotifySendOptions): Promise<void> | void;
   setStatus?(text: string | undefined): void;
+  /** 多行会话列表（Pi footer 只有单行，逐行列表放 widget）。 */
+  setWidget?(lines: string[] | undefined): void;
 };
 
 /** WS 线格式里我们关心的字段（server.ts wireOf） */
@@ -127,14 +129,24 @@ const STATUS_RANK: Record<string, number> = {
   unknown: 6,
 };
 
-const MAX_STATUS_SESSIONS = 3;
+const MAX_WIDGET_SESSIONS = 10;
 const MAX_LABEL_CHARS = 20;
+
+const STATUS_TEXT: Record<string, string> = {
+  "needs-input": "待回话",
+  running: "运行中",
+  starting: "启动中",
+  idle: "待命",
+  handoff: "交接",
+  exited: "已退出",
+  unknown: "未知",
+};
 
 function statusLabel(status: string | undefined): string {
   return status !== undefined && status.length > 0 ? status : "unknown";
 }
 
-/** 会话短标识：agent:目录名（拿不到目录时用 nativeId / key 尾段）。 */
+/** 会话短标识：agent：目录名（拿不到目录时用 nativeId / key 尾段）。 */
 function sessionLabel(session: NotifySession): string {
   const [keyAgent, keyId] = session.key.split(":");
   const agent = session.agent ?? keyAgent ?? "?";
@@ -142,15 +154,13 @@ function sessionLabel(session: NotifySession): string {
   const base = cwd !== undefined && cwd.length > 0 ? cwd.split(/[\\/]/).pop() : undefined;
   const raw = base !== undefined && base.length > 0 ? base : (session.nativeId ?? keyId ?? session.key);
   const short = raw.length > MAX_LABEL_CHARS ? raw.slice(0, MAX_LABEL_CHARS - 1) + "…" : raw;
-  return agent + ":" + short;
+  return agent + "：" + short;
 }
 
-/**
- * 底栏文案（替代早期“N 未读”）：显示有多少活跃会话、每个会话的状态与会话短名。
- * 只列 Pi 驱动的、或正在运行/等回话/交接的会话；历史 unknown 会话不占位置。
- */
-export function renderStatus(sessions: readonly NotifySession[]): string {
-  const visible = sessions.filter((s) => s.driver === "pi" || ACTIVE_STATUSES.has(statusLabel(s.status)))
+/** 可见会话：Pi 正在驱动或处于活动状态；历史 unknown 不占位置。 */
+function visibleSessions(sessions: readonly NotifySession[]): NotifySession[] {
+  return sessions
+    .filter((s) => s.driver === "pi" || ACTIVE_STATUSES.has(statusLabel(s.status)))
     .sort((a, b) => {
       const rank = (STATUS_RANK[statusLabel(a.status)] ?? 99) - (STATUS_RANK[statusLabel(b.status)] ?? 99);
       if (rank !== 0) return rank;
@@ -158,24 +168,54 @@ export function renderStatus(sessions: readonly NotifySession[]): string {
       if (unread !== 0) return unread;
       return a.key.localeCompare(b.key);
     });
+}
+
+/** 给 widget 用的逐行列表：一行一个会话；同目录会话用 nativeId 前缀区分。 */
+export function renderStatusLines(sessions: readonly NotifySession[]): string[] {
+  const visible = visibleSessions(sessions);
   if (visible.length === 0) {
-    return "pi-workbench: 无活跃会话";
+    return [];
   }
   const labels = visible.map(sessionLabel);
   const dupes = new Map<string, number>();
   for (const label of labels) {
     dupes.set(label, (dupes.get(label) ?? 0) + 1);
   }
-  const shown = visible.slice(0, MAX_STATUS_SESSIONS).map((session, index) => {
+  const shown = visible.slice(0, MAX_WIDGET_SESSIONS).map((session, index) => {
     let label = labels[index]!;
     if ((dupes.get(label) ?? 0) > 1) {
       const id = session.nativeId ?? session.key.split(":")[1] ?? session.key;
       label += "#" + id.slice(0, 4);
     }
-    return "[" + statusLabel(session.status) + "] " + label;
+    return "【" + statusLabel(session.status) + "】" + label;
   });
+  const lines = ["pi-workbench 会话（" + String(visible.length) + "）", ...shown];
   const more = visible.length - shown.length;
-  return "pi-workbench: " + String(visible.length) + " 个会话 · " + shown.join(" · ") + (more > 0 ? " · +" + String(more) : "");
+  if (more > 0) {
+    lines.push("… 还有 " + String(more) + " 个会话");
+  }
+  return lines;
+}
+
+/**
+ * 底栏单行文案：只放汇总（Pi 的 footer 会强制压成一行）。
+ * 逐会话列表由 renderStatusLines 交给 widget 显示。
+ */
+export function renderStatus(sessions: readonly NotifySession[]): string {
+  const visible = visibleSessions(sessions);
+  if (visible.length === 0) {
+    return "pi-workbench: 无活跃会话";
+  }
+  const counts = new Map<string, number>();
+  for (const session of visible) {
+    const status = statusLabel(session.status);
+    counts.set(status, (counts.get(status) ?? 0) + 1);
+  }
+  const summary = [...counts.entries()]
+    .sort((a, b) => (STATUS_RANK[a[0]] ?? 99) - (STATUS_RANK[b[0]] ?? 99))
+    .map(([status, count]) => (STATUS_TEXT[status] ?? status) + " " + String(count))
+    .join(" · ");
+  return "pi-workbench: " + String(visible.length) + " 个会话 · " + summary;
 }
 
 type Pending = { reason: NotifyReason; seq: number };
@@ -197,6 +237,7 @@ export class TurnNotifier {
   readonly #wakes = new Map<string, { count: number; windowStart: number }>();
   #flushing: Promise<void> | null = null;
   #badge: string | undefined;
+  #widget: string[] | undefined;
   #disposed = false;
 
   constructor(options: TurnNotifierOptions) {
@@ -281,6 +322,8 @@ export class TurnNotifier {
     if (sessions === null) {
       return;
     }
+    const lines = renderStatusLines(sessions);
+    this.#setWidget(lines.length > 0 ? lines : undefined);
     this.#setBadge(renderStatus(sessions));
   }
 
@@ -428,6 +471,16 @@ export class TurnNotifier {
     }
     this.#badge = text;
     this.#options.sink.setStatus?.(text);
+  }
+
+  #setWidget(lines: string[] | undefined): void {
+    const next = lines?.join("\n");
+    const current = this.#widget?.join("\n");
+    if (next === current) {
+      return;
+    }
+    this.#widget = lines;
+    this.#options.sink.setWidget?.(lines);
   }
 
   #log(line: string): void {
