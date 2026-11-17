@@ -2,7 +2,7 @@
  * API v1 契约测试（C06 / Task 11）。
  *
  * 口径：docs/specs/2026-11-17-phase-0.5c-control-plane-hardening.md §6。
- * - 常量必须与 spec §6.1 的冻结路由清单逐条一致（22 条，含 GET /health）；
+ * - 常量必须与 spec §6.1 的冻结路由清单逐条一致（23 条，含 GET /health；resume 为 2026-11-17 additive）；
  * - 运行时 printRoutes 必须与常量完全相等（先剔除 /api/cp/health 别名）；
  * - GET /api/cp/version 的 api / schemaVersion 必须等于契约常量；
  * - WS after 回放跨重启：同一 db 重建 server 后不重复、不断档。
@@ -124,11 +124,11 @@ function parsedRoutes(app: FastifyInstance): string[] {
   return routes;
 }
 
-test("契约常量：API_VERSION / SCHEMA_VERSION_EXPECTED / 22 条冻结路由", () => {
+test("契约常量：API_VERSION / SCHEMA_VERSION_EXPECTED / 23 条冻结路由", () => {
   assert.equal(API_VERSION, "1");
   assert.equal(SCHEMA_VERSION_EXPECTED, 4);
   assert.equal(SCHEMA_VERSION, SCHEMA_VERSION_EXPECTED, "db.ts 的 SCHEMA_VERSION 必须与契约常量一致");
-  assert.equal(API_ROUTES.length, 22);
+  assert.equal(API_ROUTES.length, 23);
   const keys = new Set(API_ROUTES.map((route) => route.method + " " + route.path));
   assert.equal(keys.size, API_ROUTES.length, "路由清单不得有重复项");
   assert.equal(keys.has("GET " + API_PREFIX + "/health"), false, "运行时别名 /api/cp/health 不进冻结清单");

@@ -2,7 +2,7 @@
  * API v1 公共契约（C06 / Task 11）。
  *
  * 口径：docs/specs/2026-11-17-phase-0.5c-control-plane-hardening.md §6。
- * - `API_ROUTES` 是 spec §6.1 的冻结路由清单（22 条，含裸 GET /health），
+ * - `API_ROUTES` 是 spec §6.1 的冻结路由清单（23 条，含裸 GET /health；2026-11-17 additive 增加 resume），
  *   运行时路由必须与之完全相等；`/api/cp/health` 只是 /health 的兼容别名，不进清单。
  * - v1 内只做 additive：新增可选字段 / 新端点；删字段、改语义一律走 /api/cp/v2。
  * - `SCHEMA_VERSION_EXPECTED` 是 API 契约承诺的库 schema 版本；
@@ -41,6 +41,7 @@ export const API_ROUTES: ReadonlyArray<ApiRoute> = Object.freeze([
   { method: "POST", path: "/api/cp/sessions/:key/inject" },
   { method: "POST", path: "/api/cp/sessions/:key/interrupt" },
   { method: "POST", path: "/api/cp/sessions/:key/attach" },
+  { method: "POST", path: "/api/cp/sessions/:key/resume" },
   { method: "POST", path: "/api/cp/sessions/:key/checkpoint" },
   { method: "GET", path: "/api/cp/sessions/:key/checkpoint" },
   { method: "POST", path: "/api/cp/sessions/:key/handoff" },

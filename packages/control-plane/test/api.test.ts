@@ -97,6 +97,27 @@ function sessionRef(overrides: Partial<SessionRef> = {}): SessionRef {
   };
 }
 
+/** 假 driver：记录 attach / resume 调用，其余方法空实现（resume 路由用例共用） */
+function makeDriver(calls: string[], overrides: Partial<AgentDriver> = {}): AgentDriver {
+  return {
+    agent: "claude",
+    caps: CLAUDE_CAPABILITIES,
+    discover: async () => [],
+    attach: async () => {
+      calls.push("attach");
+    },
+    inject: async () => ({ messageId: "m-1", effective: "now" }),
+    interrupt: async () => ({ stopReason: "cancelled" }),
+    resume: async () => {
+      calls.push("resume");
+    },
+    handoff: async () => ({ command: ["claude", "attach", "sess-1"], mode: "attach" }),
+    onUpdate: () => () => {},
+    dispose: async () => {},
+    ...overrides,
+  };
+}
+
 function makeConfig(home: string, overrides: Partial<Config> = {}): Config {
   return {
     host: "127.0.0.1",
@@ -135,6 +156,8 @@ type BundleOptions = {
   logError?: (error: unknown) => void;
   /** 需要走 /agents 或 attach 的用例注入注册表 */
   router?: AgentRouter;
+  /** 需要观察写队列入队行为的用例注入假队列 */
+  writeQueue?: NonNullable<ServerDeps["writeQueue"]>;
 };
 
 function makeBundle(opts: BundleOptions = {}): Bundle {
@@ -176,6 +199,7 @@ function makeBundle(opts: BundleOptions = {}): Bundle {
     readTranscript: opts.readTranscript,
     logError: opts.logError,
     ...(opts.router === undefined ? {} : { router: opts.router }),
+    ...(opts.writeQueue === undefined ? {} : { writeQueue: opts.writeQueue }),
   };
 
   return {
@@ -1548,6 +1572,140 @@ test("attach 成功后恢复 driver=pi 且 status=idle（spec §7.1）", async (
     assert.deepEqual(calls, ["attach"]);
     assert.equal(h.registry.get(SESSION_KEY)?.driver, "pi");
     assert.equal(h.registry.get(SESSION_KEY)?.status, "idle");
+  } finally {
+    await h.close();
+  }
+});
+
+test("resume 成功后接管会话：driver=pi / status=idle 且追加 state_update（v1 additive）", async () => {
+  const calls: string[] = [];
+  const router = new AgentRouter();
+  router.register(makeDriver(calls));
+
+  const h = await makeHarness({
+    router,
+    seed: [
+      sessionRef({
+        status: "unknown",
+        driver: "none",
+        capabilities: CLAUDE_CAPABILITIES,
+        kind: "interactive",
+      }),
+    ],
+  });
+  try {
+    const res = await h.app.inject({ method: "POST", url: SESSIONS + "/resume" });
+    assert.equal(res.statusCode, 200, res.body);
+    assert.deepEqual(res.json(), { resumed: true, sessionKey: SESSION_KEY, agent: "claude" });
+    assert.deepEqual(calls, ["resume"]);
+    assert.equal(h.registry.get(SESSION_KEY)?.driver, "pi");
+    assert.equal(h.registry.get(SESSION_KEY)?.status, "idle");
+
+    const events = h.store.list(SESSION_KEY);
+    const last = events[events.length - 1];
+    assert.equal(last?.type, "state_update");
+    // source 用会话 agent 名（与 takeover / boot-recovery 的 state_update 口径一致）
+    assert.equal(last?.source, "claude");
+    assert.deepEqual(last?.payload, {
+      reason: "manual_resume",
+      previous: { driver: "none", status: "unknown" },
+    });
+  } finally {
+    await h.close();
+  }
+});
+
+test("resume 走 per-session 写队列：driver.resume 在队列任务内执行", async () => {
+  const calls: string[] = [];
+  const router = new AgentRouter();
+  router.register(makeDriver(calls));
+  const queued: string[] = [];
+  const writeQueue = {
+    run: async <T>(sessionKey: string, task: () => Promise<T>): Promise<T> => {
+      queued.push(sessionKey);
+      return await task();
+    },
+    pending: (): number => 0,
+  };
+
+  const h = await makeHarness({
+    router,
+    writeQueue: writeQueue as unknown as NonNullable<ServerDeps["writeQueue"]>,
+    seed: [sessionRef({ status: "unknown", driver: "none" })],
+  });
+  try {
+    const res = await h.app.inject({ method: "POST", url: SESSIONS + "/resume" });
+    assert.equal(res.statusCode, 200, res.body);
+    assert.deepEqual(queued, [SESSION_KEY], "resume 必须按路径 sessionKey 入队");
+    assert.deepEqual(calls, ["resume"]);
+    assert.equal(h.registry.get(SESSION_KEY)?.driver, "pi");
+  } finally {
+    await h.close();
+  }
+});
+
+test("resume：会话不存在 → 404 E_SESSION_NOT_FOUND", async () => {
+  const h = await makeHarness({ seed: null });
+  try {
+    const res = await h.app.inject({ method: "POST", url: API + "/sessions/claude:nope/resume" });
+    assert.equal(res.statusCode, 404, res.body);
+    assert.equal(res.json<ErrorEnvelope>().error.code, "E_SESSION_NOT_FOUND");
+  } finally {
+    await h.close();
+  }
+});
+
+test("resume：Agent 不可用 → 422 E_AGENT_UNAVAILABLE 且不调 driver", async () => {
+  const calls: string[] = [];
+  const router = new AgentRouter();
+  router.register(makeDriver(calls), {
+    available: false,
+    reason: "E_AGENT_UNAVAILABLE: claude 未登录",
+  });
+
+  const h = await makeHarness({
+    router,
+    seed: [sessionRef({ status: "unknown", driver: "none" })],
+  });
+  try {
+    const res = await h.app.inject({ method: "POST", url: SESSIONS + "/resume" });
+    assert.equal(res.statusCode, 422, res.body);
+    const body = res.json<ErrorEnvelope>();
+    assert.equal(body.error.code, "E_AGENT_UNAVAILABLE");
+    assert.deepEqual(body.error.details, {
+      agent: "claude",
+      cap: "resume",
+      reason: "E_AGENT_UNAVAILABLE: claude 未登录",
+    });
+    assert.deepEqual(calls, []);
+    assert.equal(h.registry.get(SESSION_KEY)?.driver, "none", "失败不改状态");
+  } finally {
+    await h.close();
+  }
+});
+
+test("resume：会话未声明 caps.resume → 422 E_CAP_UNSUPPORTED 且不调 driver", async () => {
+  const calls: string[] = [];
+  const router = new AgentRouter();
+  router.register(makeDriver(calls));
+
+  const h = await makeHarness({
+    router,
+    seed: [
+      sessionRef({
+        status: "unknown",
+        driver: "none",
+        capabilities: { ...CLAUDE_CAPABILITIES, resume: false },
+      }),
+    ],
+  });
+  try {
+    const res = await h.app.inject({ method: "POST", url: SESSIONS + "/resume" });
+    assert.equal(res.statusCode, 422, res.body);
+    const body = res.json<ErrorEnvelope>();
+    assert.equal(body.error.code, "E_CAP_UNSUPPORTED");
+    assert.deepEqual(body.error.details, { agent: "claude", cap: "resume" });
+    assert.deepEqual(calls, []);
   } finally {
     await h.close();
   }

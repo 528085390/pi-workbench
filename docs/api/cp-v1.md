@@ -1,6 +1,6 @@
 # Control Plane API v1
 
-> 状态：**冻结**（2026-11-17，C06 / Task 11）。机器可读清单见 `packages/shared/src/api.ts` 的 `API_ROUTES`（22 条，含裸 `GET /health`），契约测试为 `packages/control-plane/test/api-contract.test.ts`。
+> 状态：**冻结**（2026-11-17，C06 / Task 11）。机器可读清单见 `packages/shared/src/api.ts` 的 `API_ROUTES`（23 条，含裸 `GET /health`；2026-11-17 additive 增加 resume），契约测试为 `packages/control-plane/test/api-contract.test.ts`。
 >
 > 冻结范围：只承诺 `/api/cp/*` 与 `GET /health`；CLI 参数与 Pi 扩展内部接口不在承诺内。
 >
@@ -28,7 +28,7 @@
 | 409 | `E_NO_LEASE` | 调用方未持有该会话租约 |
 | 409 | `E_IDEMPOTENCY_CONFLICT` | 同一 `idempotencyKey` 对应不同请求 |
 | 409 | `E_DISPATCH_IN_PROGRESS` | 同一幂等键的派发仍在进行 |
-| 409 | `E_RESUME_REJECTED` | attach / handback 时原生会话已被丢弃或拒绝恢复 |
+| 409 | `E_RESUME_REJECTED` | attach / resume / handback 时原生会话已被丢弃或拒绝恢复 |
 | 422 | `E_CAP_UNSUPPORTED` | 会话能力未声明该操作 |
 | 422 | `E_AGENT_UNAVAILABLE` | 目标 Agent 未注册 / CLI 不可用 / 探测失败 |
 | 429 | `E_SESSION_BUSY` | 会话忙，稍后重试 |
@@ -62,6 +62,7 @@
 | POST | `/api/cp/sessions/:key/inject` | 是 | 注入 |
 | POST | `/api/cp/sessions/:key/interrupt` | 是 | 中断 |
 | POST | `/api/cp/sessions/:key/attach` | 是 | 接入会话（重启后重连入口） |
+| POST | `/api/cp/sessions/:key/resume` | 是 | 接管已存在会话（重启后恢复入口，v1 additive） |
 | POST | `/api/cp/sessions/:key/checkpoint` | 是 | 写检查点 |
 | GET | `/api/cp/sessions/:key/checkpoint` | 是 | 读最新检查点 |
 | POST | `/api/cp/sessions/:key/handoff` | 是 | 交给 human / pi |
@@ -308,6 +309,25 @@
 3. 会话自身声明的 `capabilities.attach` 必须为 `true` → 否则 `422 E_CAP_UNSUPPORTED`。这里用**会话快照**而不是 `driver.caps`：Claude 的 attach 随 `kind` 变化（interactive=false、background=true），driver.caps 只是交互式快照。
 4. 调 `driver.attach()` 建立控制通道；原生侧拒绝恢复 → `409 E_RESUME_REJECTED`，会话状态不变。
 5. 成功后注册表置 `driver="pi"`、`status="idle"`；失败不改状态。
+
+其他错误：`401`、`500 E_INTERNAL`。
+
+### POST /api/cp/sessions/:key/resume
+
+请求体：无（`{}` 亦可）。
+
+成功 `200`：`{ "resumed": true, "sessionKey": "claude:abc", "agent": "claude" }`。
+
+用途：重启对账把 driver 会话置为 `driver="none"` / `status="unknown"` 后，用 resume 显式接管已存在的原生会话（v1 additive，补 attach 的盲区：Claude 交互式会话 `capabilities.attach=false`，只能走 resume）。
+
+判定顺序：
+
+1. 会话必须存在 → 否则 `404 E_SESSION_NOT_FOUND`。
+2. 目标 Agent 必须已注册且可用 → 否则 `422 E_AGENT_UNAVAILABLE`（`details.cap="resume"`）。
+3. 会话自身声明的 `capabilities.resume` 必须为 `true` → 否则 `422 E_CAP_UNSUPPORTED`（`details.cap="resume"`）。
+4. 调 `driver.resume()` 接管；原生侧拒绝恢复 → `409 E_RESUME_REJECTED`，会话状态不变。
+5. 成功后注册表置 `driver="pi"`、`status="idle"`，并追加 `state_update` 事件：`payload.reason="manual_resume"`，`payload.previous={ driver, status }` 为改写前快照。
+6. 写操作走 per-session 写队列：同一会话的 resume / inject / interrupt / handoff 串行执行。
 
 其他错误：`401`、`500 E_INTERNAL`。
 

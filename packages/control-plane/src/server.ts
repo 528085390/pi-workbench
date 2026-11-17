@@ -12,7 +12,7 @@
  * 业务真相（租约 / 幂等 / handoff 顺序）都在 TakeoverEngine 与各 store 里；
  * 本层只做装配：鉴权、请求体校验、错误映射、事件广播。不 import node:http，也不自己 listen。
  */
-import { timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
@@ -738,6 +738,66 @@ export async function createServer(deps: ServerDeps): Promise<FastifyInstance> {
         // 控制面驱动并进入 idle，避免会话永远停在 unknown。
         deps.registry.upsert({ ...session, driver: "pi", status: "idle" });
         return { attached: true, sessionKey: key, agent: session.agent };
+      });
+
+      /**
+       * 接管已存在的原生会话（v1 additive：重启后 Claude 交互式会话的恢复入口）。
+       *
+       * 与 attach 同一套双判定：可用性（422 E_AGENT_UNAVAILABLE）在能力闸门之前，
+       * 能力用会话声明的 caps.resume（不是 driver.caps 快照）；缺能力时不触碰 driver。
+       * 写入串行化：driver.resume + 注册表 + 事件整体进 per-session 写队列，与
+       * inject / interrupt / handoff 互斥（attach 是 0.5-B 既有实现，未入队，语义不动）。
+       */
+      api.post("/sessions/:key/resume", async (request) => {
+        const key = paramOf(request, "key");
+        const session = requireSession(deps.registry, key);
+        if (deps.router === undefined) {
+          throw new WorkbenchError("E_AGENT_UNAVAILABLE", "Agent 注册表未启用，无法 resume：" + session.agent, {
+            agent: session.agent,
+            cap: "resume",
+          });
+        }
+        const driver = deps.router.get(session.agent);
+        if (driver === null) {
+          throw new WorkbenchError("E_AGENT_UNAVAILABLE", "Agent 未注册或不可用：" + session.agent, {
+            agent: session.agent,
+            cap: "resume",
+          });
+        }
+        // 可用性与 /agents 同源（探测缓存 / 注册表快照）：不可用必须在能力闸门之前报 422，
+        // 而不是调用 driver 后变成 503 E_ADAPTER_DOWN。
+        const status = (await currentAgents()).find((item) => item.agent === session.agent);
+        if (status !== undefined && !status.available) {
+          const reason = "reason" in status && typeof status.reason === "string" ? status.reason : undefined;
+          throw new WorkbenchError(
+            "E_AGENT_UNAVAILABLE",
+            "Agent 不可用：" + session.agent + (reason === undefined ? "" : "（" + reason + "）"),
+            { agent: session.agent, cap: "resume", reason: reason ?? null },
+          );
+        }
+        const declared = session.capabilities;
+        if (declared.resume !== true) {
+          throw new WorkbenchError("E_CAP_UNSUPPORTED", "Agent " + session.agent + " 不支持能力 resume", {
+            agent: session.agent,
+            cap: "resume",
+          });
+        }
+        const previous = { driver: session.driver, status: session.status };
+        await runWrite(key, async () => {
+          await driver.resume(session);
+          deps.registry.upsert({ ...session, driver: "pi", status: "idle" });
+          deps.store.append({
+            sessionKey: key,
+            type: "state_update",
+            // source 用会话 agent 名（口径同 takeover / boot-recovery 的 state_update）
+            source: session.agent,
+            payload: { reason: "manual_resume", previous },
+            idempotencyKey: "resume:" + key + ":" + randomUUID(),
+          });
+        });
+        const resumed = deps.registry.get(key) ?? { ...session, driver: "pi" as const, status: "idle" as const };
+        attachPipeline(resumed);
+        return { resumed: true, sessionKey: key, agent: session.agent };
       });
 
       api.post("/sessions/:key/inject", async (request) => {
